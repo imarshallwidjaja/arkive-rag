@@ -1,12 +1,21 @@
 [project]
 name = "arkive-rag"
-version = "0.1.0"
-description = "Arkive RAG: RAG implementation for ETL classification and document services"
+version = "0.2.0"
+description = "Compile curated documents into read-only SQLite knowledge snapshots served over MCP"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
+    "mcp==2.2.0",
+    "numpy==2.5.3",
+    "openai==3.22.1",
+    "pillow==12.3.0",
     "pydantic==2.13.4",
+    "pypdfium2==5.13.0",
+    "typer==0.26.8",
 ]
+
+[project.scripts]
+arkive-rag = "arkive_rag.cli:main"
 
 [dependency-groups]
 dev = [
@@ -25,14 +34,22 @@ module-name = "arkive_rag"
 [tool.mypy]
 python_version = "3.14"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "evals"]
+explicit_package_bases = true
+mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
+
+[[tool.mypy.overrides]]
+module = ["pypdfium2", "pypdfium2.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--strict-markers"]
+pythonpath = ["."]
+addopts = ["--strict-markers", "--import-mode=importlib"]
 
 [tool.ruff]
 target-version = "py314"
+line-length = 100
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]

@@ -1,1 +1,1 @@
-"""Arkive RAG implementation for ETL classification and document services."""
+__version__ = "0.2.0"

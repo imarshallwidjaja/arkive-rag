@@ -30,6 +30,14 @@ Use comments to preserve information that code cannot state clearly: an invarian
 
 When a language first lands in this repository, choose that language's current conventional portable package manager and a modern test runner in the same change. Prefer tools that reproduce on a clean checkout without a preconfigured machine. Record the choice in the component manifest, not in this file. After that, follow the toolchain already in the tree.
 
+Before changing dependencies, the build pipeline, the snapshot schema or the MCP tools, read `docs/architecture.md`. Its Verification section lists the gates: `ruff check`, `ruff format --check`, `mypy`, `pytest` and `uv build`.
+
+Keep the uv environment, tool caches, pytest cache and temporary directories, and build output outside the checkout: set `UV_PROJECT_ENVIRONMENT`, `MYPY_CACHE_DIR` and `RUFF_CACHE_DIR`, pass `-o cache_dir=` and `--basetemp=` to pytest and `--out-dir` to `uv build`, each pointing at a per-checkout scratch path.
+
+Keep `pytest` offline: tests drive the compiler through a fake `LanguageGateway` or a fake OpenAI client. Run real OpenAI builds only through `arkive-rag build` or the evaluation harness (`python -m evals.run`, which compiles its holdout snapshot), outside the test suite.
+
+When a change alters snapshot tables or their meaning, bump `SCHEMA_VERSION` in `src/arkive_rag/snapshot.py`. Old snapshots are rebuilt from their corpus.
+
 ## Repository structure
 
 A component owns what is required to understand, test, build, and operate it, and should stay understandable without first learning a repository-wide abstraction. When more than one component exists, the root composes them and coordinates common workflows; it does not absorb domain behaviour.

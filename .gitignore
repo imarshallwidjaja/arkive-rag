@@ -266,3 +266,11 @@ terraform.rc
 *.swp
 *.swo
 generated/
+
+# =============================================================================
+# Private corpus artefacts: snapshots and local eval packs live in a private store
+# =============================================================================
+
+*.arkive.db
+*.arkive.db.*
+*.eval.local.json
