@@ -1,9 +1,16 @@
-"""Compile a corpus directory into a `CompiledCorpus`.
+"""Compile a corpus directory into a `CompiledCorpus` in three passes.
 
-Every page of every PDF, Word and PowerPoint file goes through one pipeline:
-render to WebP, transcribe with the generation model, check the transcript against
-the native text layer, then stitch pages into sections and chunks. The request types
-below own every prompt, output schema and reasoning effort the compiler sends.
+1. Reading (`read_document`, per source, cached by content): render to WebP, transcribe with
+   the generation model, check the transcript against the native text layer, stitch pages
+   into sections and chunk pieces, and write an observation card. A reading holds no corpus
+   IDs and no path.
+2. Induction (`arkive_rag.induction.induce`, corpus-wide): facets, facet binding, glossary,
+   blueprints and the topic guide.
+3. Binding (`bind_document`): section and chunk IDs, breadcrumbs from the bound facets, then
+   embeddings.
+
+The request types below own every prompt, output schema and reasoning effort the reading
+pass sends.
 """
 
 from __future__ import annotations
@@ -17,35 +24,46 @@ import subprocess
 import tempfile
 import threading
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import pypdfium2 as pdfium
 from PIL import Image
 
+from arkive_rag.induction import INDUCTION_EFFORTS, Checked, generate_checked, induce
 from arkive_rag.llm import Effort, LanguageGateway
 from arkive_rag.models import (
+    CardHeader,
     Chunk,
     ChunkKind,
+    ChunkPiece,
     CompiledCorpus,
     CompiledDocument,
     ConversionError,
-    CorpusSynthesisExtraction,
+    CorpusDocument,
+    CraftObservation,
     CuratorNote,
-    DocumentMetaExtraction,
-    InvalidCitationError,
+    DocumentReading,
+    Facet,
     MissingDependencyError,
+    ObservationCard,
+    ObservationDraft,
     PageBlock,
     PageExtraction,
+    ReadSection,
     RenderedPage,
     Section,
     SourceFormat,
+    StatedAttribute,
+    TermObservation,
     TranscriptionFidelityError,
     UnsafePathError,
     UnsupportedFormatError,
+    fold_for_quote,
+    fold_text,
 )
 
 SUPPORTED_SUFFIXES: dict[str, SourceFormat] = {
@@ -62,6 +80,9 @@ TABLE_PIECE_CHARS = 2000
 MAX_CHUNK_CHARS = 6000
 OFFICE_TIMEOUT_SECONDS = 120
 PREV_CONTEXT_CHARS = 1200
+# Sections are packed in order into observation batches of about this many characters; a
+# larger section is a batch of its own.
+OBSERVE_BATCH_CHARS = 24_000
 
 # libpdfium and pypdfium2's object tracker are not thread-safe: every pdfium call
 # across all threads goes through this lock.
@@ -83,8 +104,6 @@ _PAGE_LABEL = re.compile(
     r"\s*(?:page\s+\d{1,4}(?:\s+of\s+\d{1,4})?|\d{1,4}\s+of\s+\d{1,4})\s*", re.IGNORECASE
 )
 _EDGE_PAGE_NUMBER = re.compile(r"(\d{1,4})\s+(.+)|(.+?)\s+(\d{1,4})")
-_CITATION_TOKEN = re.compile(r"\[doc[^\]]*\]")
-_CITATION = re.compile(r"\[(doc_\d+):(doc_\d+_sec_\d+)\]")
 _TABLE_CELL_SPLIT = re.compile(r"(?<!\\)\|")
 _SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
@@ -122,21 +141,36 @@ Rules:
 - Copy every number, unit and filename exactly as printed. Never invent content.
 """
 
-META_INSTRUCTIONS = """\
-You catalogue one consulting document. From its path, project folder, outline
-and opening text give: the document title, the client organisation, the
-lifecycle stage (proposal, memorandum, feedback, summary, case_study, guidance
-or reference), the document date as printed (null if absent) and a factual
-two-to-four sentence summary naming its subject, methods and key results.
+OBSERVE_INSTRUCTIONS = """\
+You read consecutive sections of one document and record what they show. Another
+step organises a whole collection from these observations, so state only what the
+text supports.
+
+- title: the document's title as printed; when none is printed, a short descriptive
+  title of what the document is. Never empty. doc_date: its date as printed, or null.
+- deliverable_type: a short generic name for the kind of document, for example
+  "technical memorandum", "proposal", "review comments", "campaign brief" or
+  "slide deck". Never a project or client name.
+- summary: two to four factual sentences on its subject, methods and results.
+- attributes: name/value pairs the document states about itself, such as client,
+  author, audience, project, region, sensor, product or channel. Use short
+  lowercase names. Only values the text states.
+- terms: domain terms, acronyms, named methods, datasets, tools and products the
+  text uses. kind is a one-word category (acronym, method, dataset, tool, product,
+  concept). defines is true only when the quote states what the term means.
+- craft: how the document is written: structure (sections it always has), convention
+  (house rules for tables, units, naming), caveat, disclaimer, reviewer_feedback
+  (what a reviewer asked to change) and tone. statement is a generic rule a writer
+  could follow, without this document's project-specific values.
+- quote: copy one sentence or phrase of at most 300 characters verbatim from the
+  sections, as contiguous text. Never quote section headers you were not shown,
+  never paraphrase, and never give section numbers instead of a quote.
 """
 
-SYNTHESIS_INSTRUCTIONS = """\
-You write the orientation guide for a knowledge base that AI agents will search.
-Using only the catalog and curator notes, describe in Markdown: the projects,
-clients and how they relate; what each document type covers; recurring methods,
-datasets and results; and caveats or gaps the curator notes record.
-Cite every factual claim with the exact section citation tokens from the
-catalog, written as [doc_XXX:doc_XXX_sec_YYY]. Use no other citation form.
+CONSOLIDATE_INSTRUCTIONS = """\
+You receive the title, date, deliverable type and summary written for each part of one
+long document. Write the document's single title, date (null if none is printed),
+deliverable type (a short generic name) and a factual two-to-four sentence summary.
 """
 
 
@@ -166,47 +200,55 @@ class PageTranscription:
 
 
 @dataclass(frozen=True)
-class DocumentCatalogue:
-    """Title, client, lifecycle stage, date and summary of one non-curator document."""
+class BatchSection:
+    """One section as an observation batch shows it, by document-local ordinal."""
 
-    operation: ClassVar[str] = "document_meta"
-    output: ClassVar[type[DocumentMetaExtraction]] = DocumentMetaExtraction
-    effort: ClassVar[Effort] = "low"
-    instructions: ClassVar[str] = META_INSTRUCTIONS
-    image_webp: ClassVar[None] = None
-    rel_path: str
-    project_id: str
-    outline_and_excerpt: str
-
-    def text(self) -> str:
-        return (
-            f"PATH: {self.rel_path}\nPROJECT FOLDER: {self.project_id}\n\n"
-            f"{self.outline_and_excerpt}"
-        )
+    ordinal: int
+    heading_path: str
+    page_start: int
+    page_end: int
+    markdown: str
 
 
 @dataclass(frozen=True)
-class CorpusSynthesis:
-    """The cited topic guide. `citation_feedback` lists a rejected draft's invalid citations."""
+class ObserveSections:
+    """Observe one batch of a document's sections. `feedback` names a rejected answer's flaws."""
 
-    operation: ClassVar[str] = "synthesize_corpus"
-    output: ClassVar[type[CorpusSynthesisExtraction]] = CorpusSynthesisExtraction
-    effort: ClassVar[Effort] = "medium"
-    instructions: ClassVar[str] = SYNTHESIS_INSTRUCTIONS
+    operation: ClassVar[str] = "observe"
+    output: ClassVar[type[ObservationDraft]] = ObservationDraft
+    effort: ClassVar[Effort] = "low"
+    instructions: ClassVar[str] = OBSERVE_INSTRUCTIONS
     image_webp: ClassVar[None] = None
-    topic: str
-    curator_notes_text: str
-    catalog_text: str
-    citation_feedback: str | None = None
+    sections: tuple[BatchSection, ...]
+    feedback: str | None = None
 
     def text(self) -> str:
-        text = (
-            f"TOPIC: {self.topic}\n\nCURATOR NOTES:\n{self.curator_notes_text}"
-            f"\n\nCATALOG:\n{self.catalog_text}"
+        parts = [
+            f"=== Section {s.ordinal}: {s.heading_path} (pp. {s.page_start}-{s.page_end}) ===\n"
+            f"{s.markdown}"
+            for s in self.sections
+        ]
+        text = "SECTIONS:\n" + "\n\n".join(parts)
+        return f"{text}\n\n{self.feedback}" if self.feedback else text
+
+
+@dataclass(frozen=True)
+class ConsolidateCard:
+    """One title, date, deliverable type and summary from the headers of several batches."""
+
+    operation: ClassVar[str] = "consolidate_card"
+    output: ClassVar[type[CardHeader]] = CardHeader
+    effort: ClassVar[Effort] = "low"
+    instructions: ClassVar[str] = CONSOLIDATE_INSTRUCTIONS
+    image_webp: ClassVar[None] = None
+    headers: tuple[CardHeader, ...]
+
+    def text(self) -> str:
+        return "\n\n".join(
+            f"PART {i}:\nTitle: {h.title}\nDate: {h.doc_date or 'none'}\n"
+            f"Deliverable type: {h.deliverable_type}\nSummary: {h.summary}"
+            for i, h in enumerate(self.headers, start=1)
         )
-        if self.citation_feedback:
-            text += f"\n\nYOUR PREVIOUS DRAFT HAD INVALID CITATIONS:\n{self.citation_feedback}"
-        return text
 
 
 @dataclass(frozen=True)
@@ -214,7 +256,6 @@ class SourceFile:
     rel_path: str
     path: Path
     format: SourceFormat
-    project_id: str
 
     @property
     def is_curator_note(self) -> bool:
@@ -242,8 +283,7 @@ def discover_corpus(corpus_dir: Path) -> list[SourceFile]:
             raise UnsupportedFormatError(
                 f"{rel.as_posix()}: supported formats are .pdf .docx .pptx .md"
             )
-        project_id = rel.parts[0] if len(rel.parts) >= 2 else "root"
-        sources.append(SourceFile(rel.as_posix(), path, fmt, project_id))
+        sources.append(SourceFile(rel.as_posix(), path, fmt))
     return sources
 
 
@@ -818,26 +858,17 @@ def split_table(markdown: str) -> list[str]:
     return pieces
 
 
-@dataclass(frozen=True)
-class ChunkContext:
-    doc_id: str
-    project_id: str
-    client: str
-    stage: str
-    title: str
-    prose_kind: ChunkKind
-
-
-def _section_pieces(draft: SectionDraft) -> list[tuple[ChunkKind | None, str, int, int]]:
-    """(kind, content, first page, last page) per chunk; kind None marks packed prose."""
-    pieces: list[tuple[ChunkKind | None, str, int, int]] = []
+def section_pieces(draft: SectionDraft, prose_kind: ChunkKind) -> tuple[ChunkPiece, ...]:
+    """The chunks of one section, without IDs or breadcrumbs: packed prose, table pieces and
+    one piece per visual, each with its own page span."""
+    pieces: list[tuple[ChunkKind, str, int, int]] = []
     prose: list[tuple[str, int, int]] = []
 
     def flush() -> None:
         if prose:
             text = "\n\n".join(t for t, _, _ in prose)
             first, last = min(p[1] for p in prose), max(p[2] for p in prose)
-            pieces.append((None, text, first, last))
+            pieces.append((prose_kind, text, first, last))
             prose.clear()
 
     for part in draft.parts:
@@ -855,41 +886,14 @@ def _section_pieces(draft: SectionDraft) -> list[tuple[ChunkKind | None, str, in
                     flush()
                 prose.append((text, *span))
     flush()
-    return [
-        (kind, piece, first, last)
+    return tuple(
+        ChunkPiece(kind=kind, content=piece, page_start=first, page_end=last)
         for kind, content, first, last in pieces
         for piece in wrap_text(content, MAX_CHUNK_CHARS)
-    ]
+    )
 
 
-def build_chunks(
-    drafts: Sequence[SectionDraft], sections: Sequence[Section], ctx: ChunkContext
-) -> list[Chunk]:
-    chunks: list[Chunk] = []
-    for draft, section in zip(drafts, sections, strict=True):
-        breadcrumb = (
-            f"[Project: {ctx.project_id} | Client: {ctx.client} | Stage: {ctx.stage}"
-            f" | Doc: {ctx.title} (pp. {section.page_start}-{section.page_end})"
-            f" | Section: {section.heading_path}]"
-        )
-        for kind, content, first, last in _section_pieces(draft):
-            ordinal = len(chunks) + 1
-            chunks.append(
-                Chunk(
-                    chunk_id=f"{ctx.doc_id}_chk_{ordinal:04d}",
-                    section_id=section.section_id,
-                    ordinal=ordinal,
-                    kind=kind or ctx.prose_kind,
-                    page_start=first,
-                    page_end=last,
-                    breadcrumb=breadcrumb,
-                    content=content,
-                )
-            )
-    return chunks
-
-
-# Document and corpus compilation.
+# Reading.
 
 
 def _transcribe_pages(
@@ -910,6 +914,8 @@ def _transcribe_pages(
             prev_context=prev_context,
         )
         results.append((number, extraction))
+        # Page N's request carries page N-1's transcript tail, which the continuation flags
+        # need; a changed page therefore also changes the cache keys of the pages after it.
         prev_context = "\n\n".join(b.markdown for b in extraction.blocks)[-PREV_CONTEXT_CHARS:]
     return results
 
@@ -922,10 +928,193 @@ def _visual_summary(extraction: PageExtraction) -> str:
     return "\n".join(lines)
 
 
-def compile_document(
-    source: SourceFile, doc_id: str, gateway: LanguageGateway, data: bytes
-) -> CompiledDocument:
-    """Compile one source from `data`, the bytes read from it exactly once."""
+def observation_batches(sections: Sequence[ReadSection]) -> list[tuple[BatchSection, ...]]:
+    """Sections packed in order into batches of at most `OBSERVE_BATCH_CHARS` characters.
+
+    A section larger than the budget is split by `wrap_text` into pieces within it; every
+    piece keeps the section's document-local ordinal, so a quote found in a piece is located
+    in its section.
+    """
+    batches: list[list[BatchSection]] = []
+    size = 0
+    for section in sections:
+        # An empty section is one empty piece, shown as before.
+        for piece in wrap_text(section.markdown, OBSERVE_BATCH_CHARS) or [section.markdown]:
+            item = BatchSection(
+                section.ordinal, section.heading_path, section.page_start, section.page_end, piece
+            )
+            if batches and size + len(piece) <= OBSERVE_BATCH_CHARS:
+                batches[-1].append(item)
+                size += len(piece)
+            else:
+                batches.append([item])
+                size = len(piece)
+    return [tuple(batch) for batch in batches]
+
+
+def locate_quote(quote: str, sections: Sequence[BatchSection]) -> int | None:
+    """Ordinal of the first section whose text contains `quote`, compared by `fold_for_quote`."""
+    needle = fold_for_quote(quote)
+    if not needle:
+        return None
+    for section in sections:
+        if needle in fold_for_quote(section.markdown):
+            return section.ordinal
+    return None
+
+
+@dataclass(frozen=True)
+class LocatedBatch:
+    """One batch's observations with every quote located; `discarded` counts dropped ones."""
+
+    draft: ObservationDraft
+    terms: tuple[TermObservation, ...]
+    craft: tuple[CraftObservation, ...]
+    discarded: int
+
+
+def locate_batch(
+    draft: ObservationDraft, sections: Sequence[BatchSection], *, rerun_of_unlocated: bool
+) -> Checked[LocatedBatch]:
+    """Locate every quote of a batch in that batch's sections.
+
+    Unlocated quotes are rejections. Keeping the located observations and discarding the rest
+    is an accepted reduction, except when the batch quoted something and nothing could be
+    located: that is a broken reading. With `rerun_of_unlocated` (the earlier answer quoted
+    and located nothing), a rerun without any observation is that same broken reading.
+    """
+    if rerun_of_unlocated and not (draft.terms or draft.craft):
+        return Checked.reject(
+            [
+                "the earlier answer quoted the sections but none of its quotes could be located,"
+                " and this answer has no observations"
+            ]
+        )
+    terms: list[TermObservation] = []
+    craft: list[CraftObservation] = []
+    unlocated: list[str] = []
+    for term in draft.terms:
+        ordinal = locate_quote(term.quote, sections)
+        if ordinal is None:
+            unlocated.append(term.quote)
+            continue
+        terms.append(
+            TermObservation(
+                term=term.term,
+                kind=term.kind,
+                aliases=tuple(term.aliases),
+                quote=term.quote,
+                defines=term.defines,
+                section_ordinal=ordinal,
+            )
+        )
+    for item in draft.craft:
+        ordinal = locate_quote(item.quote, sections)
+        if ordinal is None:
+            unlocated.append(item.quote)
+            continue
+        craft.append(
+            CraftObservation(
+                aspect=item.aspect,
+                statement=item.statement,
+                quote=item.quote,
+                section_ordinal=ordinal,
+            )
+        )
+    located = LocatedBatch(draft, tuple(terms), tuple(craft), len(unlocated))
+    if not unlocated:
+        return Checked.accept(located)
+    rejections = tuple(f"quote not found verbatim in the sections: {q!r}" for q in unlocated)
+    if terms or craft:
+        return Checked.reduce(rejections, located)
+    return Checked.reject(rejections)
+
+
+def observe_document(
+    gateway: LanguageGateway, rel_path: str, sections: Sequence[ReadSection]
+) -> tuple[ObservationCard, int]:
+    """The observation card of a citable document, and the count of discarded observations."""
+    batches = observation_batches(sections)
+    if not batches:
+        raise ConversionError(f"{rel_path}: the document has no text to read")
+
+    def observe(batch: tuple[BatchSection, ...]) -> LocatedBatch:
+        nothing_located = False
+
+        def check(draft: ObservationDraft) -> Checked[LocatedBatch]:
+            nonlocal nothing_located
+            checked = locate_batch(draft, batch, rerun_of_unlocated=nothing_located)
+            nothing_located = checked.result is None
+            return checked
+
+        return generate_checked(
+            f"{rel_path}: observations",
+            lambda feedback: gateway.run(ObserveSections(batch, feedback)),
+            check,
+        )
+
+    located = [observe(batch) for batch in batches]
+    attributes: dict[tuple[str, str], StatedAttribute] = {}
+    for batch in located:
+        for attribute in batch.draft.attributes:
+            key = (fold_text(attribute.name).strip(), fold_text(attribute.value).strip())
+            attributes.setdefault(key, attribute)
+    header: CardHeader
+    if len(located) == 1:
+        draft = located[0].draft
+        header = CardHeader(
+            title=draft.title,
+            doc_date=draft.doc_date,
+            deliverable_type=draft.deliverable_type,
+            summary=draft.summary,
+        )
+    else:
+        headers = tuple(
+            CardHeader(
+                title=b.draft.title,
+                doc_date=b.draft.doc_date,
+                deliverable_type=b.draft.deliverable_type,
+                summary=b.draft.summary,
+            )
+            for b in located
+        )
+        header = gateway.run(ConsolidateCard(headers))
+    card = ObservationCard(
+        title=header.title,
+        doc_date=header.doc_date,
+        deliverable_type=header.deliverable_type,
+        summary=header.summary,
+        attributes=tuple(attributes.values()),
+        terms=tuple(t for b in located for t in b.terms),
+        craft=tuple(c for b in located for c in b.craft),
+    )
+    return card, sum(b.discarded for b in located)
+
+
+def curator_note_card(text: str) -> ObservationCard:
+    """A curator note's card, written without a model call."""
+    """The title is the first line with text once heading marks are removed; the summary is
+    the first line that is not a heading."""
+    lines = [line.strip() for line in text.splitlines()]
+    titles = [t for line in lines if (t := line.lstrip("#").strip())]
+    prose = [line for line in lines if line and not line.startswith("#")]
+    return ObservationCard(
+        title=titles[0] if titles else "Curator note",
+        doc_date=None,
+        deliverable_type="curator note",
+        summary=" ".join(prose[0].split())[:300] if prose else "",
+        attributes=(),
+        terms=(),
+        craft=(),
+    )
+
+
+def read_document(source: SourceFile, data: bytes, gateway: LanguageGateway) -> DocumentReading:
+    """Read one source from `data`, the bytes read from it exactly once.
+
+    The result depends on the bytes and the source format only: `source.rel_path` appears in
+    error messages, and a file named `AGENTS.md` is read as a curator note.
+    """
     pages: tuple[RenderedPage, ...] = ()
     text = _decode_markdown(source, data) if source.format == "md" else ""
     if source.format == "md":
@@ -948,118 +1137,111 @@ def compile_document(
             )
             for (native_text, webp), (number, extraction) in zip(rendered, transcribed, strict=True)
         )
+    prose_kind: ChunkKind = "guidance" if source.is_curator_note else "prose"
     sections = tuple(
-        Section(
-            section_id=f"{doc_id}_sec_{ordinal:03d}",
+        ReadSection(
             ordinal=ordinal,
             heading_path=draft.heading_path,
             level=draft.level,
             page_start=draft.page_start,
             page_end=draft.page_end,
             markdown=draft.markdown,
+            pieces=section_pieces(draft, prose_kind),
         )
         for ordinal, draft in enumerate(drafts, start=1)
     )
-    prose_kind: ChunkKind = "guidance" if source.is_curator_note else "prose"
     if source.is_curator_note:
-        scope = source.rel_path.rpartition("/")[0] or "corpus root"
-        first_line = next((ln.strip("# ") for ln in text.splitlines() if ln.strip()), "")
-        meta = DocumentMetaExtraction(
-            title=f"Curator guidance: {scope}",
-            client="curator",
-            stage="guidance",
-            doc_date=None,
-            summary=first_line[:300],
-        )
+        card, discarded = curator_note_card(text), 0
     else:
-        outline = "\n".join(
-            f"- {s.heading_path} (pp. {s.page_start}-{s.page_end})" for s in sections
-        )
-        excerpt = "\n\n".join(s.markdown for s in sections)[:6000]
-        meta = gateway.run(
-            DocumentCatalogue(
-                rel_path=source.rel_path,
-                project_id=source.project_id,
-                outline_and_excerpt=f"OUTLINE:\n{outline}\n\nOPENING TEXT:\n{excerpt}",
-            )
-        )
-    ctx = ChunkContext(doc_id, source.project_id, meta.client, meta.stage, meta.title, prose_kind)
-    return CompiledDocument(
-        doc_id=doc_id,
-        rel_path=source.rel_path,
+        card, discarded = observe_document(gateway, source.rel_path, sections)
+    return DocumentReading(
         sha256=hashlib.sha256(data).hexdigest(),
         format=source.format,
-        project_id=source.project_id,
-        client=meta.client,
-        stage=meta.stage,
-        title=meta.title,
-        doc_date=meta.doc_date,
-        summary=meta.summary,
-        sections=sections,
-        chunks=tuple(build_chunks(drafts, sections, ctx)),
-        pages=pages,
         is_curator_note=source.is_curator_note,
+        sections=sections,
+        pages=pages,
+        card=card,
+        discarded_quotes=discarded,
     )
 
 
-def _citable(documents: Sequence[CompiledDocument]) -> list[CompiledDocument]:
-    return [doc for doc in documents if not doc.is_curator_note]
+# Binding.
 
 
-def invalid_citations(markdown: str, documents: Sequence[CompiledDocument]) -> list[str]:
-    """Bracketed `[doc...]` tokens that do not resolve, or a marker when one is needed."""
-    valid = {(doc.doc_id, s.section_id) for doc in _citable(documents) for s in doc.sections}
-    bad: list[str] = []
-    resolved = 0
-    for token in _CITATION_TOKEN.findall(markdown):
-        match = _CITATION.fullmatch(token)
-        if match is None or (match[1], match[2]) not in valid:
-            bad.append(token)
-        else:
-            resolved += 1
-    if valid and resolved == 0:
-        bad.append("(no valid citation)")
-    return bad
-
-
-def _catalog_text(documents: Sequence[CompiledDocument]) -> str:
-    lines: list[str] = []
-    for doc in _citable(documents):
-        lines.append(
-            f"\n## {doc.doc_id}: {doc.title}\nProject: {doc.project_id} | Client: {doc.client}"
-            f" | Stage: {doc.stage} | Date: {doc.doc_date or 'unknown'}\nSummary: {doc.summary}"
-        )
-        lines += [
-            f"- [{doc.doc_id}:{s.section_id}] {s.heading_path} (pp. {s.page_start}-{s.page_end})"
-            for s in doc.sections
-        ]
-    return "\n".join(lines)
-
-
-def synthesize_with_citations(
-    gateway: LanguageGateway,
-    topic: str,
-    notes: Sequence[CuratorNote],
-    documents: Sequence[CompiledDocument],
-) -> str:
-    notes_text = "\n\n".join(f"### {n.scope_path}\n{n.content}" for n in notes) or "(none)"
-    catalog = _catalog_text(documents)
-    request = CorpusSynthesis(topic, notes_text, catalog)
-    markdown = gateway.run(request).synthesis_markdown
-    bad = invalid_citations(markdown, documents)
-    if not bad:
-        return markdown
-    feedback = f"Invalid: {', '.join(bad)}. Cite only these section tokens:\n" + "\n".join(
-        f"[{d.doc_id}:{s.section_id}]" for d in _citable(documents) for s in d.sections
+def breadcrumb_prefix(facets: Sequence[Facet], assignment: Mapping[str, Sequence[str]]) -> str:
+    """`<facet>: v1, v2 | ...` in facet definition order, values sorted, empty facets left out."""
+    return " | ".join(
+        f"{facet.name}: {', '.join(sorted(assignment[facet.name]))}"
+        for facet in facets
+        if assignment.get(facet.name)
     )
-    retry = CorpusSynthesis(topic, notes_text, catalog, citation_feedback=feedback)
-    markdown = gateway.run(retry).synthesis_markdown
-    bad = invalid_citations(markdown, documents)
-    if bad:
-        raise InvalidCitationError(
-            f"corpus synthesis still has invalid citations: {', '.join(bad)}"
+
+
+def bind_document(
+    document: CorpusDocument, facets: Sequence[Facet], assignment: Mapping[str, Sequence[str]]
+) -> CompiledDocument:
+    """Bind one document: section and chunk IDs, and breadcrumbs from its facets."""
+    reading, card = document.reading, document.reading.card
+    prefix = breadcrumb_prefix(facets, assignment)
+    sections: list[Section] = []
+    chunks: list[Chunk] = []
+    for read in reading.sections:
+        section = Section(
+            section_id=document.section_id(read.ordinal),
+            ordinal=read.ordinal,
+            heading_path=read.heading_path,
+            level=read.level,
+            page_start=read.page_start,
+            page_end=read.page_end,
+            markdown=read.markdown,
         )
-    return markdown
+        sections.append(section)
+        crumb = (
+            f"Doc: {card.title} (pp. {section.page_start}-{section.page_end})"
+            f" | Section: {section.heading_path}"
+        )
+        crumb = f"[{prefix} | {crumb}]" if prefix else f"[{crumb}]"
+        for piece in read.pieces:
+            ordinal = len(chunks) + 1
+            chunks.append(
+                Chunk(
+                    chunk_id=f"{document.doc_id}_chk_{ordinal:04d}",
+                    section_id=section.section_id,
+                    ordinal=ordinal,
+                    kind=piece.kind,
+                    page_start=piece.page_start,
+                    page_end=piece.page_end,
+                    breadcrumb=crumb,
+                    content=piece.content,
+                )
+            )
+    return CompiledDocument(
+        doc_id=document.doc_id,
+        rel_path=document.rel_path,
+        sha256=reading.sha256,
+        format=reading.format,
+        title=card.title,
+        doc_date=card.doc_date,
+        deliverable_type=card.deliverable_type,
+        summary=card.summary,
+        facets={
+            f.name: tuple(sorted(assignment[f.name])) for f in facets if assignment.get(f.name)
+        },
+        sections=tuple(sections),
+        chunks=tuple(chunks),
+        pages=reading.pages,
+        is_curator_note=reading.is_curator_note,
+    )
+
+
+def _effort_settings() -> dict[str, str]:
+    retry = FIDELITY_ATTEMPTS[1].effort
+    return {
+        PageTranscription.operation: f"{FIDELITY_ATTEMPTS[0].effort} ({retry} on fidelity retry)",
+        ObserveSections.operation: ObserveSections.effort,
+        ConsolidateCard.operation: ConsolidateCard.effort,
+        **INDUCTION_EFFORTS,
+    }
 
 
 def compile_corpus(
@@ -1071,30 +1253,38 @@ def compile_corpus(
     max_concurrency: int = 4,
 ) -> CompiledCorpus:
     sources = discover_corpus(corpus_dir)
-    note_bytes = {s.rel_path: read_source(s) for s in sources if s.is_curator_note}
-    notes = tuple(
-        CuratorNote(scope_path=s.rel_path, content=_decode_markdown(s, note_bytes[s.rel_path]))
-        for s in sources
-        if s.is_curator_note
-    )
-
-    def compile_source(source: SourceFile, doc_id: str) -> CompiledDocument:
-        data = note_bytes[source.rel_path] if source.is_curator_note else read_source(source)
-        return compile_document(source, doc_id, gateway, data)
-
     with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
-        futures: list[Future[CompiledDocument]] = [
-            pool.submit(compile_source, source, f"doc_{index:03d}")
-            for index, source in enumerate(sources, start=1)
+
+        def read(source: SourceFile) -> tuple[str | None, DocumentReading]:
+            """The reading and, for a curator note only, its text: no other bytes outlive it."""
+            data = read_source(source)
+            note = _decode_markdown(source, data) if source.is_curator_note else None
+            return note, read_document(source, data, gateway)
+
+        futures: list[Future[tuple[str | None, DocumentReading]]] = [
+            pool.submit(read, source) for source in sources
         ]
         try:
-            documents = tuple(future.result() for future in futures)
+            results = [future.result() for future in futures]
         except BaseException:
             pool.shutdown(cancel_futures=True)
             raise
-    synthesis = synthesize_with_citations(gateway, topic, notes, documents)
-    chunks = [chunk for doc in documents for chunk in doc.chunks]
+    notes = tuple(
+        CuratorNote(scope_path=source.rel_path, content=note)
+        for source, (note, _) in zip(sources, results, strict=True)
+        if note is not None
+    )
+    documents = tuple(
+        CorpusDocument(f"doc_{index:03d}", source.rel_path, reading)
+        for index, (source, (_, reading)) in enumerate(zip(sources, results, strict=True), start=1)
+    )
+    knowledge = induce(documents, notes, gateway, topic=topic, max_concurrency=max_concurrency)
+    compiled = tuple(
+        bind_document(d, knowledge.facets, knowledge.assignments[d.doc_id]) for d in documents
+    )
+    chunks = [chunk for doc in compiled for chunk in doc.chunks]
     embeddings = gateway.embed_texts([f"{c.breadcrumb}\n{c.content}" for c in chunks])
+    settings: dict[str, Any] = {**gateway.describe(), "efforts": _effort_settings()}
     return CompiledCorpus(
         corpus_dir=corpus_dir,
         topic=topic,
@@ -1102,7 +1292,12 @@ def compile_corpus(
         embedding_model=gateway.embedding_model,
         embedding_dimensions=gateway.embedding_dimensions,
         curator_notes=notes,
-        synthesis_markdown=synthesis,
-        documents=documents,
+        guide_markdown=knowledge.guide_markdown,
+        facets=knowledge.facets,
+        glossary=knowledge.glossary,
+        blueprints=knowledge.blueprints,
+        build_settings=settings,
+        build_report=knowledge.report,
+        documents=compiled,
         embeddings=embeddings,
     )

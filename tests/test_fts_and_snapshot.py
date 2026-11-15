@@ -25,12 +25,13 @@ from arkive_rag.models import (
 )
 from arkive_rag.snapshot import (
     MAX_TOP_K,
+    SCHEMA_VERSION,
     SNIPPET_CHARS,
     TopicSnapshot,
     build_fts5_query,
     write_snapshot,
 )
-from tests.support import BATHYMETRY_CORPUS, FakeGateway, compile_snapshot
+from tests.support import BATHYMETRY_CORPUS, MARKETING_CORPUS, FakeGateway, compile_snapshot
 
 FTS_BATTERY = [
     "Sentinel-2",
@@ -123,15 +124,15 @@ def test_invalid_search_requests_fail_before_any_query_embedding(
         return FakeGateway().embed_query(text)
 
     assert build_fts5_query("") is None
-    bad = [
-        ("", None, None),
-        (" \n ", None, None),
-        ("bathymetry", "p999", None),
-        ("bathymetry", None, "x"),
+    bad: list[tuple[str, dict[str, str]]] = [
+        ("", {}),
+        (" \n ", {}),
+        ("bathymetry", {"project": "p999"}),
+        ("bathymetry", {"stage": "memorandum"}),
     ]
-    for text, project, stage in bad:
+    for text, filters in bad:
         with pytest.raises(InvalidFilterError):
-            snapshot.search(text, embed, project=project, stage=stage)
+            snapshot.search(text, embed, filters=filters)
     with pytest.raises(InvalidFilterError, match="top_k"):
         snapshot.search("bathymetry", embed, top_k=MAX_TOP_K + 1)
     assert calls == []
@@ -233,43 +234,66 @@ def test_rank_channels_order_one_embedding_by_each_channel_and_handle_empty_snap
         }
 
 
-def test_filters_are_validated_against_snapshot_values(snapshot: TopicSnapshot) -> None:
+def test_filter_errors_name_the_valid_facets_and_values(snapshot: TopicSnapshot) -> None:
     vector = FakeGateway().embed_query
     with pytest.raises(
-        InvalidFilterError, match="valid projects: p101-harbour-lidar, p102-estuary-multibeam"
+        InvalidFilterError, match="unknown facet 'stage'; valid facets: project, client"
     ):
-        snapshot.search("bathymetry", vector, project="p999")
-    with pytest.raises(InvalidFilterError, match="valid stages: guidance, memorandum, proposal"):
-        snapshot.grep("bathymetry", stage="draft")
-    with pytest.raises(InvalidFilterError, match="unknown project"):
-        snapshot.list_documents(project="P101-HARBOUR-LIDAR")
+        snapshot.list_documents(filters={"stage": "memorandum"})
+    with pytest.raises(
+        InvalidFilterError,
+        match="unknown project value 'p999'; valid values: p101-harbour-lidar,"
+        " p102-estuary-multibeam, p103-reef-sonar",
+    ):
+        snapshot.search("bathymetry", vector, filters={"project": "p999"})
+    with pytest.raises(InvalidFilterError, match="unknown client value 'Fabrikam'"):
+        snapshot.grep("bathymetry", filters={"client": "Fabrikam"})
+    for blank in ("", " \t"):
+        with pytest.raises(InvalidFilterError, match="client filter value must not be blank"):
+            snapshot.list_documents(filters={"client": blank})
     with pytest.raises(InvalidFilterError, match="top_k"):
         snapshot.search("bathymetry", vector, top_k=0)
     with pytest.raises(ProviderError, match="dimension 64"):
         snapshot.search("bathymetry", lambda _: np.ones(3, dtype=np.float32))
 
 
-def test_filters_restrict_search_grep_and_listing(snapshot: TopicSnapshot) -> None:
-    hits = snapshot.search("Sentinel-2", FakeGateway().embed_query, stage="proposal")
-    assert {h.stage for h in hits} == {"proposal"}
-    assert [d.rel_path for d in snapshot.list_documents(project="p103-reef-sonar")] == [
-        "p103-reef-sonar/AGENTS.md"
+def test_filters_combine_with_and_resolve_aliases_and_restrict_every_read(
+    snapshot: TopicSnapshot,
+) -> None:
+    def paths(filters: dict[str, str]) -> list[str]:
+        return [d.rel_path for d in snapshot.list_documents(filters=filters)]
+
+    assert paths({}) == [d.rel_path for d in snapshot.list_documents()]
+    assert len(paths({})) == 3
+    assert paths({"project": "p103-reef-sonar"}) == ["p103-reef-sonar/AGENTS.md"]
+    # Values match case-insensitively, and an alias resolves to its canonical value.
+    assert paths({"client": "northwind"}) == ["p101-harbour-lidar/harbour-memo.md"]
+    assert paths({"client": "NORTHWIND MARINE", "project": "p101-harbour-lidar"}) == [
+        "p101-harbour-lidar/harbour-memo.md"
     ]
-    assert {m.project_id for m in snapshot.grep("sentinel-2")} == {
+    assert paths({"client": "Northwind Marine", "project": "p102-estuary-multibeam"}) == []
+    assert snapshot.resolve_filters({}) is None
+
+    hits = snapshot.search("Sentinel-2", FakeGateway().embed_query, filters={"client": "Contoso"})
+    assert hits and {tuple(h.facets["client"]) for h in hits} == {("Contoso Ports",)}
+    assert {m.facets["project"][0] for m in snapshot.grep("sentinel-2")} == {
         "p101-harbour-lidar",
         "p102-estuary-multibeam",
         "p103-reef-sonar",
     }
-    assert {
-        m.project_id for m in snapshot.grep("sentinel-2", project="p102-estuary-multibeam")
-    } == {"p102-estuary-multibeam"}
+    only_estuary = snapshot.grep("sentinel-2", filters={"project": "p102-estuary-multibeam"})
+    assert {m.doc_id for m in only_estuary} == {"doc_002"}
+    assert (
+        snapshot.grep("sentinel-2", filters={"client": "Contoso", "project": "p101-harbour-lidar"})
+        == []
+    )
 
 
 def test_curator_guidance_answers_status_questions(snapshot: TopicSnapshot) -> None:
     text = "Where is the reef Sentinel-2 case study?"
     top = snapshot.search(text, FakeGateway().embed_query, top_k=1)[0]
-    assert (top.kind, top.project_id) == ("guidance", "p103-reef-sonar")
-    assert snapshot.grep("case study")[0].stage == "guidance"
+    assert (top.kind, top.facets) == ("guidance", {"project": ["p103-reef-sonar"]})
+    assert snapshot.document(snapshot.grep("case study")[0].doc_id).is_curator_note
 
 
 def test_grep_folds_dashes_compatibility_forms_and_case(snapshot: TopicSnapshot) -> None:
@@ -285,7 +309,7 @@ def test_grep_folds_dashes_compatibility_forms_and_case(snapshot: TopicSnapshot)
 
 
 def test_sections_link_to_neighbours_and_missing_ids_raise(snapshot: TopicSnapshot) -> None:
-    doc = next(d for d in snapshot.list_documents() if d.stage == "memorandum")
+    doc = next(d for d in snapshot.list_documents() if d.deliverable_type == "survey memorandum")
     outline = snapshot.outline(doc.doc_id)
     first, second = outline.sections[0], outline.sections[1]
     view = snapshot.read_section(second.section_id)
@@ -367,14 +391,14 @@ def test_snapshot_reports_a_content_addressed_corpus_fingerprint(tmp_path: Path)
     assert (summary.corpus_fingerprint, summary.arkive_version) == (expected, __version__)
     assert sha256s["p1/memo.md"] == hashlib.sha256(b"# A\n\nDepth 12.5 m").hexdigest()
 
-    # A snapshot written before the keys were recorded reports the same fingerprint.
-    legacy = tmp_path / "legacy.arkive.db"
-    shutil.copy(output, legacy)
-    with sqlite3.connect(legacy) as db:
+    # Every metadata key is required.
+    unrecorded = tmp_path / "unrecorded.arkive.db"
+    shutil.copy(output, unrecorded)
+    with sqlite3.connect(unrecorded) as db:
         db.execute("DELETE FROM corpus_meta WHERE key IN ('corpus_fingerprint', 'arkive_version')")
     db.close()
-    with TopicSnapshot.open(legacy) as snap:
-        assert (snap.corpus_fingerprint, snap.arkive_version) == (expected, "")
+    with pytest.raises(SnapshotIntegrityError, match="lacks corpus_fingerprint, arkive_version"):
+        TopicSnapshot.open(unrecorded)
 
     tampered = tmp_path / "tampered.arkive.db"
     shutil.copy(output, tampered)
@@ -429,9 +453,11 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     stale = tmp_path / "stale.arkive.db"
     shutil.copy(path, stale)
     with sqlite3.connect(stale) as db:
-        db.execute("UPDATE corpus_meta SET value = '1.0' WHERE key = 'schema_version'")
+        db.execute("UPDATE corpus_meta SET value = '2.0' WHERE key = 'schema_version'")
     db.close()
-    with pytest.raises(SnapshotIntegrityError, match=r"schema version '1\.0'"):
+    with pytest.raises(
+        SnapshotIntegrityError, match=r"schema version '2\.0'; Arkive \S+ reads schema 3\.0 only"
+    ):
         TopicSnapshot.open(stale)
     with pytest.raises(SnapshotIntegrityError, match="does not exist"):
         TopicSnapshot.open(tmp_path / "absent.arkive.db")
@@ -439,3 +465,142 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     garbage.write_bytes(os.urandom(4096))
     with pytest.raises(SnapshotIntegrityError, match="not a valid snapshot"):
         TopicSnapshot.open(garbage)
+
+
+def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    for rel_path, text in MARKETING_CORPUS.items():
+        (corpus_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (corpus_dir / rel_path).write_text(text, encoding="utf-8")
+    corpus = compile_corpus(corpus_dir, FakeGateway(), topic="campaigns", title="Campaigns")
+    output = tmp_path / "campaigns.arkive.db"
+    write_snapshot(corpus, output)
+
+    with TopicSnapshot.open(output) as snap:
+        assert SCHEMA_VERSION == "3.0"
+        assert tuple(snap.facets) == corpus.facets
+        assert tuple(snap.glossary) == corpus.glossary
+        assert tuple(snap.blueprints) == corpus.blueprints
+        assert snap.build_settings == dict(corpus.build_settings)
+        assert snap.build_report == corpus.build_report
+        assert snap.guide_markdown == corpus.guide_markdown
+        assert {d.doc_id: d.facets for d in snap.list_documents()}["doc_004"] == {
+            "campaign": ["spring-launch"],
+            "author": ["Sam Okafor"],
+            "channel": ["Social"],
+        }
+        summary = snap.summary()
+    assert [(f.name, f.binding) for f in summary.facets] == [
+        ("campaign", "path"),
+        ("author", "content"),
+        ("channel", "content"),
+    ]
+    assert (summary.blueprints, summary.glossary_terms) == (["campaign brief", "review notes"], 3)
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "old", "new", "message"),
+    [
+        ("glossary", "entry_json", "doc_002_sec_002", "doc_002_sec_099", "cites 'doc_002_sec_099'"),
+        # doc_001 is the curator note: its sections are not citable.
+        ("glossary", "entry_json", "doc_002_sec_002", "doc_001_sec_001", "cites 'doc_001_sec_001'"),
+        ("blueprints", "blueprint_json", '"doc_002"', '"doc_001"', "names document 'doc_001'"),
+        ("blueprints", "blueprint_json", '"outline"', '"sketch"', "row is malformed"),
+    ],
+)
+def test_glossary_and_blueprint_rows_are_validated_when_a_snapshot_opens(
+    tmp_path: Path, table: str, column: str, old: str, new: str, message: str
+) -> None:
+    corpus_dir = tmp_path / "corpus"
+    for rel_path, text in MARKETING_CORPUS.items():
+        (corpus_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (corpus_dir / rel_path).write_text(text, encoding="utf-8")
+    output = tmp_path / "campaigns.arkive.db"
+    write_snapshot(compile_corpus(corpus_dir, FakeGateway(), topic="c", title="C"), output)
+    with sqlite3.connect(output) as db:
+        changed = db.execute(
+            f"UPDATE {table} SET {column} = replace({column}, ?, ?) WHERE ordinal = 1", (old, new)
+        ).rowcount
+    db.close()
+
+    assert changed == 1
+    with pytest.raises(SnapshotIntegrityError, match=message):
+        TopicSnapshot.open(output)
+
+
+def test_glossary_lookup_by_term_alias_list_and_miss(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, MARKETING_CORPUS, topic="campaigns")
+
+    with TopicSnapshot.open(path) as snap:
+        listing = snap.lookup_glossary()
+        by_term = snap.lookup_glossary("cta")
+        by_alias = snap.lookup_glossary("Call To Action")
+        miss = snap.lookup_glossary("net promoter score")
+        with pytest.raises(InvalidFilterError, match="blank"):
+            snap.lookup_glossary("  ")
+
+    assert [(t.term, t.defined, t.aliases) for t in listing.terms] == [
+        ("Churn", True, []),
+        ("CTA", True, ["call to action"]),
+        ("ICP", False, []),
+    ]
+    assert listing.matches == []
+    assert [e.term for e in by_term.matches] == ["CTA"] and by_term.terms == []
+    assert by_alias.matches == by_term.matches
+    assert len(by_term.matches[0].senses) == 2
+    assert (miss.query, miss.matches, miss.terms) == ("net promoter score", [], [])
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        (
+            "INSERT INTO document_facets VALUES ('doc_001', 'client', 'Fabrikam')",
+            "dangling foreign keys in document_facets",
+        ),
+        (
+            "INSERT INTO facet_aliases VALUES ('client', 'fabrikam', 'Fabrikam', 'Fabrikam')",
+            "dangling foreign keys in facet_aliases",
+        ),
+        (
+            "DELETE FROM facet_aliases WHERE facet = 'client' AND alias = value",
+            "value 'Contoso Ports' has no canonical alias row",
+        ),
+        # A blank folded key would let a blank filter resolve to the alias's value.
+        (
+            "UPDATE facet_aliases SET folded_alias = ''"
+            " WHERE rowid = (SELECT min(rowid) FROM facet_aliases WHERE alias != value)",
+            "has folded key '', which is not the alias's non-blank folded form",
+        ),
+        (
+            "UPDATE facet_aliases SET folded_alias = 'someone else'"
+            " WHERE rowid = (SELECT min(rowid) FROM facet_aliases WHERE alias != value)",
+            "has folded key 'someone else', which is not the alias's non-blank folded form",
+        ),
+        ("DROP TABLE chunks_fts", "lacks the tables chunks_fts"),
+        ("UPDATE documents SET page_count = 'many' WHERE ordinal = 1", "not a valid snapshot"),
+        ("UPDATE facet_values SET folders_json = '{' WHERE ordinal = 1", "facet row is malformed"),
+    ],
+)
+def test_a_damaged_snapshot_fails_to_open_with_an_integrity_error(
+    tmp_path: Path, damage: str, message: str
+) -> None:
+    path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
+    with sqlite3.connect(path) as db:
+        db.execute(damage)
+    db.close()
+
+    with pytest.raises(SnapshotIntegrityError, match=message) as raised:
+        TopicSnapshot.open(path)
+    assert str(path) in str(raised.value)
+
+
+def test_sqlite_errors_after_opening_are_integrity_errors(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
+    with TopicSnapshot.open(path) as snap:
+        # The file is damaged under an open snapshot.
+        with sqlite3.connect(path) as db:
+            db.execute("DROP TABLE chunks_fts")
+        db.close()
+        with pytest.raises(SnapshotIntegrityError, match="cannot read the snapshot"):
+            query(snap, "rainfall")

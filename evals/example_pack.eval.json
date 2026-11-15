@@ -1,5 +1,5 @@
 {
-  "format": "arkive-eval-pack/1",
+  "format": "arkive-eval-pack/2",
   "name": "example-bathymetry",
   "description": "Fictional example pack for a small marine survey corpus (Northwind Marine and Contoso Ports). Every name, value and file in it is invented; it shows the pack format and drives the offline tests.",
   "corpus_fingerprint": null,
@@ -29,7 +29,7 @@
       "category": "disambiguation_and_structure",
       "query": "What is the total fee for the estuary multibeam bathymetry survey?",
       "required_groups": [["120,000"]],
-      "project": "p102-estuary-multibeam"
+      "filters": {"project": "p102-estuary-multibeam"}
     },
     {
       "case_id": "conceptual_paraphrase_1",
@@ -56,23 +56,23 @@
     }
   ],
   "holdout_memo": {
-    "included_paths": ["p101-harbour-lidar", "p102-estuary-multibeam"],
-    "held_out_markers": ["p103", "reef-sonar"],
-    "reference_doc_id": "doc_003",
-    "memo_instructions": "You are a hydrographic analyst at Northwind Marine writing the final survey memorandum for the Contoso Ports reef sonar project. Write the complete memo in Markdown from the run notes in the prompt. Every project-specific fact must come from the run notes. Prior Northwind Marine project documents may be available through your tools; when they are, follow their house structure, conventions and explanations. Return only the memo.",
-    "run_notes": "run_handoff.json\n- project: Contoso Ports reef sonar habitat survey\n- sonar: Sonar-2 sidescan, 400 kHz, 2024-02-01 .. 2024-03-15\n- area: 812 km2, vertical datum LAT\n- tiling: 2000 x 2000 px tiles\n- outputs: reef_habitat_likelihood.tif, reef_habitat_threshold.tif; nodata=9999; masking=None\n- qc: false positives over moorings and dredged channels\n",
+    "included_paths": ["p101-harbour-lidar", "p103-reef-sonar"],
+    "held_out_markers": ["p102", "estuary-multibeam"],
+    "reference_doc_id": "doc_002",
+    "memo_instructions": "You are a hydrographic analyst at Northwind Marine writing the proposal for the Contoso Ports estuary multibeam survey. Write the complete proposal in Markdown from the scoping notes in the prompt. Every project-specific fact must come from the scoping notes. Prior Northwind Marine project documents may be available through your tools; when they are, follow their house structure, conventions and explanations. Return only the proposal.",
+    "run_notes": "scoping_notes.json\n- project: Contoso Ports estuary multibeam bathymetry survey\n- sonar: multibeam echosounder, 400 kHz, 2024-02-01 .. 2024-03-15\n- area: 812 km2, vertical datum LAT\n- tiling: 2000 x 2000 px tiles\n- outputs: estuary_depth_grid.tif, estuary_depth_uncertainty.tif; nodata=9999; masking=None\n- risks: false soundings over moorings and dredged channels\n- fee: 120,000 AUD\n",
     "rubric": [
       {
-        "check_id": "executive_summary",
+        "check_id": "scope_and_budget",
         "category": "house_structure",
-        "description": "Executive summary with recommendations.",
-        "require_groups": [["executive summary"], ["recommendation"]]
+        "description": "A scope section and a budget section.",
+        "require_groups": [["scope"], ["budget"]]
       },
       {
         "check_id": "limitations_section",
         "category": "house_structure",
         "description": "A limitations section that recommends ground truthing.",
-        "require_groups": [["limitation"], ["ground truth", "diver survey"]]
+        "require_groups": [["limitation"], ["ground truth", "check line"]]
       },
       {
         "check_id": "tile_size_not_contaminated",
@@ -92,7 +92,7 @@
         "check_id": "deliverables_and_area_kept",
         "category": "anti_contamination",
         "description": "Lists both GeoTIFF deliverables and keeps the 812 km2 survey area.",
-        "require_groups": [["reef_habitat_likelihood.tif"], ["reef_habitat_threshold.tif"], ["812 km2"]]
+        "require_groups": [["estuary_depth_grid.tif"], ["estuary_depth_uncertainty.tif"], ["812 km2"]]
       }
     ]
   }

@@ -5,9 +5,10 @@ from __future__ import annotations
 import base64
 import json
 import re
+import threading
 import zipfile
 import zlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -20,24 +21,51 @@ from numpy.typing import NDArray
 from pydantic import BaseModel
 
 from arkive_rag.compiler import (
-    CorpusSynthesis,
-    DocumentCatalogue,
+    ConsolidateCard,
+    ObserveSections,
     PageTranscription,
     compile_corpus,
     parse_markdown_blocks,
 )
-from arkive_rag.llm import AgentRequest, OpenAIGateway, StructuredRequest
+from arkive_rag.induction import (
+    OrganiseCorpus,
+    WriteBlueprint,
+    WriteGlossary,
+    WriteGuide,
+)
+from arkive_rag.llm import AgentRequest, OpenAIGateway, StructuredRequest, Tool
 from arkive_rag.models import (
-    CorpusSynthesisExtraction,
-    DocumentMetaExtraction,
-    LifecycleStage,
+    BlueprintDraft,
+    BlueprintSectionDraft,
+    CraftDraft,
+    DeliverableTypeDraft,
+    FacetDraft,
+    FacetValueDraft,
+    GlossaryDraft,
+    GlossaryEntryDraft,
+    GuidanceDraft,
+    GuideDraft,
+    ObservationDraft,
+    OrganisationDraft,
     PageExtraction,
+    SenseDraft,
+    StatedAttribute,
+    TermDraft,
+    fold_for_quote,
 )
 from arkive_rag.snapshot import write_snapshot
 
-_SECTION_TOKEN = re.compile(r"\[doc_\d+:doc_\d+_sec_\d+\]")
 TEST_BASE_URL = "https://api.openai.test/v1"
 SCRIPTED_EMBEDDING_DIMENSIONS = 8
+# Synthetic documents state what the fake gateway observes in plain lines: `Key: value`
+# attributes, `Convention:` / `Reviewer:` craft lines, and `**Term** (alias) means ...` terms.
+_KEY_LINE = re.compile(r"([A-Z][A-Za-z]{1,19}): (\S.*)")
+_CRAFT_KEYS = {"Convention": "convention", "Reviewer": "reviewer_feedback", "Caveat": "caveat"}
+_BOLD_TERM = re.compile(r"\*\*([^*]+)\*\*(?: \(([^)]+)\))?")
+_QUOTED = re.compile(r'"([^"]+)"')
+_FOLDER_FACET = re.compile(r"^Folders: (\w+)$", re.MULTILINE)
+# Attributes that describe the document rather than group the collection.
+_NOT_FACETS = {"deliverable", "date"}
 
 
 def hash_embedding(text: str, dimensions: int) -> NDArray[np.float32]:
@@ -52,12 +80,32 @@ def hash_embedding(text: str, dimensions: int) -> NDArray[np.float32]:
     return vector / norm
 
 
-class FakeGateway:
-    """A `LanguageGateway` that answers each compiler request type deterministically.
+def generic_heading(heading_path: str) -> str:
+    """A blueprint outline heading without the exemplar's own title: a document's top-level
+    heading names the project, so it becomes the generic opening section."""
+    *parents, last = heading_path.split(" > ")
+    return last if parents else "Title and summary"
 
-    Transcription echoes the native text layer as Markdown blocks. `page_script` and
-    `synthesis_script` queue scripted responses consumed in order. Every request is kept in
-    `requests`, and its operation name in `calls`.
+
+def _call(tool: Tool, **args: str) -> Any:
+    result = tool.invoke(args)
+    assert isinstance(result, str), "the source tools return text"
+    return json.loads(result)
+
+
+class FakeGateway:
+    """A `LanguageGateway` that answers every compiler request type deterministically.
+
+    It reads typed request fields and source text, never rendered prompts. Transcription echoes
+    the native text layer as Markdown blocks. Observation reads the synthetic line conventions
+    above. Organisation makes one path-bound facet from the top-level folders (named by a
+    `Folders: <name>` line in a root curator note, else `project`), one content-bound facet per
+    attribute with two or more values, and one deliverable type per observed type. The
+    blueprint agent calls the tools it is given. `judge` answers 0.9 when every double-quoted
+    span of a predicate occurs in the evidence, else 0.1.
+
+    Each `*_script` queues responses consumed before the deterministic answer. Every request
+    is kept in `requests`, its operation name in `calls`, and judge questions in `judged`.
     """
 
     embedding_model = "fake-hash-embedding"
@@ -67,12 +115,22 @@ class FakeGateway:
         self,
         *,
         page_script: Sequence[PageExtraction] = (),
-        synthesis_script: Sequence[str] = (),
+        observe_script: Sequence[ObservationDraft] = (),
+        organise_script: Sequence[OrganisationDraft] = (),
+        glossary_script: Sequence[GlossaryDraft] = (),
+        blueprint_script: Sequence[BlueprintDraft] = (),
+        guide_script: Sequence[str] = (),
     ) -> None:
         self.page_script = list(page_script)
-        self.synthesis_script = list(synthesis_script)
+        self.observe_script = list(observe_script)
+        self.organise_script = list(organise_script)
+        self.glossary_script = list(glossary_script)
+        self.blueprint_script = list(blueprint_script)
+        self.guide_script = list(guide_script)
         self.requests: list[object] = []
         self.calls: list[str] = []
+        self.judged: list[tuple[str, str, list[str]]] = []
+        self._lock = threading.Lock()
 
     @property
     def transcribe_calls(self) -> list[tuple[str, tuple[str, ...]]]:
@@ -80,57 +138,207 @@ class FakeGateway:
             (r.effort, r.missing_values) for r in self.requests if isinstance(r, PageTranscription)
         ]
 
-    @property
-    def synthesis_feedback(self) -> list[str | None]:
-        return [r.citation_feedback for r in self.requests if isinstance(r, CorpusSynthesis)]
+    def of_type[R](self, kind: type[R]) -> list[R]:
+        return [r for r in self.requests if isinstance(r, kind)]
 
     def describe(self) -> dict[str, str]:
-        return {"embedding_model": self.embedding_model}
+        return {"model": "fake-model", "embedding_model": self.embedding_model}
+
+    def _record(self, request: object, operation: str) -> None:
+        with self._lock:
+            self.requests.append(request)
+            self.calls.append(operation)
+
+    def _pop[R](self, script: list[R]) -> R | None:
+        with self._lock:
+            return script.pop(0) if script else None
 
     def run[T: BaseModel](self, request: StructuredRequest[T]) -> T:
-        self.requests.append(request)
-        self.calls.append(request.operation)
+        self._record(request, request.operation)
         return cast(T, self.answer(request))
 
     def answer(self, request: object) -> BaseModel:
         match request:
             case PageTranscription(native_text=native_text, image_webp=webp):
                 assert webp[:4] == b"RIFF", "pages must be rendered as WebP"
-                if self.page_script:
-                    return self.page_script.pop(0)
-                return parse_markdown_blocks(native_text)
-            case DocumentCatalogue(rel_path=rel_path, project_id=project_id):
-                return self.catalogue(rel_path, project_id)
-            case CorpusSynthesis(topic=topic, catalog_text=catalog):
-                if self.synthesis_script:
-                    markdown = self.synthesis_script.pop(0)
-                else:
-                    citations = _SECTION_TOKEN.findall(catalog)[:2]
-                    markdown = (
-                        f"# {topic}\n\nThe corpus covers several projects {' '.join(citations)}."
-                    )
-                return CorpusSynthesisExtraction(synthesis_markdown=markdown)
+                return self._pop(self.page_script) or parse_markdown_blocks(native_text)
+            case ObserveSections():
+                return self._pop(self.observe_script) or self.observe(request)
+            case ConsolidateCard(headers=headers):
+                return headers[0]
+            case OrganiseCorpus():
+                return self._pop(self.organise_script) or self.organise(request)
+            case WriteGlossary():
+                return self._pop(self.glossary_script) or self.glossary(request)
+            case WriteGuide(topic=topic, catalog=catalog):
+                markdown = self._pop(self.guide_script)
+                if markdown is None:
+                    sections = [(e.doc_id, s.section_id) for e in catalog for s in e.sections][:2]
+                    cited = " ".join(f"[{d}:{s}]" for d, s in sections)
+                    markdown = f"# {topic}\n\nThe corpus covers several documents {cited}."
+                return GuideDraft(guide_markdown=markdown)
         raise AssertionError(f"unexpected request {request!r}")
 
-    def catalogue(self, rel_path: str, project_id: str) -> DocumentMetaExtraction:
-        name = rel_path.lower()
-        stage: LifecycleStage = (
-            "proposal" if "proposal" in name else "memorandum" if "memo" in name else "reference"
+    def observe(self, request: ObserveSections) -> ObservationDraft:
+        attributes: list[StatedAttribute] = []
+        terms: list[TermDraft] = []
+        craft: list[CraftDraft] = []
+        prose: list[str] = []
+        for section in request.sections:
+            for line in section.markdown.splitlines():
+                key = _KEY_LINE.fullmatch(line.strip())
+                if key and key[1] in _CRAFT_KEYS:
+                    aspect = cast(Any, _CRAFT_KEYS[key[1]])
+                    craft.append(CraftDraft(aspect=aspect, statement=key[2], quote=key[2]))
+                elif key:
+                    attributes.append(StatedAttribute(name=key[1].lower(), value=key[2]))
+                elif line.strip() and not line.startswith(("#", "|", ">")):
+                    prose.append(line.strip().replace("**", ""))
+                for match in _BOLD_TERM.finditer(line):
+                    rest = line[match.end() :]
+                    terms.append(
+                        TermDraft(
+                            term=match[1],
+                            kind="acronym" if match[1].isupper() else "concept",
+                            aliases=[match[2]] if match[2] else [],
+                            quote=line.strip().replace("**", ""),
+                            defines=rest.startswith((" means ", " is ")),
+                        )
+                    )
+        stated = {a.name: a.value for a in attributes}
+        title = request.sections[0].heading_path.split(" > ")[0]
+        return ObservationDraft(
+            title=title,
+            doc_date=stated.get("date"),
+            deliverable_type=stated.get("deliverable", "document"),
+            summary=prose[0] if prose else f"About {title}.",
+            attributes=attributes,
+            terms=terms,
+            craft=craft,
         )
-        client = "Contoso Ports" if "estuary" in project_id else "Northwind Marine"
-        title = Path(rel_path).stem.replace("-", " ").title()
-        return DocumentMetaExtraction(
-            title=title, client=client, stage=stage, doc_date=None, summary=f"About {title}."
-        )
+
+    def organise(self, request: OrganiseCorpus) -> OrganisationDraft:
+        facets: list[FacetDraft] = []
+        top = sorted({f for f in request.folders if "/" not in f})
+        root_notes = [n.content for n in request.notes if "/" not in n.scope_path]
+        named = [m[1] for note in root_notes if (m := _FOLDER_FACET.search(note))]
+        if len(top) >= 2:
+            name = named[0] if named else "project"
+            values = [
+                FacetValueDraft(value=f, description=f"The {f} folder.", aliases=[], folders=[f])
+                for f in top
+            ]
+            facets.append(FacetDraft(name=name, description=f"The {name} folder.", values=values))
+        stated: dict[str, set[str]] = {}
+        for digest in request.cards:
+            for attribute in digest.card.attributes:
+                stated.setdefault(attribute.name, set()).add(attribute.value)
+        for name in sorted(stated):
+            if name in _NOT_FACETS or len(stated[name]) < 2:
+                continue
+            firsts = [v.split()[0] for v in sorted(stated[name])]
+            values = [
+                FacetValueDraft(
+                    value=v,
+                    description=f"Documents whose {name} is {v}.",
+                    aliases=[v.split()[0]] if " " in v and firsts.count(v.split()[0]) == 1 else [],
+                    folders=[],
+                )
+                for v in sorted(stated[name])
+            ]
+            facets.append(
+                FacetDraft(name=name, description=f"The {name} a document states.", values=values)
+            )
+        by_type: dict[str, list[str]] = {}
+        for digest in request.cards:
+            if digest.card.deliverable_type != "document":
+                by_type.setdefault(digest.card.deliverable_type, []).append(digest.doc_id)
+        feedback = sorted(d for t, ids in by_type.items() if "review" in t for d in ids)
+        types = [
+            DeliverableTypeDraft(
+                name=name,
+                description=f"A {name}.",
+                exemplar_doc_ids=ids,
+                feedback_doc_ids=[] if "review" in name else feedback,
+            )
+            for name, ids in sorted(by_type.items())
+        ]
+        return OrganisationDraft(facets=facets, deliverable_types=types)
+
+    def glossary(self, request: WriteGlossary) -> GlossaryDraft:
+        entries: list[GlossaryEntryDraft] = []
+        for cluster in request.clusters:
+            defining = {q.text: q.section_id for q in cluster.quotes if q.defines}
+            if defining:
+                senses = [SenseDraft(definition=t, citations=[s]) for t, s in defining.items()]
+            else:
+                seen = [q.section_id for q in cluster.quotes]
+                seen += [o.section_id for o in cluster.occurrences]
+                senses = [SenseDraft(definition=None, citations=sorted(set(seen))[:3])]
+            entries.append(
+                GlossaryEntryDraft(
+                    term=cluster.term,
+                    kind=cluster.kind,
+                    aliases=list(cluster.aliases),
+                    senses=senses,
+                )
+            )
+        return GlossaryDraft(entries=entries)
 
     def run_agent[T: BaseModel](self, request: AgentRequest[T]) -> T:
-        raise AssertionError(f"the compiler makes no agent requests: {request.operation}")
+        self._record(request, request.operation)
+        assert isinstance(request, WriteBlueprint), f"unexpected agent request {request!r}"
+        scripted = self._pop(self.blueprint_script)
+        return cast(T, scripted or self.blueprint(request))
+
+    def blueprint(self, request: WriteBlueprint) -> BlueprintDraft:
+        tools = {t.name: t for t in request.tools}
+        dtype = request.deliverable_type
+        _call(tools["grep"], pattern=dtype.name)
+
+        def lines(doc_ids: Sequence[str], key: str) -> list[GuidanceDraft]:
+            found: dict[str, list[str]] = {}
+            for doc_id in doc_ids:
+                for section in _call(tools["outline"], doc_id=doc_id)["sections"]:
+                    read = _call(tools["read_section"], section_id=section["section_id"])
+                    for line in read["markdown"].splitlines():
+                        if line.startswith(f"{key}: "):
+                            statement = line.removeprefix(f"{key}: ")
+                            found.setdefault(statement, []).append(section["section_id"])
+            return [GuidanceDraft(statement=s, citations=c) for s, c in found.items()]
+
+        first = _call(tools["outline"], doc_id=dtype.exemplar_doc_ids[0])
+        conventions = lines(dtype.exemplar_doc_ids, "Convention")
+        pitfalls = lines(dtype.feedback_doc_ids, "Reviewer")
+        return BlueprintDraft(
+            description=f"How the collection writes a {dtype.name}.",
+            exemplar_doc_ids=list(dtype.exemplar_doc_ids),
+            outline=[
+                BlueprintSectionDraft(
+                    heading=generic_heading(s["heading_path"]),
+                    purpose=f"Covers {generic_heading(s['heading_path'])}.",
+                    citations=[s["section_id"]],
+                )
+                for s in first["sections"]
+            ],
+            conventions=conventions,
+            pitfalls=pitfalls,
+        )
 
     def judge(self, operation: str, evidence: str, predicates: Sequence[str]) -> list[float | None]:
-        raise AssertionError(f"the compiler makes no judge requests: {operation}")
+        with self._lock:
+            self.calls.append(operation)
+            self.judged.append((operation, evidence, list(predicates)))
+        haystack = fold_for_quote(evidence)
+        return [
+            0.9
+            if all(fold_for_quote(span) in haystack for span in _QUOTED.findall(predicate))
+            else 0.1
+            for predicate in predicates
+        ]
 
     def embed_texts(self, texts: Sequence[str]) -> NDArray[np.float32]:
-        self.calls.append("embed_texts")
+        self._record(list(texts), "embed_texts")
         rows = [hash_embedding(text, self.embedding_dimensions) for text in texts]
         return np.vstack(rows) if rows else np.zeros((0, self.embedding_dimensions), np.float32)
 
@@ -213,16 +421,20 @@ def decision_body(answers: Sequence[float | None], input_tokens: int = 50) -> di
 
 
 def _default_structured(schema_name: str) -> BaseModel:
-    if schema_name == "DocumentMetaExtraction":
-        return DocumentMetaExtraction(
+    if schema_name == "ObservationDraft":
+        return ObservationDraft(
             title="Memo",
-            client="Northwind Marine",
-            stage="memorandum",
             doc_date="2025-10",
+            deliverable_type="memorandum",
             summary="Bathymetry memo.",
+            attributes=[],
+            terms=[],
+            craft=[],
         )
-    if schema_name == "CorpusSynthesisExtraction":
-        return CorpusSynthesisExtraction(synthesis_markdown="Overview [doc_001:doc_001_sec_001].")
+    if schema_name == "OrganisationDraft":
+        return OrganisationDraft(facets=[], deliverable_types=[])
+    if schema_name == "GuideDraft":
+        return GuideDraft(guide_markdown="Overview [doc_001:doc_001_sec_001].")
     raise AssertionError(f"no default response for schema {schema_name!r}; script one")
 
 
@@ -241,11 +453,15 @@ class ScriptedOpenAI:
 
     A scripted outcome is a JSON body (status 200), an `httpx2.Response`, or a transport
     exception to raise (`httpx2.ConnectError` reaches the SDK as `APIConnectionError`). When
-    a path's script is empty, catalogue and synthesis requests get a valid default, decisions
-    answer 0.75 to every question and embeddings return positive vectors.
+    a path's script is empty, a structured request gets `defaults[schema name]`, a model or a
+    function of the request body (agent runs ask for the schema name "final_output"), else
+    a valid default for observation, organisation and guide requests; decisions answer 0.75
+    to every question and embeddings return positive vectors.
     """
 
     def __init__(self) -> None:
+        self.defaults: dict[str, BaseModel | Callable[[dict[str, Any]], BaseModel]] = {}
+        self._lock = threading.Lock()
         self.scripts: dict[str, list[Outcome]] = {
             "/responses": [],
             "/decisions": [],
@@ -267,9 +483,10 @@ class ScriptedOpenAI:
         path = request.url.path.removeprefix("/v1")
         body = json.loads(request.content)
         timeout = request.extensions.get("timeout", {}).get("read")
-        self.exchanges.append(Exchange(path, body, timeout))
-        script = self.scripts[path]
-        outcome = script.pop(0) if script else self._default(path, body)
+        with self._lock:
+            self.exchanges.append(Exchange(path, body, timeout))
+            script = self.scripts[path]
+            outcome = script.pop(0) if script else self._default(path, body)
         if isinstance(outcome, Exception):
             raise outcome
         if isinstance(outcome, httpx2.Response):
@@ -278,7 +495,9 @@ class ScriptedOpenAI:
 
     def _default(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         if path == "/responses":
-            return structured_body(_default_structured(body["text"]["format"]["name"]))
+            name = body["text"]["format"]["name"]
+            default = self.defaults.get(name) or _default_structured(name)
+            return structured_body(default if isinstance(default, BaseModel) else default(body))
         if path == "/decisions":
             return decision_body([0.75] * len(body["questions"]))
         rows = [
@@ -417,14 +636,45 @@ BATHYMETRY_CORPUS = {
         "## Statistics\n\nThe p-value: 0.05 threshold applied. Area covered 59,494 km\u00b2"
         " of the harbour approaches.\n\n| Layer | File |\n| --- | --- |\n| Dry season |"
         " harbour_dry_depth_thresh.tif |\n\n# Bathymetry\n\nSoundings were reduced with"
-        " formula C12-SUM(C13:C15) in the workbook.\n"
+        " formula C12-SUM(C13:C15) in the workbook. **LAT** (lowest astronomical tide) is the"
+        " vertical datum of every sounding.\n\nConvention: Report depths in metres below the"
+        " stated datum.\n\nDeliverable: survey memorandum\nClient: Northwind Marine\n"
     ),
     "p102-estuary-multibeam/estuary-proposal.md": (
         "# Scope\n\nEstuary multibeam bathymetry using Sentinel-2 and tide gauge depth.\n\n"
-        "# Budget\n\nTotal fee 120,000 AUD.\n"
+        "# Budget\n\nTotal fee 120,000 AUD. Soundings will be reduced to **LAT**.\n\n"
+        "Deliverable: proposal\nClient: Contoso Ports\n"
     ),
     "p103-reef-sonar/AGENTS.md": (
         "# Status\n\nThe reef Sentinel-2 case study has not been written yet.\n"
+    ),
+}
+
+# A campaign library organised by campaign folder, with authors and channels stated in the
+# documents: a different organisation from the project folders above.
+MARKETING_CORPUS = {
+    "AGENTS.md": (
+        "# Campaign library\n\nFolders: campaign\n\nEach folder holds one campaign's brief"
+        " and its review notes. The autumn recap deck is still missing.\n"
+    ),
+    "loyalty-relaunch/brief.md": (
+        "# Loyalty Relaunch Brief\n\nDeliverable: campaign brief\nChannel: Email\n"
+        "Author: Dana Reyes\n\n## Audience\n\nLapsed members. **Churn** is the share of"
+        " members who stop buying within a year.\n\n## Messaging\n\n"
+        "Convention: Lead with the customer benefit before the product name.\n\n"
+        "**CTA** (call to action) is the button that closes every email.\n"
+    ),
+    "spring-launch/brief.md": (
+        "# Spring Launch Brief\n\nDeliverable: campaign brief\nChannel: Social\n"
+        "Author: Dana Reyes\n\n## Audience\n\nFirst-time buyers aged 25 to 34.\n\n"
+        "## Messaging\n\nConvention: Lead with the customer benefit before the product name."
+        "\n\n**CTA** (call to action) means the single step a reader should take next.\n\n"
+        "Write every line for the **ICP**.\n"
+    ),
+    "spring-launch/review.md": (
+        "# Spring Brief Review\n\nDeliverable: review notes\nChannel: Social\n"
+        "Author: Sam Okafor\n\n## Comments\n\nReviewer: Cut the jargon from the opening line."
+        "\n\nThe **CTA** was buried in paragraph three. The **ICP** was never named.\n"
     ),
 }
 

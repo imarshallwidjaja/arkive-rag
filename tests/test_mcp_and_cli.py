@@ -17,11 +17,12 @@ from typer.testing import CliRunner
 
 from arkive_rag import __version__, cli
 from arkive_rag.cli import app
-from arkive_rag.models import ArkiveError, DocumentMetaExtraction
+from arkive_rag.models import ArkiveError, ObservationDraft
 from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
 from tests.support import (
     BATHYMETRY_CORPUS,
+    MARKETING_CORPUS,
     FakeGateway,
     ScriptedOpenAI,
     compile_snapshot,
@@ -82,7 +83,7 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
         [
             ("list_topics", {}),
             ("get_topic_guide", {"topic": marine}),
-            ("list_documents", {"topic": marine, "stage": "memorandum"}),
+            ("list_documents", {"topic": marine, "filters": {"project": "p101-harbour-lidar"}}),
             ("get_document_outline", {"topic": marine, "doc_id": "doc_001"}),
             ("search", {"topic": marine, "query": "nine year median rainfall", "top_k": 3}),
             ("grep", {"topic": marine, "pattern": "330.9"}),
@@ -90,17 +91,30 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
             ("view_page", {"topic": marine, "doc_id": "doc_001", "page_number": 2}),
             ("list_documents", {"topic": "soils"}),
             ("grep", {"topic": "soils", "pattern": "330.9"}),
+            ("lookup_glossary", {"topic": marine}),
+            ("lookup_glossary", {"topic": marine, "query": "lowest astronomical"}),
         ],
         FakeGateway().embed_query,
     )
-    topics, guide, memos, outline, hits, matches, section, page, soils, soils_grep = results
+    topics, guide, memos, outline, hits, matches, section, page, soils, soils_grep = results[:10]
+    terms, lat = results[10:]
 
     assert [(t["topic"], t["document_count"]) for t in data(topics)] == [
         ("bathymetry", 4),
         ("soils", 1),
     ]
     assert [len(t["corpus_fingerprint"]) for t in data(topics)] == [64, 64]
-    assert "[doc_00" in data(guide)["synthesis_markdown"]
+    project = data(topics)[0]["facets"][0]
+    assert (project["name"], project["values"]) == (
+        "project",
+        ["p101-harbour-lidar", "p102-estuary-multibeam", "p103-reef-sonar"],
+    )
+    assert "[doc_00" in data(guide)["guide_markdown"]
+    assert [b["deliverable_type"] for b in data(guide)["blueprints"]] == [
+        "proposal",
+        "survey memorandum",
+    ]
+    assert data(guide)["glossary_terms"] == ["LAT"]
     assert data(guide)["curator_notes"][0]["scope_path"] == "p103-reef-sonar/AGENTS.md"
     assert [d["rel_path"] for d in data(memos)] == [
         "p101-harbour-lidar/harbour-chart-memo.pdf",
@@ -117,6 +131,10 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
     assert base64.b64decode(image.data)[8:12] == b"WEBP"
     assert [d["rel_path"] for d in data(soils)] == ["p900-soils/soils-memo.md"]
     assert data(soils_grep) == []
+    assert [(t["term"], t["defined"]) for t in data(terms)["terms"]] == [("LAT", True)]
+    (entry,) = data(lat)["matches"]
+    assert entry["aliases"] == ["lowest astronomical tide"]
+    assert entry["senses"][0]["citations"] == ["doc_002_sec_003"]
 
 
 def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
@@ -130,20 +148,24 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
             ("read_section", {"topic": "bathymetry", "section_id": "doc_001_sec_001"}),
             ("view_page", {"topic": "bathymetry", "doc_id": "doc_001", "page_number": 1}),
             ("list_documents", {"topic": "mining"}),
-            ("list_documents", {"topic": "bathymetry", "project": "p999"}),
+            ("list_documents", {"topic": "bathymetry", "filters": {"project": "p999"}}),
             ("view_page", {"topic": "bathymetry", "doc_id": "doc_001", "page_number": 9}),
+            ("grep", {"topic": "bathymetry", "pattern": "x", "filters": {"stage": "memo"}}),
+            ("lookup_glossary", {"topic": "bathymetry", "query": " "}),
         ],
         None,
     )
-    search, grep, section, page, bad_topic, bad_project, bad_page = results
+    search, grep, section, page, bad_topic, bad_project, bad_page, bad_facet, blank = results
 
     assert "OPENAI_API_KEY" in error_text(search) and "grep" in error_text(search)
     assert len(data(grep)) == 1
     assert data(section)["section_id"] == "doc_001_sec_001"
     assert isinstance(page.content[1], ImageContent)
     assert error_text(bad_topic).endswith("unknown topic 'mining'; valid topics: bathymetry, soils")
-    assert "valid projects: p101-harbour-lidar" in error_text(bad_project)
+    assert "valid values: p101-harbour-lidar" in error_text(bad_project)
     assert error_text(bad_page).endswith("doc_001 has no page 9; it has pages 1-2")
+    assert error_text(bad_facet).endswith("unknown facet 'stage'; valid facets: project, client")
+    assert "glossary query must not be blank" in error_text(blank)
 
 
 def test_catalog_rejects_two_snapshots_with_the_same_topic(
@@ -163,9 +185,21 @@ def test_cli_inspect_and_grep_work_offline(
 
     inspected = runner.invoke(app, ["inspect", str(snapshots[0])])
     grepped = runner.invoke(
-        app, ["grep", str(snapshots[0]), "km2", "--project", "p101-harbour-lidar"]
+        app,
+        [
+            "grep",
+            str(snapshots[0]),
+            "sentinel-2",
+            "--filter",
+            "project=p101-harbour-lidar",
+            "--filter",
+            "client=Northwind",
+        ],
     )
-    bad_stage = runner.invoke(app, ["grep", str(snapshots[0]), "bathymetry", "--stage", "draft"])
+    bad_facet = runner.invoke(app, ["grep", str(snapshots[0]), "x", "--filter", "stage=draft"])
+    twice = ["--filter", "project=p101-harbour-lidar", "--filter", "project=p103-reef-sonar"]
+    repeated = runner.invoke(app, ["grep", str(snapshots[0]), "x", *twice])
+    malformed = runner.invoke(app, ["grep", str(snapshots[0]), "x", "--filter", "project"])
     search = runner.invoke(app, ["search", str(snapshots[0]), "rainfall"])
 
     assert inspected.exit_code == 0, inspected.output
@@ -180,17 +214,27 @@ def test_cli_inspect_and_grep_work_offline(
         "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "rel_path": "p101-harbour-lidar/harbour-chart-memo.pdf",
         "format": "pdf",
-        "project_id": "p101-harbour-lidar",
-        "client": "Northwind Marine",
-        "stage": "memorandum",
-        "title": "Harbour Chart Memo",
+        "title": "Rainfall",
         "doc_date": None,
+        "deliverable_type": "document",
         "page_count": 2,
+        "is_curator_note": False,
+        "facets": {"project": ["p101-harbour-lidar"]},
         "sections": 2,
     }
-    assert grepped.exit_code == 0
-    assert "59,494 km²" in json.loads(grepped.stdout)[0]["snippet"]
-    assert bad_stage.exit_code == 1 and "valid stages" in bad_stage.stderr
+    assert [f["name"] for f in summary["facets"]] == ["project", "client"]
+    assert [e["term"] for e in summary["glossary"]] == ["LAT"]
+    assert [b["deliverable_type"] for b in summary["blueprints"]] == [
+        "proposal",
+        "survey memorandum",
+    ]
+    assert summary["build_settings"]["efforts"]["observe"] == "low"
+    assert summary["build_report"]["discarded_unlocated_quotes"] == 0
+    assert grepped.exit_code == 0, grepped.output
+    assert [m["doc_id"] for m in json.loads(grepped.stdout)] == ["doc_002"]
+    assert bad_facet.exit_code == 1 and "valid facets: project, client" in bad_facet.stderr
+    assert repeated.exit_code == 2 and "given twice" in repeated.output
+    assert malformed.exit_code == 2 and "not FACET=VALUE" in malformed.output
     assert search.exit_code == 1 and "OPENAI_API_KEY" in search.stderr
 
 
@@ -254,12 +298,17 @@ def test_cli_build_rejects_outputs_in_the_corpus_before_any_work(
     shared = tmp_path / "t.db"
     same = runner.invoke(app, ["build", str(corpus), "-o", str(shared), "--cache", str(shared)])
 
-    free = runner.invoke(app, ["build", str(corpus), "-o", str(shared), "--max-cost", "0"])
+    refused = [
+        runner.invoke(app, ["build", str(corpus), "-o", str(shared), "--max-cost", limit])
+        for limit in ("0", "inf", "nan")
+    ]
     keyless = runner.invoke(app, ["build", str(corpus), "-o", str(shared), "--max-cost", "1"])
 
     assert inside.exit_code == 1 and "inside the corpus directory" in inside.stderr
     assert same.exit_code == 1 and "must be different files" in same.stderr
-    assert free.exit_code == 2 and "--max-cost must be positive" in free.output
+    for result in refused:
+        message = " ".join(result.output.replace("\u2502", " ").split())
+        assert result.exit_code == 2 and "--max-cost must be a positive finite" in message
     # A build that stops still reports what it spent.
     assert keyless.exit_code == 1 and "OPENAI_API_KEY" in keyless.stderr
     assert "usage: 0 provider calls" in keyless.stdout
@@ -274,11 +323,17 @@ def test_cli_build_that_reaches_the_spend_limit_exits_with_its_usage_and_no_snap
     (corpus / "p1").mkdir(parents=True)
     (corpus / "p1" / "memo.md").write_text("# Memo\n\nSeagrass at 59,494 ha.")
     api = ScriptedOpenAI()
-    # Cataloguing the one document costs $0.30, so the synthesis call that follows is refused.
-    meta = DocumentMetaExtraction(
-        title="Memo", client="Contoso Ports", stage="memorandum", doc_date=None, summary="Seagrass."
+    # Observing the one document costs $0.30, so the organisation call that follows is refused.
+    card = ObservationDraft(
+        title="Memo",
+        doc_date=None,
+        deliverable_type="memorandum",
+        summary="Seagrass.",
+        attributes=[],
+        terms=[],
+        craft=[],
     )
-    api.script("/responses", structured_body(meta, tokens=usage(100_000, 10_000)))
+    api.script("/responses", structured_body(card, tokens=usage(100_000, 10_000)))
     monkeypatch.setattr(cli, "OpenAIGateway", api.gateway)
     output = tmp_path / "t.arkive.db"
 
@@ -289,3 +344,41 @@ def test_cli_build_that_reaches_the_spend_limit_exits_with_its_usage_and_no_snap
     assert "usage: 1 provider calls" in result.stdout and "estimated $0.3000" in result.stdout
     assert api.request_count == 1
     assert sorted(p.name for p in tmp_path.iterdir()) == ["corpus"]
+
+
+def test_cli_builds_differently_organised_corpora_into_different_knowledge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "OpenAIGateway", lambda **options: FakeGateway())
+    runner = CliRunner()
+    summaries = {}
+    for name, files in (("bathymetry", BATHYMETRY_CORPUS), ("campaigns", MARKETING_CORPUS)):
+        corpus = tmp_path / name
+        for rel_path, text in files.items():
+            (corpus / rel_path).parent.mkdir(parents=True, exist_ok=True)
+            (corpus / rel_path).write_text(text, encoding="utf-8")
+        output = tmp_path / f"{name}.arkive.db"
+        built = runner.invoke(app, ["build", str(corpus), "-o", str(output)])
+        assert built.exit_code == 0, built.output
+        assert "build report: {" in built.stdout and f"wrote {output}" in built.stdout
+        inspected = runner.invoke(app, ["inspect", str(output)])
+        summaries[name] = json.loads(inspected.stdout)
+
+    def knowledge(name: str) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+        summary = summaries[name]
+        return (
+            [(f["name"], f["binding"]) for f in summary["facets"]],
+            [e["term"] for e in summary["glossary"]],
+            [b["deliverable_type"] for b in summary["blueprints"]],
+        )
+
+    assert knowledge("bathymetry") == (
+        [("project", "path"), ("client", "content")],
+        ["LAT"],
+        ["proposal", "survey memorandum"],
+    )
+    assert knowledge("campaigns") == (
+        [("campaign", "path"), ("author", "content"), ("channel", "content")],
+        ["Churn", "CTA", "ICP"],
+        ["campaign brief", "review notes"],
+    )

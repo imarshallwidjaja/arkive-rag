@@ -1,44 +1,65 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from arkive_rag.compiler import (
     FIDELITY_ATTEMPTS,
     MAX_CHUNK_CHARS,
-    ChunkContext,
+    OBSERVE_BATCH_CHARS,
+    BatchSection,
+    ObserveSections,
     SectionDraft,
     assemble_sections,
-    build_chunks,
+    bind_document,
     compile_corpus,
+    curator_note_card,
     discover_corpus,
     fidelity_anchors,
     find_furniture,
-    invalid_citations,
+    locate_quote,
     missing_anchors,
+    observation_batches,
     parse_markdown_blocks,
     render_pdf,
+    section_pieces,
     split_table,
     split_table_block,
     strip_furniture,
-    synthesize_with_citations,
     transcribe_with_fidelity,
 )
 from arkive_rag.llm import BuildCache
 from arkive_rag.models import (
-    CompiledDocument,
+    BlueprintDraft,
+    BlueprintSectionDraft,
+    ChunkPiece,
     ConversionError,
-    DocumentMetaExtraction,
-    InvalidCitationError,
+    CorpusDocument,
+    CraftDraft,
+    DeliverableTypeDraft,
+    DocumentReading,
+    Facet,
+    FacetDraft,
+    FacetValue,
+    FacetValueDraft,
+    GuidanceDraft,
+    GuideDraft,
+    ObservationCard,
+    ObservationDraft,
+    OrganisationDraft,
     PageBlock,
     PageExtraction,
-    Section,
+    ReadSection,
+    RejectedOutputError,
+    TermDraft,
     TranscriptionFidelityError,
     UnsafePathError,
     UnsupportedFormatError,
@@ -73,10 +94,17 @@ def page(*blocks: PageBlock, visuals: tuple[VisualTranscript, ...] = ()) -> Page
     return PageExtraction(blocks=list(blocks), visuals=list(visuals))
 
 
+def write_files(root: Path, files: dict[str, str]) -> Path:
+    for rel_path, text in files.items():
+        (root / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel_path).write_text(text, encoding="utf-8")
+    return root
+
+
 # Discovery.
 
 
-def test_discovery_derives_project_from_top_folder_and_skips_hidden(tmp_path: Path) -> None:
+def test_discovery_lists_supported_files_in_sorted_order_and_skips_hidden(tmp_path: Path) -> None:
     (tmp_path / "p102-estuary-multibeam" / "drafts").mkdir(parents=True)
     (tmp_path / "p102-estuary-multibeam" / "P102 summary.docx").write_bytes(b"x")
     (tmp_path / "p102-estuary-multibeam" / "drafts" / "notes.MD").write_text("x")
@@ -87,10 +115,10 @@ def test_discovery_derives_project_from_top_folder_and_skips_hidden(tmp_path: Pa
 
     sources = discover_corpus(tmp_path)
 
-    assert [(s.rel_path, s.project_id, s.format) for s in sources] == [
-        ("overview.md", "root", "md"),
-        ("p102-estuary-multibeam/P102 summary.docx", "p102-estuary-multibeam", "docx"),
-        ("p102-estuary-multibeam/drafts/notes.MD", "p102-estuary-multibeam", "md"),
+    assert [(s.rel_path, s.format) for s in sources] == [
+        ("overview.md", "md"),
+        ("p102-estuary-multibeam/P102 summary.docx", "docx"),
+        ("p102-estuary-multibeam/drafts/notes.MD", "md"),
     ]
 
 
@@ -122,20 +150,27 @@ def test_discovery_rejects_symlinked_files_and_directories(tmp_path: Path) -> No
         discover_corpus(corpus)
 
 
-def test_markdown_that_is_not_utf8_is_a_conversion_error(tmp_path: Path) -> None:
+def test_unreadable_documents_are_conversion_errors(tmp_path: Path) -> None:
     (tmp_path / "p1").mkdir()
     (tmp_path / "p1" / "memo.md").write_bytes(b"# Memo\n\n\xff\xfe broken")
 
     with pytest.raises(ConversionError, match=r"p1/memo\.md is not UTF-8"):
         compile_corpus(tmp_path, FakeGateway(), topic="t", title="T")
+    (tmp_path / "p1" / "memo.md").write_text("  \n")
+    with pytest.raises(ConversionError, match=r"p1/memo\.md: the document has no text"):
+        compile_corpus(tmp_path, FakeGateway(), topic="t", title="T")
 
 
-def test_curator_notes_are_kept_and_compiled_as_searchable_guidance(tmp_path: Path) -> None:
-    (tmp_path / "p103-reef-sonar").mkdir()
+def test_curator_notes_get_a_deterministic_card_and_searchable_guidance_chunks(
+    tmp_path: Path,
+) -> None:
     note = "# Status\n\nThe reef Sentinel-2 case study has not been written yet."
-    (tmp_path / "p103-reef-sonar" / "AGENTS.md").write_text(note)
-    (tmp_path / "p103-reef-sonar" / "estuary-proposal.md").write_text(
-        "# Scope\n\nSentinel-2 bathymetry."
+    write_files(
+        tmp_path,
+        {
+            "p103-reef-sonar/AGENTS.md": note,
+            "p103-reef-sonar/estuary-proposal.md": "# Scope\n\nSentinel-2 bathymetry.",
+        },
     )
     gateway = FakeGateway()
 
@@ -145,13 +180,39 @@ def test_curator_notes_are_kept_and_compiled_as_searchable_guidance(tmp_path: Pa
         ("p103-reef-sonar/AGENTS.md", note)
     ]
     guidance, proposal = corpus.documents
-    assert (guidance.doc_id, guidance.stage, guidance.client) == ("doc_001", "guidance", "curator")
-    assert guidance.title == "Curator guidance: p103-reef-sonar"
+    assert (guidance.doc_id, guidance.is_curator_note) == ("doc_001", True)
+    assert (guidance.title, guidance.deliverable_type) == ("Status", "curator note")
+    assert guidance.summary == "The reef Sentinel-2 case study has not been written yet."
     assert {c.kind for c in guidance.chunks} == {"guidance"}
     assert "case study has not been written" in guidance.chunks[0].content
-    assert proposal.stage == "proposal"
-    assert gateway.calls.count("document_meta") == 1
+    assert not proposal.is_curator_note and {c.kind for c in proposal.chunks} == {"prose"}
+    # Only the proposal is observed; the note's card needs no model call.
+    (observed,) = gateway.of_type(ObserveSections)
+    assert [s.heading_path for s in observed.sections] == ["Scope"]
     assert corpus.embeddings.shape == (len(corpus.all_chunks()), FakeGateway.embedding_dimensions)
+
+
+@pytest.mark.parametrize(
+    ("text", "title", "summary"),
+    [
+        (
+            "#\nThe reef study is unwritten.\n",
+            "The reef study is unwritten.",
+            "The reef study is unwritten.",
+        ),
+        (
+            "# Status\nThe reef study is unwritten.\nAsk Dana.",
+            "Status",
+            "The reef study is unwritten.",
+        ),
+        ("#\n\n", "Curator note", ""),
+    ],
+)
+def test_curator_note_cards_take_the_first_text_as_title_and_first_prose_line_as_summary(
+    text: str, title: str, summary: str
+) -> None:
+    card = curator_note_card(text)
+    assert (card.title, card.summary) == (title, summary)
 
 
 # Section assembly and chunking.
@@ -240,27 +301,11 @@ def test_table_blocks_keep_empty_cells_captions_and_pipeless_rows() -> None:
     assert "Table 3: Areas" in section.markdown and section.markdown.endswith("survey 2024")
 
 
-def _sections(drafts: Sequence[SectionDraft]) -> list[Section]:
-    return [
-        Section(
-            section_id=f"doc_001_sec_{i:03d}",
-            ordinal=i,
-            heading_path=d.heading_path,
-            level=d.level,
-            page_start=d.page_start,
-            page_end=d.page_end,
-            markdown=d.markdown,
-        )
-        for i, d in enumerate(drafts, start=1)
-    ]
+def pieces(drafts: Sequence[SectionDraft]) -> list[ChunkPiece]:
+    return [piece for draft in drafts for piece in section_pieces(draft, "prose")]
 
 
-CTX = ChunkContext(
-    "doc_001", "p101-harbour-lidar", "Northwind Marine", "memorandum", "Memo", "prose"
-)
-
-
-def test_chunks_stitched_across_a_page_break_span_both_pages() -> None:
+def test_chunk_pieces_stitched_across_a_page_break_span_both_pages() -> None:
     drafts = assemble_sections(
         [
             (4, page(block("heading", "Areas", level=1), block("table", "| a |\n| --- |\n| 1 |"))),
@@ -269,7 +314,7 @@ def test_chunks_stitched_across_a_page_break_span_both_pages() -> None:
         ]
     )
 
-    chunks = build_chunks(drafts, _sections(drafts), CTX)
+    chunks = pieces(drafts)
 
     assert [(c.kind, c.content, c.page_start, c.page_end) for c in chunks] == [
         ("table", "| a |\n| --- |\n| 1 |\n| 2 |", 4, 5),
@@ -295,7 +340,7 @@ def test_every_chunk_is_bounded_for_oversized_sentences_rows_and_visuals() -> No
         ]
     )
 
-    chunks = build_chunks(drafts, _sections(drafts), CTX)
+    chunks = pieces(drafts)
 
     assert max(len(c.content) for c in chunks) <= MAX_CHUNK_CHARS
     by_kind = {k: [c.content for c in chunks if c.kind == k] for k in ("prose", "table", "visual")}
@@ -352,47 +397,6 @@ def test_large_tables_split_on_rows_with_header_on_every_piece() -> None:
     body_rows = [line for piece in pieces for line in piece.splitlines()[2:]]
     assert body_rows == rows.splitlines()
     assert split_table("| a |\n| --- |\n| 1 |") == ["| a |\n| --- |\n| 1 |"]
-
-
-def test_chunks_carry_breadcrumbs_and_emit_dedicated_visual_chunks() -> None:
-    chart = VisualTranscript(label="Rainfall chart", transcript="Median 330.9 mm")
-    long_paragraph = " ".join(f"Sentence {i} about groundwater." for i in range(150))
-    drafts = assemble_sections(
-        [
-            (2, page(block("heading", "Climate", level=1), block("paragraph", long_paragraph))),
-            (3, page(block("paragraph", "Short note."), visuals=(chart,))),
-        ]
-    )
-    sections = [
-        Section(
-            section_id="doc_001_sec_001",
-            ordinal=1,
-            heading_path="Climate",
-            level=1,
-            page_start=2,
-            page_end=3,
-            markdown=drafts[0].markdown,
-        )
-    ]
-    ctx = ChunkContext(
-        "doc_001", "p101-harbour-lidar", "Northwind Marine", "memorandum", "Memo", "prose"
-    )
-    chunks = build_chunks(drafts, sections, ctx)
-
-    assert [c.chunk_id for c in chunks][:2] == ["doc_001_chk_0001", "doc_001_chk_0002"]
-    assert all(
-        c.breadcrumb
-        == "[Project: p101-harbour-lidar | Client: Northwind Marine | Stage: memorandum"
-        " | Doc: Memo (pp. 2-3) | Section: Climate]"
-        for c in chunks
-    )
-    prose = [c for c in chunks if c.kind == "prose"]
-    assert len(prose) >= 3 and all(len(c.content) <= 1800 for c in prose)
-    assert " ".join(c.content for c in prose).startswith("Sentence 0 about")
-    visual = [c for c in chunks if c.kind == "visual"]
-    assert len(visual) == 1
-    assert (visual[0].page_start, visual[0].page_end) == (3, 3)
-    assert "Rainfall chart" in visual[0].content and "330.9" in visual[0].content
 
 
 # Fidelity gate.
@@ -547,94 +551,372 @@ def test_fidelity_gate_fails_loudly_when_a_filename_stays_missing() -> None:
     assert gateway.transcribe_calls == [("low", ()), ("high", ("harbour_dry_depth_thresh.tif",))]
 
 
-# Cited synthesis.
+# Binding.
 
 
-def _documents(tmp_path: Path) -> tuple[CompiledDocument, ...]:
-    (tmp_path / "p1").mkdir()
-    (tmp_path / "p1" / "memo.md").write_text("# Results\n\nSeagrass mapped.")
-    return compile_corpus(tmp_path, FakeGateway(), topic="t", title="T").documents
-
-
-def test_synthesis_retries_once_with_feedback_on_invalid_citations(tmp_path: Path) -> None:
-    documents = _documents(tmp_path)
-    gateway = FakeGateway(
-        synthesis_script=["See [doc_001:bad_sec].", "See [doc_001:doc_001_sec_001]."]
+def reading_of(drafts: Sequence[SectionDraft], title: str) -> DocumentReading:
+    return DocumentReading(
+        sha256="0" * 64,
+        format="pdf",
+        is_curator_note=False,
+        sections=tuple(
+            ReadSection(
+                ordinal=i,
+                heading_path=d.heading_path,
+                level=d.level,
+                page_start=d.page_start,
+                page_end=d.page_end,
+                markdown=d.markdown,
+                pieces=section_pieces(d, "prose"),
+            )
+            for i, d in enumerate(drafts, start=1)
+        ),
+        pages=(),
+        card=ObservationCard(
+            title=title,
+            doc_date=None,
+            deliverable_type="memorandum",
+            summary="Rainfall.",
+            attributes=(),
+            terms=(),
+            craft=(),
+        ),
+        discarded_quotes=0,
     )
 
-    markdown = synthesize_with_citations(gateway, "t", (), documents)
 
-    assert markdown == "See [doc_001:doc_001_sec_001]."
-    feedback = gateway.synthesis_feedback[1]
-    assert feedback is not None
-    assert "[doc_001:bad_sec]" in feedback and "[doc_001:doc_001_sec_001]" in feedback
-
-
-def test_synthesis_without_valid_citations_after_retry_raises(tmp_path: Path) -> None:
-    documents = _documents(tmp_path)
-    gateway = FakeGateway(synthesis_script=["No citations.", "Still [doc_002:doc_002_sec_001]."])
-
-    with pytest.raises(InvalidCitationError, match="doc_002_sec_001"):
-        synthesize_with_citations(gateway, "t", (), documents)
+def facet(name: str, *values: str) -> Facet:
+    return Facet(
+        name=name,
+        description=name,
+        binding="content",
+        values=tuple(FacetValue(value=v, description=v, aliases=(), folders=()) for v in values),
+    )
 
 
-class GuidanceStageGateway(FakeGateway):
-    def catalogue(self, rel_path: str, project_id: str) -> DocumentMetaExtraction:
-        return DocumentMetaExtraction(
-            title="Style guide",
-            client="Contoso Ports",
-            stage="guidance",
-            doc_date=None,
-            summary="How.",
+def test_binding_numbers_chunks_and_builds_breadcrumbs_from_bound_facets() -> None:
+    chart = VisualTranscript(label="Rainfall chart", transcript="Median 330.9 mm")
+    long_paragraph = " ".join(f"Sentence {i} about groundwater." for i in range(150))
+    drafts = assemble_sections(
+        [
+            (2, page(block("heading", "Climate", level=1), block("paragraph", long_paragraph))),
+            (3, page(block("paragraph", "Short note."), visuals=(chart,))),
+        ]
+    )
+    facets = (facet("project", "p1", "p2"), facet("client", "Northwind Marine", "Contoso Ports"))
+    assignment = {"project": (), "client": ("Northwind Marine", "Contoso Ports")}
+
+    doc = bind_document(
+        CorpusDocument("doc_007", "p1/memo.pdf", reading_of(drafts, "Memo")), facets, assignment
+    )
+
+    assert doc.facets == {"client": ("Contoso Ports", "Northwind Marine")}
+    assert [s.section_id for s in doc.sections] == ["doc_007_sec_001"]
+    chunks = doc.chunks
+    assert [c.chunk_id for c in chunks][:2] == ["doc_007_chk_0001", "doc_007_chk_0002"]
+    # Facets in definition order, values sorted, a facet without values left out.
+    assert {c.breadcrumb for c in chunks} == {
+        "[client: Contoso Ports, Northwind Marine | Doc: Memo (pp. 2-3) | Section: Climate]"
+    }
+    prose = [c for c in chunks if c.kind == "prose"]
+    assert len(prose) >= 3 and all(len(c.content) <= 1800 for c in prose)
+    assert " ".join(c.content for c in prose).startswith("Sentence 0 about")
+    (visual,) = [c for c in chunks if c.kind == "visual"]
+    assert (visual.page_start, visual.page_end) == (3, 3)
+    assert "Rainfall chart" in visual.content and "330.9" in visual.content
+    unfaceted = bind_document(
+        CorpusDocument("doc_001", "memo.pdf", reading_of(drafts, "M")), (), {}
+    )
+    assert unfaceted.chunks[0].breadcrumb == "[Doc: M (pp. 2-3) | Section: Climate]"
+
+
+# Observation cards.
+
+LOCATION_SECTIONS = (
+    BatchSection(
+        1,
+        "Areas",
+        1,
+        1,
+        "| Layer | File |\n| --- | --- |\n| Dry season | harbour_dry_depth_thresh.tif |",
+    ),
+    BatchSection(
+        2,
+        "Rainfall",
+        2,
+        2,
+        "> **[Visual \u2014 Page 2: Rainfall chart]**\n> Nine Year Median = 330.9 mm\n"
+        "> for 2016\u20132017",
+    ),
+    BatchSection(3, "Methods", 3, 3, "The multi-\nbeam survey used `LAT` as the *vertical* datum."),
+    BatchSection(
+        4,
+        "Grid",
+        4,
+        4,
+        "The multi\u2010\nswath run used _LAT_ on a 2 * 3 m grid, file dry_run.tif.",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("quote", "ordinal"),
+    [
+        ("Dry season harbour_dry_depth_thresh.tif", 1),
+        ("| Dry season | harbour_dry_depth_thresh.tif |", 1),
+        ("NINE YEAR MEDIAN = 330.9 mm for 2016-2017", 2),
+        ("Rainfall chart] Nine Year Median", 2),
+        ("multibeam survey used LAT as the vertical datum", 3),
+        # A Unicode hyphen at a line break joins; `_` emphasis is ignored.
+        ("multiswath run used LAT", 4),
+        ("2 * 3 m grid", 4),
+        ("file dry_run.tif", 4),
+        # A literal operator between spaces and an intraword underscore are text, not markup.
+        ("on a 2 3 m grid", None),
+        ("file dryrun.tif", None),
+        ("survey used lidar", None),
+        ("  ", None),
+    ],
+)
+def test_quotes_are_located_through_markup_case_dashes_and_hyphenation(
+    quote: str, ordinal: int | None
+) -> None:
+    assert locate_quote(quote, LOCATION_SECTIONS) == ordinal
+
+
+def draft(*quotes: str, craft: Sequence[str] = ()) -> ObservationDraft:
+    return ObservationDraft(
+        title="Datum memo",
+        doc_date=None,
+        deliverable_type="memorandum",
+        summary="Datum.",
+        attributes=[],
+        terms=[
+            TermDraft(term=q.split()[0], kind="acronym", aliases=[], quote=q, defines=True)
+            for q in quotes
+        ],
+        craft=[CraftDraft(aspect="convention", statement=q, quote=q) for q in craft],
+    )
+
+
+DATUM_CORPUS = {"p1/memo.md": "# Datum\n\nLAT is the datum of every sounding.\n"}
+LOCATED, UNLOCATED = "LAT is the datum", "MSL is mean sea level"
+
+
+def test_unlocated_quotes_get_one_rerun_that_names_them(tmp_path: Path) -> None:
+    gateway = FakeGateway(observe_script=[draft(LOCATED, UNLOCATED), draft(LOCATED)])
+
+    corpus = compile_corpus(write_files(tmp_path, DATUM_CORPUS), gateway, topic="t", title="T")
+
+    first, rerun = gateway.of_type(ObserveSections)
+    assert first.feedback is None
+    assert rerun.feedback is not None and repr(UNLOCATED) in rerun.feedback
+    assert LOCATED not in rerun.feedback
+    assert corpus.build_report.discarded_unlocated_quotes == 0
+
+
+def test_quotes_still_unlocated_after_the_rerun_are_discarded_and_counted(tmp_path: Path) -> None:
+    kept_then_lost = draft(LOCATED, UNLOCATED, craft=["Always state the datum loudly"])
+    gateway = FakeGateway(observe_script=[kept_then_lost, kept_then_lost])
+
+    corpus = compile_corpus(write_files(tmp_path, DATUM_CORPUS), gateway, topic="t", title="T")
+
+    assert gateway.calls.count("observe") == 2
+    assert corpus.build_report.discarded_unlocated_quotes == 2
+    (entry,) = corpus.glossary
+    assert entry.term == "LAT"
+
+
+def test_a_batch_whose_quotes_are_never_located_raises(tmp_path: Path) -> None:
+    gateway = FakeGateway(observe_script=[draft(UNLOCATED), draft(UNLOCATED)])
+
+    with pytest.raises(RejectedOutputError, match=r"p1/memo\.md: observations.*MSL is mean"):
+        compile_corpus(write_files(tmp_path, DATUM_CORPUS), gateway, topic="t", title="T")
+    assert gateway.calls == ["observe", "observe"]
+    # A rerun that drops every observation is the same broken reading, not an empty batch.
+    silent = FakeGateway(observe_script=[draft(UNLOCATED), draft()])
+    with pytest.raises(RejectedOutputError, match="none of its quotes could be located"):
+        compile_corpus(write_files(tmp_path / "silent", DATUM_CORPUS), silent, topic="t", title="T")
+    assert silent.calls == ["observe", "observe"]
+
+
+def test_long_documents_are_observed_in_batches_then_consolidated(tmp_path: Path) -> None:
+    body = " ".join(["sounding"] * (OBSERVE_BATCH_CHARS // 20))
+    text = "".join(f"# Part {i}\n\n{body}\n\n" for i in range(1, 4))
+    gateway = FakeGateway()
+
+    corpus = compile_corpus(write_files(tmp_path, {"memo.md": text}), gateway, topic="t", title="T")
+
+    batches = gateway.of_type(ObserveSections)
+    assert [[s.ordinal for s in b.sections] for b in batches] == [[1, 2], [3]]
+    assert gateway.calls.count("consolidate_card") == 1
+    assert corpus.documents[0].title == "Part 1"
+
+
+def test_an_oversized_section_is_observed_in_pieces_that_keep_its_ordinal() -> None:
+    long_text = " ".join(f"sounding{i}" for i in range(OBSERVE_BATCH_CHARS // 4)) + " closing note"
+    sections = [
+        ReadSection(
+            ordinal=ordinal,
+            heading_path=heading,
+            level=1,
+            page_start=1,
+            page_end=1,
+            markdown=markdown,
+            pieces=(),
         )
+        for ordinal, heading, markdown in ((1, "Intro", "Short."), (2, "Log", long_text))
+    ]
+
+    batches = observation_batches(sections)
+
+    assert len(long_text) > 2 * OBSERVE_BATCH_CHARS
+    assert all(sum(len(s.markdown) for s in batch) <= OBSERVE_BATCH_CHARS for batch in batches)
+    pieces = [s for batch in batches for s in batch if s.ordinal == 2]
+    assert len(pieces) >= 3 and " ".join(p.markdown for p in pieces) == long_text
+    assert locate_quote("closing note", batches[-1]) == 2
 
 
-def test_citations_resolve_exactly_to_sections_of_non_curator_documents(tmp_path: Path) -> None:
-    (tmp_path / "p1").mkdir()
-    (tmp_path / "p1" / "AGENTS.md").write_text("# Note\n\nDraft only.")
-    (tmp_path / "p1" / "style-guide.md").write_text("# Style\n\nWrite plainly.")
+# Build cache: provider requests through `OpenAIGateway` and the scripted provider.
 
-    corpus = compile_corpus(tmp_path, GuidanceStageGateway(), topic="t", title="T")
-    docs = corpus.documents
+CLIENTS = FacetDraft(
+    name="client",
+    description="Client organisation.",
+    values=[
+        FacetValueDraft(value="Northwind Marine", description="NM", aliases=["NM"], folders=[]),
+        FacetValueDraft(value="Contoso Ports", description="CP", aliases=[], folders=[]),
+    ],
+)
+MEMO_TYPE = DeliverableTypeDraft(
+    name="memorandum", description="Memo.", exemplar_doc_ids=["doc_001"], feedback_doc_ids=[]
+)
+MEMO_BLUEPRINT = BlueprintDraft(
+    description="A survey memo.",
+    exemplar_doc_ids=["doc_001"],
+    outline=[
+        BlueprintSectionDraft(heading="Results", purpose="Findings.", citations=["doc_001_sec_001"])
+    ],
+    conventions=[
+        GuidanceDraft(statement="State areas in hectares.", citations=["doc_001_sec_001"])
+    ],
+    pitfalls=[],
+)
+_TOKEN = re.compile(r"\[doc_\d+:doc_\d+_sec_\d+\]")
 
-    # A non-curator document the model classes as guidance is still catalogued and citable.
-    assert corpus.synthesis_markdown.endswith("[doc_002:doc_002_sec_001].")
-    assert invalid_citations("See [doc_002:doc_002_sec_001].", docs) == []
-    assert invalid_citations(
-        "[doc_002:doc_002_sec_001] [doc_002: doc_002_sec_001] [doc_001:doc_001_sec_001]", docs
-    ) == ["[doc_002: doc_002_sec_001]", "[doc_001:doc_001_sec_001]"]
-    assert invalid_citations("Only [docs] here.", docs) == ["[docs]", "(no valid citation)"]
+
+def cite_last_section(body: dict[str, Any]) -> GuideDraft:
+    """A guide that cites the last section token of its own request's catalog."""
+    text = body["input"][0]["content"][0]["text"]
+    return GuideDraft(guide_markdown=f"Overview {_TOKEN.findall(text)[-1]}.")
 
 
-def test_second_compile_with_build_cache_makes_no_provider_requests(tmp_path: Path) -> None:
-    (tmp_path / "corpus" / "p1").mkdir(parents=True)
-    # Sorts before AGENTS.md, so it is doc_001: the section the fake synthesis cites.
-    (tmp_path / "corpus" / "p1" / "2024-memo.md").write_text("# Results\n\nSeagrass at 59,494 ha.")
-    (tmp_path / "corpus" / "p1" / "AGENTS.md").write_text("Memo is final.")
+def scripted_api() -> ScriptedOpenAI:
     api = ScriptedOpenAI()
+    api.defaults["OrganisationDraft"] = OrganisationDraft(
+        facets=[CLIENTS], deliverable_types=[MEMO_TYPE]
+    )
+    api.defaults["final_output"] = MEMO_BLUEPRINT
+    api.defaults["GuideDraft"] = cite_last_section
+    return api
 
-    def build() -> list[str]:
-        with BuildCache(tmp_path / "cache.db") as cache:
-            corpus = compile_corpus(
-                tmp_path / "corpus", api.gateway(cache=cache), topic="t", title="T"
-            )
-        return [corpus.synthesis_markdown, *(c.content for c in corpus.all_chunks())]
 
-    first = build()
+def build(api: ScriptedOpenAI, corpus_dir: Path, cache: Path) -> Any:
+    with BuildCache(cache) as build_cache:
+        return compile_corpus(corpus_dir, api.gateway(cache=build_cache), topic="t", title="T")
+
+
+def formats(api: ScriptedOpenAI, start: int = 0) -> list[str]:
+    bodies = [e.body for e in api.exchanges[start:] if e.path == "/responses"]
+    return sorted(b["text"]["format"]["name"] for b in bodies)
+
+
+MEMO_CORPUS = {
+    "p1/2024-memo.md": "# Results\n\nSeagrass at 59,494 ha.",
+    "p1/AGENTS.md": "Memo is final.",
+    "p2/proposal.md": "# Scope\n\nA follow-up survey.",
+}
+
+
+def test_unchanged_corpus_rebuilds_from_the_cache_without_provider_requests(
+    tmp_path: Path,
+) -> None:
+    corpus_dir = write_files(tmp_path / "corpus", MEMO_CORPUS)
+    api = scripted_api()
+
+    first = build(api, corpus_dir, tmp_path / "cache.db")
     requests_after_first = api.request_count
-    second = build()
+    second = build(api, corpus_dir, tmp_path / "cache.db")
 
-    assert requests_after_first == 3
     assert api.request_count == requests_after_first
-    assert second == first
-    # Each compiler operation states its own effort.
-    assert [b["reasoning"]["effort"] for b in api.requests("/responses")] == ["low", "medium"]
+    assert (second.documents, second.guide_markdown) == (first.documents, first.guide_markdown)
+    assert (second.facets, second.blueprints) == (first.facets, first.blueprints)
+    # Every operation of all three passes was made once: two observations, organisation, one
+    # binding judgement per citable document, one blueprint agent run and its support check,
+    # the guide, and the embeddings.
+    assert formats(api) == [
+        "GuideDraft",
+        "ObservationDraft",
+        "ObservationDraft",
+        "OrganisationDraft",
+        "final_output",
+    ]
+    assert len(api.requests("/decisions")) == 3 and len(api.requests("/embeddings")) == 1
+    efforts = {
+        b["text"]["format"]["name"]: b["reasoning"]["effort"] for b in api.requests("/responses")
+    }
+    assert efforts == {
+        "ObservationDraft": "low",
+        "OrganisationDraft": "medium",
+        "final_output": "medium",
+        "GuideDraft": "medium",
+    }
+    assert first.blueprints[0].conventions[0].statement == "State areas in hectares."
+    assert first.build_settings["efforts"]["write_blueprint"] == "medium"
+    assert first.build_settings["model"] == "gpt-6.1-sol"
+
+
+def test_adding_a_file_requests_no_reading_of_the_existing_files(tmp_path: Path) -> None:
+    corpus_dir = write_files(tmp_path / "corpus", MEMO_CORPUS)
+    api = scripted_api()
+    build(api, corpus_dir, tmp_path / "cache.db")
+    start = len(api.exchanges)
+
+    # Sorts first, so every existing document gets a new ID.
+    write_files(corpus_dir, {"p0/new.md": "# Brief\n\nA new brief."})
+    corpus = build(api, corpus_dir, tmp_path / "cache.db")
+
+    observed = [
+        e.body
+        for e in api.exchanges[start:]
+        if e.path == "/responses" and e.body["text"]["format"]["name"] == "ObservationDraft"
+    ]
+    assert len(observed) == 1 and "A new brief." in observed[0]["input"][0]["content"][0]["text"]
+    assert "OrganisationDraft" in formats(api, start)
+    assert corpus.documents[0].rel_path == "p0/new.md"
+
+
+def test_a_subset_corpus_does_not_reuse_the_full_corpus_induction(tmp_path: Path) -> None:
+    full = write_files(
+        tmp_path / "full", {"a.md": "# Alpha\n\nAlpha survey.", "b.md": "# Beta\n\nBeta survey."}
+    )
+    subset = write_files(tmp_path / "subset", {"a.md": "# Alpha\n\nAlpha survey."})
+    api = ScriptedOpenAI()
+    api.defaults["GuideDraft"] = cite_last_section
+    assert "[doc_002:doc_002_sec_001]" in build(api, full, tmp_path / "cache.db").guide_markdown
+    start = len(api.exchanges)
+
+    corpus = build(api, subset, tmp_path / "cache.db")
+
+    # The reading of a.md is reused; organisation and the guide are requested again, and the
+    # guide cites only the subset's documents.
+    assert formats(api, start) == ["GuideDraft", "OrganisationDraft"]
+    assert _TOKEN.findall(corpus.guide_markdown) == ["[doc_001:doc_001_sec_001]"]
 
 
 # Rendered formats end to end.
 
 
-def test_pdf_compiles_through_render_transcribe_and_metadata(tmp_path: Path) -> None:
+def test_pdf_compiles_through_render_transcribe_and_observation(tmp_path: Path) -> None:
     corpus_dir = tmp_path / "corpus" / "p101-harbour-lidar"
     corpus_dir.mkdir(parents=True)
     write_pdf(
@@ -647,14 +929,14 @@ def test_pdf_compiles_through_render_transcribe_and_metadata(tmp_path: Path) -> 
                 "| --- | --- |",
                 "| 2016 | 210 |",
             ],
-            ["## Outputs", "Raster harbour_dry_depth_thresh.tif"],
+            ["## Outputs", "Raster harbour_dry_depth_thresh.tif", "Deliverable: memorandum"],
         ],
     )
 
     corpus = compile_corpus(tmp_path / "corpus", FakeGateway(), topic="t", title="T")
 
     (doc,) = corpus.documents
-    assert (doc.format, doc.project_id, doc.stage) == ("pdf", "p101-harbour-lidar", "memorandum")
+    assert (doc.format, doc.title, doc.deliverable_type) == ("pdf", "Rainfall", "memorandum")
     assert [p.page_number for p in doc.pages] == [1, 2]
     assert all(p.webp_bytes[8:12] == b"WEBP" for p in doc.pages)
     assert "330.9" in doc.pages[0].native_text

@@ -20,7 +20,8 @@ uv sync --locked
 uv run --locked arkive-rag build path/to/corpus -o bathymetry.arkive.db --cache build-cache.db
 uv run --locked arkive-rag inspect bathymetry.arkive.db
 uv run --locked arkive-rag grep bathymetry.arkive.db "harbour_dry_depth_thresh.tif"
-uv run --locked arkive-rag search bathymetry.arkive.db "nine-year median rainfall"
+uv run --locked arkive-rag search bathymetry.arkive.db "nine-year median rainfall" \
+  --filter project=p101-harbour-lidar
 uv run --locked arkive-rag serve bathymetry.arkive.db other.arkive.db
 ```
 
@@ -33,17 +34,31 @@ and every tool except `search` works.
 The snapshot and `--cache` files must be different files outside the corpus
 directory. A corpus may not contain symlinks.
 
-`build` uses `gpt-6.1-sol` and `text-embedding-3-large`; the models are fixed
-in code. It prints the provider calls, tokens and estimated cost of the build.
-With `--max-cost 5`, no provider call starts once the estimated spend has
+`build` uses `gpt-6.1-sol`, `gpt-6-luna` on the Decisions API and
+`text-embedding-3-large`; the models are fixed in code, and the snapshot
+records them with the reasoning effort of each operation. It prints the
+provider calls, tokens and estimated cost of the build, and a build report
+of what it dropped or pruned without failing.
+With `--max-cost 5` (a positive finite number of USD), no provider call starts once the estimated spend has
 reached USD 5, and the build stops with an error. Calls already in flight can
 take the total past the limit, and the estimate ignores the long-context
 surcharge. `--trace` sends traces of agent runs to the OpenAI dashboard (off by
 default); it fails if `OPENAI_AGENTS_DISABLE_TRACING` is set to `1` or `true`
 (in any letter case).
 
-Each top-level folder in the corpus is a project. An `AGENTS.md` anywhere in the
-corpus is a curator note: it appears in the topic guide and is searchable.
+The build reads every document, then induces from the whole corpus up to six
+facets to filter by (path-bound when the folders already encode them, such as
+projects or campaigns, otherwise judged per document, such as client or
+author), a cited glossary, and a blueprint for each recurring deliverable type
+(at most eight).
+`inspect` prints them. `search` and `grep` take repeated `--filter FACET=VALUE`
+(a canonical value or an alias; several facets combine with AND), and the MCP
+tools `list_documents`, `search` and `grep` take the same `filters` mapping.
+An `AGENTS.md` anywhere in the corpus is a curator note: it guides induction,
+appears in the topic guide and is searchable, but is never cited. With
+`--cache`, rebuilding an unchanged corpus makes no provider calls. Snapshots
+use schema `3.0`; a snapshot from an earlier version is rebuilt from its
+corpus.
 
 ## Private corpora, snapshots and eval packs
 
@@ -56,7 +71,8 @@ private store such as a private Git LFS or DVC repository, or a private bucket:
 - snapshots, named `<topic>-<corpus_fingerprint[:12]>.arkive.db`.
 
 `arkive-rag inspect` prints the snapshot's `corpus_fingerprint`, the
-`arkive_version` that wrote it, and the `sha256` of every source document. The
+`arkive_version` that wrote it, its facets, glossary, blueprints, build
+settings and build report, and the `sha256` of every source document. The
 fingerprint depends only on source paths and bytes, so you can check at any
 time that a snapshot, a corpus folder and an eval pack belong together.
 `.gitignore` excludes `*.arkive.db` and `*.eval.local.json`.
@@ -77,12 +93,17 @@ uv run --locked python -m evals.run --pack path/to/bathymetry.eval.json \
 and 3 need `--corpus`, whose files must still match the snapshot's
 `corpus_fingerprint`; `--cache` reuses a build cache for the holdout snapshot.
 `--max-cost` and `--trace` work as in `build`, and the usage and estimated cost
-of the run are written to `results.json` and `report.md`. An evaluation that
-reaches the spend limit stops with an error and writes no report.
+of the run are written to `results.json` and `report.md`. Before it creates
+any output or calls any model, the runner checks the pack, the snapshot, the
+retrieval filters and the holdout guards of every layer it will run. An
+evaluation that reaches the spend limit, or fails after calling models, prints
+its usage, stops with an error and writes no report.
 `--out` is required. Outputs quote corpus facts, so choose a private directory
 outside this repository; the runner refuses an `--out` or `--cache` that
 overlaps the pack, snapshot or corpus, and writes owner-only files.
-`evals/example_pack.eval.json` is a fictional pack that shows the format.
+`evals/example_pack.eval.json` is a fictional pack that shows the format
+(`arkive-eval-pack/2`); a retrieval case's `filters` use the facet names and
+values `inspect` prints for the snapshot.
 
 - [Product goal and end-to-end system walkthrough](docs/walkthrough.md)
 - [Architecture, pipeline, evaluation and verification](docs/architecture.md)

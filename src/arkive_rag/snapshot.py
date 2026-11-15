@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import sqlite3
@@ -11,7 +12,7 @@ import tempfile
 import threading
 import unicodedata
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice, pairwise
@@ -20,13 +21,22 @@ from typing import Any, Literal, Self
 
 import numpy as np
 from numpy.typing import NDArray
+from pydantic import TypeAdapter, ValidationError
 
 from arkive_rag import __version__
 from arkive_rag.models import (
+    Blueprint,
+    BuildReport,
     CompiledCorpus,
     CuratorNote,
     DocumentInfo,
     DocumentOutline,
+    Facet,
+    FacetSummary,
+    FacetValue,
+    GlossaryEntry,
+    GlossaryLookup,
+    GlossaryTermSummary,
     GrepMatch,
     InvalidFilterError,
     NotFoundError,
@@ -40,9 +50,11 @@ from arkive_rag.models import (
     TopicSummary,
     UnsafePathError,
     corpus_fingerprint,
+    fold_facet_label,
+    fold_text,
 )
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "3.0"
 RRF_K = 60.0
 CHANNEL_DEPTH = 100
 MAX_TOP_K = 50
@@ -57,9 +69,27 @@ CREATE TABLE curator_notes (
     ordinal INTEGER PRIMARY KEY, scope_path TEXT NOT NULL, content TEXT NOT NULL);
 CREATE TABLE documents (
     doc_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, rel_path TEXT NOT NULL UNIQUE,
-    sha256 TEXT NOT NULL, format TEXT NOT NULL, project_id TEXT NOT NULL, client TEXT NOT NULL,
-    stage TEXT NOT NULL, title TEXT NOT NULL, doc_date TEXT, summary TEXT NOT NULL,
-    page_count INTEGER NOT NULL);
+    sha256 TEXT NOT NULL, format TEXT NOT NULL, title TEXT NOT NULL, doc_date TEXT,
+    deliverable_type TEXT NOT NULL, summary TEXT NOT NULL, page_count INTEGER NOT NULL,
+    is_curator_note INTEGER NOT NULL CHECK (is_curator_note IN (0, 1)));
+CREATE TABLE facets (
+    name TEXT PRIMARY KEY, ordinal INTEGER NOT NULL UNIQUE, description TEXT NOT NULL,
+    binding TEXT NOT NULL CHECK (binding IN ('path', 'content')));
+CREATE TABLE facet_values (
+    facet TEXT NOT NULL REFERENCES facets(name), value TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    description TEXT NOT NULL, folders_json TEXT NOT NULL, PRIMARY KEY (facet, value));
+CREATE TABLE facet_aliases (
+    facet TEXT NOT NULL, folded_alias TEXT NOT NULL, alias TEXT NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (facet, folded_alias),
+    FOREIGN KEY (facet, value) REFERENCES facet_values(facet, value));
+CREATE TABLE document_facets (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id), facet TEXT NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (doc_id, facet, value),
+    FOREIGN KEY (facet, value) REFERENCES facet_values(facet, value));
+CREATE TABLE glossary (ordinal INTEGER PRIMARY KEY, term TEXT NOT NULL, entry_json TEXT NOT NULL);
+CREATE TABLE blueprints (
+    ordinal INTEGER PRIMARY KEY, deliverable_type TEXT NOT NULL UNIQUE,
+    blueprint_json TEXT NOT NULL);
 CREATE TABLE sections (
     section_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL REFERENCES documents(doc_id),
     ordinal INTEGER NOT NULL, heading_path TEXT NOT NULL, level INTEGER NOT NULL,
@@ -77,20 +107,33 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
     chunk_id UNINDEXED, content_norm, breadcrumb_norm,
     tokenize='porter unicode61 remove_diacritics 2');
 """
+# Every table a 3.0 snapshot holds; `TopicSnapshot.open` requires each one.
+TABLES = frozenset(re.findall(r"CREATE (?:VIRTUAL )?TABLE (\w+)", SCHEMA))
+# Every key is required when a snapshot opens.
+META_KEYS = (
+    "schema_version",
+    "topic",
+    "title",
+    "created_at",
+    "corpus_fingerprint",
+    "arkive_version",
+    "embedding_model",
+    "embedding_dimensions",
+    "guide_markdown",
+    "build_settings",
+    "build_report",
+)
 
 # Conversational filler dropped from FTS queries when at least two content tokens remain.
 _FILLER_WORDS = """what which where when who how does did is are was were the a an of in for to on
 with from by about show tell give list find and or not"""
 _STOPWORDS = frozenset(_FILLER_WORDS.split())
-_DASHES = re.compile(r"[\u2010-\u2015\u2212]")
+_FOLDERS: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
+_SETTINGS: TypeAdapter[dict[str, Any]] = TypeAdapter(dict[str, Any])
 
 
 def _nfkc(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
-
-
-def _grep_normalize(text: str) -> str:
-    return _DASHES.sub("-", _nfkc(text)).casefold()
 
 
 def build_fts5_query(raw_query: str) -> str | None:
@@ -196,7 +239,9 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
         "arkive_version": __version__,
         "embedding_model": corpus.embedding_model,
         "embedding_dimensions": str(corpus.embedding_dimensions),
-        "synthesis_markdown": corpus.synthesis_markdown,
+        "guide_markdown": corpus.guide_markdown,
+        "build_settings": json.dumps(corpus.build_settings, sort_keys=True),
+        "build_report": corpus.build_report.model_dump_json(),
     }
     with db:
         db.executemany("INSERT INTO corpus_meta VALUES (?, ?)", meta.items())
@@ -204,24 +249,70 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
             "INSERT INTO curator_notes VALUES (?, ?, ?)",
             [(i, n.scope_path, n.content) for i, n in enumerate(corpus.curator_notes, start=1)],
         )
+        for ordinal, facet in enumerate(corpus.facets, start=1):
+            db.execute(
+                "INSERT INTO facets VALUES (?, ?, ?, ?)",
+                (facet.name, ordinal, facet.description, facet.binding),
+            )
+            for value_ordinal, value in enumerate(facet.values, start=1):
+                db.execute(
+                    "INSERT INTO facet_values VALUES (?, ?, ?, ?, ?)",
+                    (
+                        facet.name,
+                        value.value,
+                        value_ordinal,
+                        value.description,
+                        json.dumps(list(value.folders)),
+                    ),
+                )
+                # The canonical value is stored as its own alias, so the primary key also
+                # refuses an alias that would name two values.
+                db.executemany(
+                    "INSERT INTO facet_aliases VALUES (?, ?, ?, ?)",
+                    [
+                        (facet.name, fold_facet_label(alias), alias, value.value)
+                        for alias in dict.fromkeys((value.value, *value.aliases))
+                    ],
+                )
+        db.executemany(
+            "INSERT INTO glossary VALUES (?, ?, ?)",
+            [
+                (i, entry.term, entry.model_dump_json())
+                for i, entry in enumerate(corpus.glossary, start=1)
+            ],
+        )
+        db.executemany(
+            "INSERT INTO blueprints VALUES (?, ?, ?)",
+            [
+                (i, blueprint.deliverable_type, blueprint.model_dump_json())
+                for i, blueprint in enumerate(corpus.blueprints, start=1)
+            ],
+        )
         row = 0
         for ordinal, doc in enumerate(corpus.documents, start=1):
             db.execute(
-                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc.doc_id,
                     ordinal,
                     doc.rel_path,
                     doc.sha256,
                     doc.format,
-                    doc.project_id,
-                    doc.client,
-                    doc.stage,
                     doc.title,
                     doc.doc_date,
+                    doc.deliverable_type,
                     doc.summary,
                     len(doc.pages),
+                    int(doc.is_curator_note),
                 ),
+            )
+            db.executemany(
+                "INSERT INTO document_facets VALUES (?, ?, ?)",
+                [
+                    (doc.doc_id, name, value)
+                    for name, values in doc.facets.items()
+                    for value in values
+                ],
             )
             db.executemany(
                 "INSERT INTO sections VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -279,7 +370,7 @@ def _snippet(line: str, needle: str) -> str:
     low, high = 1, len(line)
     while low < high:
         middle = (low + high) // 2
-        if needle in _grep_normalize(line[:middle]):
+        if needle in fold_text(line[:middle]):
             high = middle
         else:
             low = middle + 1
@@ -289,10 +380,10 @@ def _snippet(line: str, needle: str) -> str:
     return f"{'...' if start else ''}{line[start:end]}{'...' if end < len(line) else ''}"
 
 
-_HIT_COLUMNS = """c.chunk_id, c.doc_id, c.section_id, c.kind, d.project_id, d.client, d.stage,
-    d.title AS doc_title, s.heading_path, c.page_start, c.page_end, c.content"""
-_SECTION_COLUMNS = """s.section_id, s.doc_id, d.project_id, d.stage, d.title AS doc_title,
-    s.heading_path, s.page_start, s.page_end"""
+_HIT_COLUMNS = """c.chunk_id, c.doc_id, c.section_id, c.kind, d.title AS doc_title,
+    s.heading_path, c.page_start, c.page_end, c.content"""
+_SECTION_COLUMNS = """s.section_id, s.doc_id, d.title AS doc_title, s.heading_path,
+    s.page_start, s.page_end"""
 _FROM_CHUNKS = """FROM chunks c JOIN sections s ON s.section_id = c.section_id
     JOIN documents d ON d.doc_id = c.doc_id"""
 
@@ -312,40 +403,67 @@ class TopicSnapshot:
         self._db = db
         self._lock = threading.Lock()
         self.path = path
-        meta = dict(db.execute("SELECT key, value FROM corpus_meta").fetchall())
-        if meta.get("schema_version") != SCHEMA_VERSION:
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        meta = (
+            dict(db.execute("SELECT key, value FROM corpus_meta").fetchall())
+            if "corpus_meta" in tables
+            else {}
+        )
+        version = meta.get("schema_version")
+        if version != SCHEMA_VERSION:
             raise SnapshotIntegrityError(
-                f"{path}: schema version {meta.get('schema_version')!r}, expected {SCHEMA_VERSION}"
+                f"{path}: schema version {version!r}; Arkive {__version__} reads schema"
+                f" {SCHEMA_VERSION} only, so rebuild the snapshot from its corpus"
+            )
+        missing = [key for key in META_KEYS if key not in meta]
+        if missing:
+            raise SnapshotIntegrityError(f"{path}: corpus_meta lacks {', '.join(missing)}")
+        absent = sorted(TABLES - tables)
+        if absent:
+            raise SnapshotIntegrityError(f"{path}: snapshot lacks the tables {', '.join(absent)}")
+        dangling = db.execute("PRAGMA foreign_key_check").fetchall()
+        if dangling:
+            tables_named = sorted({row[0] for row in dangling})
+            raise SnapshotIntegrityError(
+                f"{path}: dangling foreign keys in {', '.join(tables_named)}"
             )
         try:
-            self.topic: str = meta["topic"]
-            self.title: str = meta["title"]
-            self.created_at: str = meta["created_at"]
-            self.synthesis_markdown: str = meta["synthesis_markdown"]
-            self.embedding_model: str = meta["embedding_model"]
             self.embedding_dimensions = int(meta["embedding_dimensions"])
-        except (KeyError, ValueError) as exc:
-            raise SnapshotIntegrityError(f"{path}: corpus_meta is malformed: {exc!r}") from exc
-        # Snapshots written before these keys were recorded still open: the fingerprint is
-        # recomputed from the documents table, and an unrecorded writer version reads as "".
-        self.arkive_version: str = meta.get("arkive_version", "")
+            self.build_settings: dict[str, Any] = _SETTINGS.validate_json(meta["build_settings"])
+            self.build_report = BuildReport.model_validate_json(meta["build_report"])
+        except (ValueError, ValidationError) as exc:
+            raise SnapshotIntegrityError(f"{path}: corpus_meta is malformed: {exc}") from exc
+        self.topic: str = meta["topic"]
+        self.title: str = meta["title"]
+        self.created_at: str = meta["created_at"]
+        self.arkive_version: str = meta["arkive_version"]
+        self.guide_markdown: str = meta["guide_markdown"]
+        self.embedding_model: str = meta["embedding_model"]
         db.row_factory = sqlite3.Row
+        self._load_facets(db)
         documents = db.execute(
-            "SELECT doc_id, rel_path, sha256, format, project_id, client, stage, title, doc_date,"
-            " summary, page_count FROM documents ORDER BY ordinal"
+            "SELECT doc_id, rel_path, sha256, format, title, doc_date, deliverable_type, summary,"
+            " page_count, is_curator_note FROM documents ORDER BY ordinal"
         )
-        self._documents = {r["doc_id"]: DocumentInfo.model_validate(dict(r)) for r in documents}
+        self._documents = {
+            r["doc_id"]: DocumentInfo.model_validate(
+                dict(r)
+                | {
+                    "is_curator_note": bool(r["is_curator_note"]),
+                    "facets": self.facets_of(r["doc_id"]),
+                }
+            )
+            for r in documents
+        }
         self.corpus_fingerprint = corpus_fingerprint(
             (d.rel_path, d.sha256) for d in self._documents.values()
         )
-        recorded = meta.get("corpus_fingerprint", self.corpus_fingerprint)
-        if recorded != self.corpus_fingerprint:
+        if meta["corpus_fingerprint"] != self.corpus_fingerprint:
             raise SnapshotIntegrityError(
-                f"{path}: recorded corpus_fingerprint {recorded} does not match its documents"
-                f" ({self.corpus_fingerprint})"
+                f"{path}: recorded corpus_fingerprint {meta['corpus_fingerprint']} does not match"
+                f" its documents ({self.corpus_fingerprint})"
             )
-        self.projects = sorted({d.project_id for d in self._documents.values()})
-        self.stages = sorted({d.stage for d in self._documents.values()})
+        self._load_knowledge(db)
         rows = db.execute(
             f"SELECT {_HIT_COLUMNS}, c.embedding {_FROM_CHUNKS} ORDER BY c.doc_id, c.ordinal"
         ).fetchall()
@@ -361,13 +479,119 @@ class TopicSnapshot:
                 {k: v for k, v in dict(r).items() if k != "markdown"},
                 r["doc_id"],
                 tuple(lines := r["markdown"].split("\n")),
-                tuple(_grep_normalize(line) for line in lines),
+                tuple(fold_text(line) for line in lines),
             )
             for r in db.execute(
                 f"SELECT {_SECTION_COLUMNS}, s.markdown FROM sections s"
                 " JOIN documents d ON d.doc_id = s.doc_id ORDER BY s.doc_id, s.ordinal"
             )
         ]
+
+    def _load_facets(self, db: sqlite3.Connection) -> None:
+        """Facets, aliases and the document-to-facets map, loaded once for every read path."""
+        aliases: dict[str, dict[str, str]] = {}
+        alias_lists: dict[tuple[str, str], list[str]] = {}
+        for r in db.execute("SELECT facet, folded_alias, alias, value FROM facet_aliases"):
+            # The resolver looks filters up by folded key; a key that is blank or is not its
+            # alias's fold would answer a filter the alias does not name.
+            if not r["folded_alias"] or r["folded_alias"] != fold_facet_label(r["alias"]):
+                raise SnapshotIntegrityError(
+                    f"{self.path}: facet {r['facet']!r} alias {r['alias']!r} has folded key"
+                    f" {r['folded_alias']!r}, which is not the alias's non-blank folded form"
+                )
+            aliases.setdefault(r["facet"], {})[r["folded_alias"]] = r["value"]
+            if r["alias"] != r["value"]:
+                alias_lists.setdefault((r["facet"], r["value"]), []).append(r["alias"])
+        values: dict[str, list[FacetValue]] = {}
+        try:
+            for r in db.execute(
+                "SELECT facet, value, description, folders_json FROM facet_values"
+                " ORDER BY facet, ordinal"
+            ):
+                values.setdefault(r["facet"], []).append(
+                    FacetValue(
+                        value=r["value"],
+                        description=r["description"],
+                        aliases=tuple(sorted(alias_lists.get((r["facet"], r["value"]), []))),
+                        folders=_FOLDERS.validate_json(r["folders_json"]),
+                    )
+                )
+            self.facets = [
+                Facet(
+                    name=r["name"],
+                    description=r["description"],
+                    binding=r["binding"],
+                    values=tuple(values.get(r["name"], [])),
+                )
+                for r in db.execute(
+                    "SELECT name, description, binding FROM facets ORDER BY ordinal"
+                )
+            ]
+        except ValidationError as exc:
+            raise SnapshotIntegrityError(f"{self.path}: a facet row is malformed: {exc}") from exc
+        for facet in self.facets:
+            for value in facet.values:
+                if aliases.get(facet.name, {}).get(fold_facet_label(value.value)) != value.value:
+                    raise SnapshotIntegrityError(
+                        f"{self.path}: facet {facet.name!r} value {value.value!r} has no"
+                        " canonical alias row"
+                    )
+        self._aliases = aliases
+        self._doc_facets: dict[str, dict[str, list[str]]] = {}
+        self._docs_by_value: dict[tuple[str, str], set[str]] = {}
+        order = {f.name: i for i, f in enumerate(self.facets)}
+        rows = db.execute("SELECT doc_id, facet, value FROM document_facets").fetchall()
+        for r in sorted(rows, key=lambda r: (r["doc_id"], order[r["facet"]], r["value"])):
+            self._doc_facets.setdefault(r["doc_id"], {}).setdefault(r["facet"], []).append(
+                r["value"]
+            )
+            self._docs_by_value.setdefault((r["facet"], r["value"]), set()).add(r["doc_id"])
+
+    def _load_knowledge(self, db: sqlite3.Connection) -> None:
+        """Glossary and blueprint rows, validated and with every reference resolved."""
+        citable = {
+            r["section_id"]
+            for r in db.execute(
+                "SELECT s.section_id FROM sections s JOIN documents d ON d.doc_id = s.doc_id"
+                " WHERE d.is_curator_note = 0"
+            )
+        }
+        documents = {d for d, info in self._documents.items() if not info.is_curator_note}
+        try:
+            self.glossary = [
+                GlossaryEntry.model_validate_json(r["entry_json"])
+                for r in db.execute("SELECT entry_json FROM glossary ORDER BY ordinal")
+            ]
+            self.blueprints = [
+                Blueprint.model_validate_json(r["blueprint_json"])
+                for r in db.execute("SELECT blueprint_json FROM blueprints ORDER BY ordinal")
+            ]
+        except ValidationError as exc:
+            raise SnapshotIntegrityError(
+                f"{self.path}: a glossary or blueprint row is malformed: {exc}"
+            ) from exc
+        cited = [
+            (f"glossary term {e.term!r}", c)
+            for e in self.glossary
+            for s in e.senses
+            for c in s.citations
+        ]
+        for b in self.blueprints:
+            label = f"blueprint {b.deliverable_type!r}"
+            cited += [(label, c) for s in b.outline for c in s.citations]
+            cited += [(label, c) for g in (*b.conventions, *b.pitfalls) for c in g.citations]
+            for doc_id in (*b.exemplar_doc_ids, *b.feedback_doc_ids):
+                if doc_id not in documents:
+                    raise SnapshotIntegrityError(
+                        f"{self.path}: {label} names document {doc_id!r}, which is not a"
+                        " citable document of this snapshot"
+                    )
+        for label, section_id in cited:
+            if section_id not in citable:
+                raise SnapshotIntegrityError(
+                    f"{self.path}: {label} cites {section_id!r}, which is not a citable section"
+                    " of this snapshot"
+                )
 
     @classmethod
     def open(cls, path: Path) -> TopicSnapshot:
@@ -381,9 +605,16 @@ class TopicSnapshot:
             raise SnapshotIntegrityError(f"cannot open snapshot {path}: {exc}") from exc
         try:
             return cls(db, path)
-        except sqlite3.DatabaseError as exc:
+        except (
+            sqlite3.Error,
+            KeyError,
+            StopIteration,
+            TypeError,
+            ValueError,
+        ) as exc:
+            # A damaged build output: decoding or cross-table lookups failed while loading.
             db.close()
-            raise SnapshotIntegrityError(f"{path} is not a valid snapshot: {exc}") from exc
+            raise SnapshotIntegrityError(f"{path} is not a valid snapshot: {exc!r}") from exc
         except BaseException:
             db.close()
             raise
@@ -400,7 +631,16 @@ class TopicSnapshot:
 
     def _rows(self, sql: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
         with self._lock:
-            return self._db.execute(sql, params).fetchall()
+            try:
+                return self._db.execute(sql, params).fetchall()
+            except sqlite3.Error as exc:
+                raise SnapshotIntegrityError(
+                    f"{self.path}: cannot read the snapshot: {exc}"
+                ) from exc
+
+    def facets_of(self, doc_id: str) -> dict[str, list[str]]:
+        """The document's values per facet, in facet order; facets it holds no value of omitted."""
+        return {k: list(v) for k, v in self._doc_facets.get(doc_id, {}).items()}
 
     # Catalogue reads.
 
@@ -412,40 +652,76 @@ class TopicSnapshot:
             corpus_fingerprint=self.corpus_fingerprint,
             arkive_version=self.arkive_version,
             document_count=len(self._documents),
-            projects=self.projects,
-            stages=self.stages,
+            facets=[
+                FacetSummary(name=f.name, binding=f.binding, values=[v.value for v in f.values])
+                for f in self.facets
+            ],
+            blueprints=[b.deliverable_type for b in self.blueprints],
+            glossary_terms=len(self.glossary),
         )
 
-    def guide(self) -> TopicGuide:
+    def curator_notes(self) -> list[CuratorNote]:
         notes = self._rows("SELECT scope_path, content FROM curator_notes ORDER BY ordinal")
+        return [CuratorNote.model_validate(dict(n)) for n in notes]
+
+    def guide(self) -> TopicGuide:
         return TopicGuide(
             topic=self.topic,
             title=self.title,
-            synthesis_markdown=self.synthesis_markdown,
-            curator_notes=[CuratorNote.model_validate(dict(n)) for n in notes],
-            projects=self.projects,
-            stages=self.stages,
+            guide_markdown=self.guide_markdown,
+            curator_notes=self.curator_notes(),
+            facets=self.facets,
+            blueprints=self.blueprints,
+            glossary_terms=[e.term for e in self.glossary],
         )
 
-    def _check_filters(self, project: str | None, stage: str | None) -> None:
-        if project is not None and project not in self.projects:
-            raise InvalidFilterError(
-                f"unknown project {project!r}; valid projects: {', '.join(self.projects)}"
-            )
-        if stage is not None and stage not in self.stages:
-            raise InvalidFilterError(
-                f"unknown stage {stage!r}; valid stages: {', '.join(self.stages)}"
-            )
+    def lookup_glossary(self, query: str | None = None) -> GlossaryLookup:
+        """Every term without a query; with one, entries whose folded term or alias contains it."""
+        if query is None:
+            terms = [
+                GlossaryTermSummary(
+                    term=e.term,
+                    kind=e.kind,
+                    aliases=list(e.aliases),
+                    defined=any(s.definition is not None for s in e.senses),
+                )
+                for e in self.glossary
+            ]
+            return GlossaryLookup(query=None, terms=terms, matches=[])
+        needle = fold_text(query).strip()
+        if not needle:
+            raise InvalidFilterError("glossary query must not be blank; omit it to list terms")
+        matches = [
+            e for e in self.glossary if any(needle in fold_text(f) for f in (e.term, *e.aliases))
+        ]
+        return GlossaryLookup(query=query, terms=[], matches=matches)
 
-    def _matches(self, doc_id: str, project: str | None, stage: str | None) -> bool:
-        doc = self._documents[doc_id]
-        return project in (None, doc.project_id) and stage in (None, doc.stage)
+    def resolve_filters(self, filters: Mapping[str, str] | None) -> frozenset[str] | None:
+        """The documents holding every filter's value (keys combine with AND), or None when
+        there is no filter. A value is a canonical facet value or one of its aliases."""
+        if not filters:
+            return None
+        allowed: set[str] | None = None
+        for facet, value in sorted(filters.items()):
+            if facet not in self._aliases:
+                valid = ", ".join(f.name for f in self.facets) or "none, this topic has no facets"
+                raise InvalidFilterError(f"unknown facet {facet!r}; valid facets: {valid}")
+            if not fold_facet_label(value):
+                raise InvalidFilterError(f"{facet} filter value must not be blank")
+            canonical = self._aliases[facet].get(fold_facet_label(value))
+            if canonical is None:
+                known = next(f for f in self.facets if f.name == facet).values
+                raise InvalidFilterError(
+                    f"unknown {facet} value {value!r}; valid values: "
+                    + ", ".join(v.value for v in known)
+                )
+            docs = self._docs_by_value.get((facet, canonical), set())
+            allowed = set(docs) if allowed is None else allowed & docs
+        return frozenset(allowed or ())
 
-    def list_documents(
-        self, *, project: str | None = None, stage: str | None = None
-    ) -> list[DocumentInfo]:
-        self._check_filters(project, stage)
-        return [d for d in self._documents.values() if self._matches(d.doc_id, project, stage)]
+    def list_documents(self, *, filters: Mapping[str, str] | None = None) -> list[DocumentInfo]:
+        allowed = self.resolve_filters(filters)
+        return [d for d in self._documents.values() if allowed is None or d.doc_id in allowed]
 
     def document(self, doc_id: str) -> DocumentInfo:
         if doc_id not in self._documents:
@@ -469,8 +745,7 @@ class TopicSnapshot:
         query: str,
         embed_query: QueryEmbedder,
         *,
-        project: str | None = None,
-        stage: str | None = None,
+        filters: Mapping[str, str] | None = None,
         top_k: int = 8,
     ) -> list[SearchHit]:
         """Hybrid search: BM25 and dense ranks fused by Reciprocal Rank Fusion.
@@ -478,17 +753,14 @@ class TopicSnapshot:
         The request is validated before `embed_query` runs, so a blank query or an invalid
         filter costs no provider call.
         """
-        return self.rank_channels(query, embed_query, project=project, stage=stage, top_k=top_k)[
-            "hybrid_rrf"
-        ]
+        return self.rank_channels(query, embed_query, filters=filters, top_k=top_k)["hybrid_rrf"]
 
     def rank_channels(
         self,
         query: str,
         embed_query: QueryEmbedder,
         *,
-        project: str | None = None,
-        stage: str | None = None,
+        filters: Mapping[str, str] | None = None,
         top_k: int = 8,
     ) -> dict[RankingChannel, list[SearchHit]]:
         """The top `top_k` hits of the BM25 channel, the dense channel and their RRF fusion.
@@ -498,7 +770,7 @@ class TopicSnapshot:
         """
         if not query.strip():
             raise InvalidFilterError("search query must not be blank")
-        self._check_filters(project, stage)
+        allowed = self.resolve_filters(filters)
         if not 1 <= top_k <= MAX_TOP_K:
             raise InvalidFilterError(f"top_k must be between 1 and {MAX_TOP_K}")
         query_vector = embed_query(query)
@@ -507,9 +779,9 @@ class TopicSnapshot:
                 f"query embedding shape {query_vector.shape} does not match snapshot dimension"
                 f" {self.embedding_dimensions} ({self.embedding_model})"
             )
-        lexical = self._lexical_ranks(query, project, stage)
+        lexical = self._lexical_ranks(query, allowed)
         candidates = [
-            i for i, hit in enumerate(self._hits) if self._matches(hit["doc_id"], project, stage)
+            i for i, hit in enumerate(self._hits) if allowed is None or hit["doc_id"] in allowed
         ]
         similarity = self._matrix[candidates] @ query_vector.astype(np.float32)
         cosine = dict(zip(candidates, similarity.tolist(), strict=True))
@@ -525,6 +797,7 @@ class TopicSnapshot:
             return [
                 SearchHit(
                     **self._hits[i],
+                    facets=self.facets_of(self._hits[i]["doc_id"]),
                     rrf_score=fused[i],
                     lexical_rank=lexical.get(i),
                     dense_rank=dense.get(i),
@@ -538,18 +811,19 @@ class TopicSnapshot:
             "hybrid_rrf": hits(ranked),
         }
 
-    def _lexical_ranks(self, query: str, project: str | None, stage: str | None) -> dict[int, int]:
+    def _lexical_ranks(self, query: str, allowed: frozenset[str] | None) -> dict[int, int]:
         """Rank of each matching chunk, keyed by its row index in `self._hits`."""
         fts_query = build_fts5_query(query)
         if fts_query is None:
             return {}
+        doc_ids = None if allowed is None else json.dumps(sorted(allowed))
         rows = self._rows(
             "SELECT c.chunk_id, bm25(chunks_fts, 0.0, 10.0, 2.0) AS score"
             " FROM chunks_fts JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id"
-            " JOIN documents d ON d.doc_id = c.doc_id WHERE chunks_fts MATCH ?"
-            " AND (? IS NULL OR d.project_id = ?) AND (? IS NULL OR d.stage = ?)"
+            " WHERE chunks_fts MATCH ?"
+            " AND (? IS NULL OR c.doc_id IN (SELECT value FROM json_each(?)))"
             " ORDER BY score, c.chunk_id LIMIT ?",
-            (fts_query, project, project, stage, stage, CHANNEL_DEPTH),
+            (fts_query, doc_ids, doc_ids, CHANNEL_DEPTH),
         )
         return {self._hit_index[row["chunk_id"]]: rank for rank, row in enumerate(rows, start=1)}
 
@@ -557,8 +831,7 @@ class TopicSnapshot:
         self,
         pattern: str,
         *,
-        project: str | None = None,
-        stage: str | None = None,
+        filters: Mapping[str, str] | None = None,
         max_matches: int = 20,
     ) -> list[GrepMatch]:
         """Literal, case-insensitive, dash- and NFKC-folded line search over section text."""
@@ -566,12 +839,17 @@ class TopicSnapshot:
             raise InvalidFilterError("grep pattern must not be blank")
         if max_matches < 1:
             raise InvalidFilterError("max_matches must be at least 1")
-        self._check_filters(project, stage)
-        needle = _grep_normalize(pattern)
+        allowed = self.resolve_filters(filters)
+        needle = fold_text(pattern)
         matches = (
-            GrepMatch(**section.fields, line_number=number, snippet=_snippet(line, needle))
+            GrepMatch(
+                **section.fields,
+                facets=self.facets_of(section.doc_id),
+                line_number=number,
+                snippet=_snippet(line, needle),
+            )
             for section in self._grep_sections
-            if self._matches(section.doc_id, project, stage)
+            if allowed is None or section.doc_id in allowed
             for number, (line, folded) in enumerate(
                 zip(section.lines, section.normalized, strict=True), start=1
             )
@@ -593,7 +871,8 @@ class TopicSnapshot:
             raise NotFoundError(
                 f"unknown section {section_id!r}; get_document_outline lists section IDs"
             )
-        return SectionReadView.model_validate(dict(rows[0]))
+        row = dict(rows[0])
+        return SectionReadView.model_validate(row | {"facets": self.facets_of(row["doc_id"])})
 
     def view_page(self, doc_id: str, page_number: int) -> PageVisualView:
         doc = self.document(doc_id)

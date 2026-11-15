@@ -1,25 +1,33 @@
 # Architecture
 
-Arkive RAG turns a folder of consulting documents into one SQLite file, the
+Arkive RAG turns a folder of reference documents into one SQLite file, the
 *snapshot*, and serves one or more snapshots to AI agents over MCP. Building a
 snapshot calls OpenAI models. Reading one needs no network, except that the
 `search` tool embeds each query with the OpenAI embedding model.
+
+The build does not assume how a collection is organised. It reads every
+document, induces from the whole corpus the facets an agent can filter by, a
+cited glossary and a blueprint for each recurring deliverable type, and stores
+them in the snapshot next to the sections, pages and chunks.
 
 ## Modules
 
 | Module | Owns |
 | --- | --- |
-| `models.py` | Domain types, OpenAI structured-output schemas, and the `ArkiveError` hierarchy. |
+| `models.py` | Domain types (readings, observation cards, facets, glossary entries, blueprints, the build report, read results), the provider output schemas, the shared text folding (`fold_text`, `fold_for_quote`), and the `ArkiveError` hierarchy. |
 | `llm.py` | The request protocols (`StructuredRequest`, `AgentRequest`), the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Agents SDK runs, Decisions, embeddings, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
-| `compiler.py` | Corpus discovery, rendering, the transcription fidelity gate, section stitching, chunking, cited synthesis, and embedding. Its request types (`PageTranscription`, `DocumentCatalogue`, `CorpusSynthesis`) own every prompt, output schema and reasoning effort it sends. Produces a `CompiledCorpus`. |
-| `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (hybrid search, grep, sections, pages). |
-| `server.py` | `TopicCatalog` (open snapshots keyed by topic) and the eight MCP tools. |
+| `compiler.py` | Reading (discovery, rendering, the transcription fidelity gate, section stitching, chunk pieces, observation cards with quote location) and binding (IDs, breadcrumbs, embeddings). `compile_corpus` composes reading, induction and binding into a `CompiledCorpus`. Its request types (`PageTranscription`, `ObserveSections`, `ConsolidateCard`) own their prompts, output schemas and reasoning efforts. |
+| `induction.py` | Induction: corpus organisation, facet binding, the glossary, blueprints and the topic guide; the validate-and-retry helper `generate_checked`; support checks; the read-only source tools of the blueprint agent. Its request types (`OrganiseCorpus`, `WriteGlossary`, `WriteBlueprint`, `WriteGuide`) own their prompts, schemas and efforts. |
+| `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup). |
+| `server.py` | `TopicCatalog` (open snapshots keyed by topic) and the nine MCP tools. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
 
-Dependencies point one way: `cli` → `server`, `compiler`, `snapshot` → `llm`,
-`models`. The compiler receives a `LanguageGateway`, so tests drive it with a
-deterministic fake and no network. Only `llm.py` imports the OpenAI SDK and the
-OpenAI Agents SDK (`openai-agents`); `compiler.py` and `evals/` do not.
+Dependencies point one way: `cli` → `server` → `snapshot`, and `cli` →
+`compiler` → `induction` → `llm`; every module uses `models`. `snapshot` and
+`server` import neither `compiler`, `induction` nor `llm`; the CLI passes the
+query embedder in. The compiler and induction receive a `LanguageGateway`, so
+tests drive them with a deterministic fake and no network. Only `llm.py`
+imports the OpenAI SDK and the OpenAI Agents SDK (`openai-agents`).
 
 ## Corpus layout
 
@@ -31,24 +39,36 @@ is read once without following symlinks; Word and PowerPoint files are
 converted from a private copy of those bytes. The snapshot and the build cache
 must be different files outside the corpus directory.
 
-- The first folder under the corpus root is the document's `project_id`
-  (`p102-estuary-multibeam/P102 summary.docx` belongs to `p102-estuary-multibeam`). Files directly
-  in the root belong to project `root`.
+- Folders carry no fixed meaning. Induction decides whether the folder
+  structure encodes a facet (projects, campaigns, authors) and binds that
+  facet to the folders it names.
 - Every `AGENTS.md` is a curator note. Its text is stored verbatim in the
-  topic guide, and it is also compiled as a `guidance` document (client
-  `curator`, chunk kind `guidance`, `is_curator_note`), so status questions
-  such as "where is the reef case study?" match the note in both
-  `search` and `grep`. Other documents the model classes as `guidance` are
-  catalogued and cited like any other document.
+  topic guide and given to induction as the curators' stated intent, which
+  outranks the model's inference. It is also compiled as a document
+  (`is_curator_note`, chunk kind `guidance`), so status questions such as
+  "where is the reef case study?" match the note in both `search` and `grep`.
+  A curator note is not citable: no glossary entry, blueprint or guide
+  citation may point at it, and the blueprint tools cannot read it. A
+  path-bound facet value still covers a note in its folder, so a project
+  filter also finds that project's note.
 - Documents are numbered in sorted path order: `doc_001`, sections
   `doc_001_sec_001`, chunks `doc_001_chk_0001`. The same corpus produces the
   same IDs.
 
 ## Build pipeline
 
-`compile_corpus` compiles documents in a thread pool (`--max-concurrency`,
-default 4) and keeps the output in path order. Each PDF, Word and PowerPoint
-file follows one path:
+`compile_corpus` runs three passes in order. Reading runs per document in a
+thread pool (`--max-concurrency`, default 4); induction is corpus-wide and
+one executor of the same size bounds all its provider calls in flight;
+binding needs both.
+
+### Reading
+
+`read_document(source, data, gateway)` returns a `DocumentReading`: the file's
+SHA-256, its sections and chunk pieces, its rendered pages and its observation
+card. A reading holds no corpus IDs and no path, so the provider responses it
+is built from stay valid in the build cache when files are added, removed or
+moved. Each PDF, Word and PowerPoint file follows one path:
 
 1. **Render.** Word and PowerPoint files are converted to PDF by LibreOffice
    (`soffice --headless`) with a private temporary profile, a minimal
@@ -61,7 +81,10 @@ file follows one path:
    returns blocks (`heading`, `paragraph`, `table`, `callout`) and visual
    transcripts for charts, maps and figures. The image decides what the page
    says, which repairs broken glyph encodings in the text layer; headings keep
-   their visible section numbers.
+   their visible section numbers. The previous page's tail lets the model set
+   the continuation flags below, so page N's request depends on page N-1's
+   transcript: a changed page also changes the cache keys, and so the
+   transcription, of every later page of its document.
 3. **Check fidelity.** Running headers, footers and page numbers are removed
    before anchors are collected: a top or bottom line repeated exactly on
    three or more pages, or repeated apart from a leading or trailing number
@@ -76,8 +99,7 @@ file follows one path:
    transcribed once more at high effort and the missing values are named in
    the request. After that retry, a missing filename or recall below 0.85
    raises `TranscriptionFidelityError` naming the file, page and missing
-   values. Because each request carries the previous page's transcript tail, a
-   changed page also changes the cache keys of the later pages of its document.
+   values.
 4. **Stitch sections.** `assemble_sections` keeps a heading stack (levels 1-4;
    a heading with level 0 counts as level 2) and starts a section at every
    heading; text before the first heading is `Overview`. A table block keeps
@@ -88,30 +110,149 @@ file follows one path:
    rows, and when `merges_into_previous_row` is set, its first row is merged
    cell by cell into the row cut by the page break. Visual transcripts become
    quoted `[Visual — Page N: label]` blocks in the section.
-5. **Catalogue.** `gpt-6.1-sol` at low effort returns the document's title,
-   client, lifecycle stage, date and summary. Curator notes skip this call.
-6. **Chunk.** `build_chunks` packs paragraphs and callouts into prose chunks of
-   up to 1,800 characters, splitting an oversized paragraph at sentence ends. A
-   table up to 2,400 characters is one `table` chunk; a larger table is split on
-   row boundaries into pieces of up to 2,000 characters, each repeating the
-   header and separator rows. Each visual transcript is its own `visual` chunk.
-   No chunk exceeds 6,000 characters: an oversized sentence, table row or
-   visual is wrapped at line breaks or spaces, and table pieces keep the
-   header. Every chunk carries a breadcrumb naming project, client, stage,
-   document, page range and section path, and its own page span.
+5. **Chunk pieces.** `section_pieces` packs paragraphs and callouts into prose
+   pieces of up to 1,800 characters, splitting an oversized paragraph at
+   sentence ends. A table up to 2,400 characters is one `table` piece; a larger
+   table is split on row boundaries into pieces of up to 2,000 characters, each
+   repeating the header and separator rows. Each visual transcript is its own
+   `visual` piece. No piece exceeds 6,000 characters: an oversized sentence,
+   table row or visual is wrapped at line breaks or spaces, and table pieces
+   keep the header. A piece has its own page span and no ID or breadcrumb yet.
+6. **Observe.** The document's sections are packed in order into batches of
+   at most 24,000 characters (a larger section is split at line breaks or
+   spaces into pieces within that size, each keeping the section's ordinal), and
+   `gpt-6.1-sol` at low effort reads each batch (`observe`). It returns the
+   title, date, deliverable type (free text, such as "technical memorandum"
+   or "campaign brief"), summary, the attributes the document states about
+   itself (client, author, audience, channel and similar), the terms it uses
+   (with kind, aliases and whether the quote defines the term), and craft
+   observations (structure, convention, caveat, disclaimer, reviewer
+   feedback, tone). Every term and craft observation carries a verbatim
+   quote, never a section number. Code locates each quote in the batch's
+   sections with `fold_for_quote` (NFKC, case, Unicode dashes, whitespace,
+   `*` and `_` emphasis, backticks, table pipes, block-quote markers and
+   line-break hyphenation ignored; a `*` with spaces on both sides and an
+   underscore inside a word stay text) and records the first containing
+   section's ordinal. Unlocated quotes get one rerun that names them. After
+   the rerun, observations whose quote is still unlocated are discarded and
+   counted in the build report; a batch that quoted something and had no
+   quote located raises `RejectedOutputError`, also when its rerun returns
+   no observations at all. A document with several batches has its terms,
+   craft and attributes unioned in code, and one `consolidate_card` request
+   (low effort) writes its single title, date, deliverable type and summary
+   from the batch headers. A curator note gets a card from its own text and
+   no model call: the first line with text is its title and the first line
+   that is not a heading its summary.
 
 Markdown files skip steps 1-3: `parse_markdown_blocks` splits them
 deterministically, keeping a fenced code block as one literal paragraph, and
-they have no page images for `view_page`.
+they have no page images for `view_page`. A document with no text raises
+`ConversionError`.
 
-After all documents compile, `gpt-6.1-sol` at medium effort writes the topic
-guide from the catalogue and curator notes. Every bracketed `[doc...]` token
-must have the exact form `[doc_XXX:doc_XXX_sec_YYY]` and resolve to a section
-of a catalogued (non-curator) document, and at least one valid citation is
-required when such a section exists. One
-retry lists the invalid and valid IDs; a second failure raises
-`InvalidCitationError`. Finally every chunk is embedded as
-`breadcrumb + "\n" + content` with `text-embedding-3-large` at 1,536 dimensions.
+### Induction
+
+`induce(documents, notes, gateway)` receives the readings with their IDs and
+runs five steps: organise, then bind, then the glossary and the blueprints
+concurrently, then the guide. One executor with `--max-concurrency` workers
+runs the binding questions, the blueprint runs, the glossary batches and the
+definition checks; each task makes one provider call at a time, so the limit
+bounds them together. Results are gathered in submission order, and the first
+failure of any task cancels the tasks not yet started. Every generating step
+goes through
+`generate_checked`: run, validate, rerun once with the rejections appended to
+the request, then raise `RejectedOutputError`. Only three outcomes reduce the
+output without failing, and the build report counts each: an observation
+whose quote is still unlocated after its rerun, a glossary definition the
+support check does not confirm, and a blueprint convention or pitfall it does
+not confirm.
+
+1. **Organise** (`organise_corpus`, medium effort). The request holds the
+   folder tree, the curator notes and every citable document's card. The
+   model returns up to six facets and up to eight recurring deliverable types
+   (each type costs one blueprint run, and `get_topic_guide` returns every
+   blueprint). A facet has a snake_case name, a description and a closed
+   list of values, each with a description and aliases. A facet is
+   *path-bound* when every value names the corpus folders it stands for, or
+   *content-bound* when no value names a folder. Values and aliases are
+   compared by `fold_facet_label`, the folded form the snapshot's alias table
+   and the filter resolver use. Repetition within one value is normalised:
+   values and aliases are stripped, blank aliases dropped and one alias kept
+   per folded form. Validation rejects a facet that mixes the two bindings,
+   an unknown folder, a duplicate facet name, a blank value, a value given
+   twice, a folded form that names two values of one facet, more than six
+   facets, more than eight deliverable types, and a deliverable type with no
+   exemplar or with an unknown document ID. An organisation that passes is
+   always storable. A
+   path-bound value also answers to the paths of its folders, unless a path
+   already names a value of the facet or belongs to several values.
+2. **Bind.** A path-bound value is assigned to every document under its
+   folders, curator notes included. Content-bound values are judged per
+   citable document: one `bind_facets` call to the Decisions API whose
+   evidence is the document's path, title, date, deliverable type, summary,
+   attributes and outline, with one predicate per value. A probability of
+   0.5 or more assigns the value; a refused question assigns nothing and is
+   counted. A document may hold several values of a facet or none. Values no
+   document holds are then pruned, and so are facets with fewer than two
+   populated values; the build report names both.
+3. **Glossary** (`write_glossary`, medium effort, structured requests).
+   Code merges term observations by folded term and alias, keeps a term seen
+   in two or more sections or quoted where a document defines it, and scans
+   the other citable sections for further occurrences (up to six snippets,
+   case-folded). A term's name, aliases and quotes are chosen in a total
+   order (most frequent name, ties broken by folded then literal text), so
+   the same observations in any order give the same request. Terms are sent
+   in batches with their quotes and snippets, each tagged with its section
+   ID. Each entry has a term, kind, aliases and
+   one or more senses; a sense has a definition, or `null` when the cited
+   sections use the term without establishing its meaning, and section
+   citations. Conflicting meanings are separate senses. Validation requires
+   one entry per term given, at least one sense and one citation per sense,
+   citations that resolve to citable sections, and the entry's own term or
+   one of the aliases it publishes in every cited section; an entry's aliases
+   are stripped, one per folded form and sorted. Then `check_definitions`
+   asks the Decisions API whether the cited sections establish each
+   definition; below 0.5 or refused, the definition becomes `null` and is
+   counted.
+4. **Blueprints** (`write_blueprint`, medium effort, one Agents SDK run of
+   at most 12 turns per recurring deliverable type). The agent reads the
+   citable documents through three read-only tools, `outline`,
+   `read_section` and `grep`, which refuse an argument that is not a string;
+   its request lists the exemplars' outlines, the feedback documents and,
+   as leads the agent must verify in the source before using, the craft
+   observations located in those documents (aspect, statement, section ID),
+   in sorted order. It returns a description, exemplar document IDs,
+   a section outline (heading, purpose, citations), conventions and reviewer
+   pitfalls (statement, citations), stated without project-specific values.
+   Validation requires a non-empty outline, citable exemplars and citations
+   that resolve to citable sections. `check_blueprint` then asks the
+   Decisions API whether the cited sections support each convention and
+   pitfall; unsupported or refused ones are dropped and counted.
+5. **Guide** (`write_guide`, medium effort). A cited Markdown overview from
+   the cards, the bound facets, the glossary terms, the blueprint summaries
+   and the curator notes. Every bracketed `[doc...]` token must have the exact
+   form `[doc_XXX:doc_XXX_sec_YYY]` and resolve to a section of a citable
+   document, and at least one valid citation is required when such a section
+   exists. A corpus with no citable section (curator notes only) gets a guide
+   without citation tokens.
+
+A support check judges the complete cited sections. Evidence longer than
+48,000 characters is sent in windows (a longer section in parts that overlap
+by 2,000 characters), and each predicate takes its highest probability over
+the windows; it counts as refused only when every window refused it.
+
+### Binding
+
+`bind_document` gives each section and chunk its ID and each chunk the
+breadcrumb `[<facet>: v1, v2 | ... | Doc: <title> (pp. X-Y) | Section: <heading
+path>]`, with facets in definition order, values sorted and facets the
+document holds no value of left out. Every chunk is then embedded as
+`breadcrumb + "\n" + content` with `text-embedding-3-large` at 1,536
+dimensions.
+
+`build` prints the usage line and the build report. The build report has
+`discarded_unlocated_quotes`, `unsupported_definitions`,
+`dropped_blueprint_statements`, `judge_refusals` (per Decisions operation),
+`pruned_facet_values` and `pruned_facets`.
 
 ## Provider calls
 
@@ -175,12 +316,21 @@ keyed by SHA-256 of the call's inputs:
 - `run_agent`: the same plus `max_turns`, each tool's name, description and
   parameter schema, and the request's `source_digest` (a hash of everything
   the tools can read), so a result computed while the tools could read one
-  source set never answers a request over another;
+  source set never answers a request over another. The blueprint request's
+  digest also covers `SOURCE_TOOLS_REVISION`, which names the tools'
+  behaviour, so a change in what the tools return is never answered from an
+  older run;
 - `judge`: operation, decision model, evidence and predicates;
 - embeddings: model, dimensions and the batch's texts.
 
 A rebuild of an unchanged corpus with the same cache makes no provider
-requests. The first valid entry stored under a key is canonical: when two build
+requests: every collection that reaches a prompt or a cache key is in a
+canonical sorted order, and concurrent results are gathered in submission
+order. Adding a file requests the reading of that file only; induction and
+the embeddings are requested again because the corpus changed. A build of a
+subset of a corpus never reuses the full corpus's induction results, because
+each induction request carries the cards, IDs or source digest of the
+documents it covers. The first valid entry stored under a key is canonical: when two build
 threads miss the same key at once, the second writer returns the first
 writer's value. An entry that no longer decodes or validates is a miss and is
 replaced. A new cache file is created with mode `0600`.
@@ -204,28 +354,47 @@ the output, then fsyncs the directory. A replaced snapshot keeps its file
 mode. A failed build leaves any previous snapshot untouched, and SQLite or
 file-system failures raise `SnapshotIntegrityError`.
 
-Tables (schema version `2.0`): `corpus_meta`, `curator_notes`, `documents`
-(including the SHA-256 of each source file), `sections`, `pages` (native text,
-visual summary and WebP per page), `chunks` (content, breadcrumb and float32
-embedding), and the FTS5 table `chunks_fts` with NFKC-normalised content and
-breadcrumb (`porter unicode61 remove_diacritics 2`).
+Tables (schema version `3.0`):
 
-`corpus_meta` records `corpus_fingerprint` and `arkive_version` (the package
-version that wrote the file). The corpus fingerprint is the SHA-256 hex digest
-of the lines `rel_path NUL sha256`, one per document sorted by `rel_path` and
-joined by newlines. It depends only on source paths and bytes, not on models,
-prompts or build time, so it is the content address of the corpus a snapshot
-was built from (`CompiledCorpus.corpus_fingerprint`).
+| Table | Contents |
+| --- | --- |
+| `corpus_meta` | `schema_version`, `topic`, `title`, `created_at`, `corpus_fingerprint`, `arkive_version`, `embedding_model`, `embedding_dimensions`, `guide_markdown`, `build_settings` (JSON: the model IDs and the effort of each operation) and `build_report` (JSON, as printed by `build`). |
+| `curator_notes` | Verbatim `AGENTS.md` files with their path. |
+| `documents` | One row per source file: `doc_id`, `ordinal`, `rel_path`, `sha256`, `format`, `title`, `doc_date`, `deliverable_type`, `summary`, `page_count`, `is_curator_note`. |
+| `facets` | Name, order, description and binding (`path` or `content`). |
+| `facet_values` | Each facet's values with their order, description and folders (JSON). |
+| `facet_aliases` | Every folded form of a value, the canonical value included, keyed by facet and folded alias, so a form that would name two values cannot be stored. |
+| `document_facets` | Document-to-value assignments, with foreign keys to `documents` and `facet_values`. |
+| `glossary` | One validated `GlossaryEntry` JSON document per row. |
+| `blueprints` | One validated `Blueprint` JSON document per row. |
+| `sections`, `pages`, `chunks` | Section Markdown with heading path and pages; native text, visual summary and WebP per page; chunk content, breadcrumb and float32 embedding. |
+| `chunks_fts` | FTS5 over NFKC-normalised chunk content and breadcrumb (`porter unicode61 remove_diacritics 2`). |
+
+The corpus fingerprint is the SHA-256 hex digest of the lines `rel_path NUL
+sha256`, one per document sorted by `rel_path` and joined by newlines. It
+depends only on source paths and bytes, not on models, prompts or build time,
+so it is the content address of the corpus a snapshot was built from
+(`CompiledCorpus.corpus_fingerprint`).
 
 `TopicSnapshot.open` uses a read-only SQLite URI with the path
 percent-encoded, so names containing `%`, `?` or `#` open the right file. It
-checks the schema version, metadata and embedding sizes, and loads chunk
-metadata and the embedding matrix into memory. It recomputes the fingerprint
-from the `documents` table and raises `SnapshotIntegrityError` when a recorded
-fingerprint differs. A `2.0` snapshot written before these keys existed opens
-with the recomputed fingerprint and an empty `arkive_version`. `list_topics`
-and `arkive-rag inspect` report both values; `inspect` also lists each
-document's `sha256`.
+refuses any schema version other than `3.0`, naming the file's version and the
+one it reads; a `2.0` snapshot is rebuilt from its corpus. Every
+`corpus_meta` key and every table is required, and `open` runs `PRAGMA
+foreign_key_check`, so a dangling facet assignment or alias is refused. Each
+facet value must have its canonical alias row. A snapshot is a build output
+that may be truncated or damaged: any decoding or cross-table failure while
+it opens, and any SQLite error from a later read, is `SnapshotIntegrityError`
+naming the file. `open` recomputes the fingerprint from the
+`documents` table and raises `SnapshotIntegrityError` when the recorded one
+differs. It validates every glossary and blueprint row through its model and
+checks that every cited section belongs to a citable document of the
+snapshot and that every blueprint exemplar and feedback document is one. It
+loads the facets, aliases and document-to-facets map once, with chunk
+metadata and the embedding matrix. `list_topics` and `arkive-rag inspect`
+report the fingerprint and version; `inspect` also prints the facets,
+glossary, blueprints, build settings, build report and each document's
+`sha256`.
 
 ## Private corpus and eval versioning
 
@@ -251,6 +420,13 @@ local packs are not staged by accident.
 
 ## Retrieval
 
+- **Filters.** `list_documents`, `search`, `rank_channels` and `grep` take
+  `filters`, a mapping from facet name to one value. A value matches a
+  canonical facet value or one of its aliases after `fold_text`. Several
+  facets combine with AND; an empty mapping means no filter.
+  `TopicSnapshot.resolve_filters` turns the mapping into the set of matching
+  document IDs once, and every read path uses that set. An unknown facet or
+  value raises `InvalidFilterError` naming the valid facets or values.
 - **search** fuses two rankings with Reciprocal Rank Fusion
   (each ranking adds `1 / (60 + rank)` to a chunk's score), taking the top 100 of each:
   - BM25 over `chunks_fts`, weighting content 10 and breadcrumb 2.
@@ -264,24 +440,33 @@ local packs are not staged by accident.
     passes the filters.
 
   Ties break on cosine similarity, then chunk ID. Each hit reports its fused
-  score and both ranks. A blank query or an invalid filter or `top_k` raises
-  `InvalidFilterError` before the query is embedded.
+  score, both ranks and its document's facets. A blank query or an invalid
+  filter or `top_k` raises `InvalidFilterError` before the query is embedded.
 - **grep** is a literal, case-insensitive line search over section Markdown.
-  Pattern and text are NFKC-normalised and Unicode dashes fold to `-`, so
-  `2016-2017` finds `2016–2017` and `km2` finds `km²`. A snippet is at most
-  400 characters of the line, centred on the first match.
-- `project` and `stage` filters must name values present in the snapshot;
-  anything else raises `InvalidFilterError` listing the valid values.
+  Pattern and text are compared by `fold_text` (NFKC, Unicode dashes as `-`,
+  case-folded), so `2016-2017` finds `2016–2017` and `km2` finds `km²`. A
+  snippet is at most 400 characters of the line, centred on the first match.
+- **Glossary lookup.** Without a query, `lookup_glossary` lists every term
+  with its kind, aliases and whether any sense has a definition. With a
+  query, it returns the full entries whose folded term or alias contains the
+  folded query; no match is an empty list.
 
 ## MCP server
 
 `arkive-rag serve a.arkive.db b.arkive.db` opens every snapshot into a
 `TopicCatalog` and refuses two snapshots with the same topic. The tools are
-`list_topics`, `get_topic_guide`, `list_documents`, `get_document_outline`,
-`search`, `grep`, `read_section` and `view_page`. `view_page` returns the
-caption as text content and the page as `image/webp` image content. Domain
-errors become tool errors whose message names the valid topics, projects,
-stages or pages.
+`list_topics` (each topic's facets and allowed values), `get_topic_guide`
+(guide, curator notes, facet definitions, blueprints and glossary terms),
+`list_documents`, `get_document_outline`, `search`, `grep`, `read_section`,
+`view_page` and `lookup_glossary`. `list_documents`, `search` and `grep` take
+`filters: dict[str, str] | None`. `view_page` returns the caption as text
+content and the page as `image/webp` image content. Domain errors become tool
+errors whose message names the valid topics, facets, values or pages.
+
+The server's instructions describe two modes. Answering questions cites
+`doc_id`, `section_id` and pages. Drafting a deliverable starts from the
+blueprint for its deliverable type, reads the blueprint's feedback documents
+and exemplars, and keeps every project fact to the user's own inputs.
 
 Over `streamable-http` the server has no authentication, so `serve` refuses a
 host other than `127.0.0.1`, `localhost` or `::1` unless `--allow-nonlocal` is
@@ -292,6 +477,9 @@ snapshots must share one embedding model and dimension. Without a key the
 server still starts; `search` returns an error that points to the offline
 tools.
 
+The CLI's `search` and `grep` take repeated `--filter FACET=VALUE`; naming a
+facet twice is a usage error, because each facet takes one value.
+
 ## Evaluation
 
 `evals/` is a harness outside the `arkive_rag` package; it is not in the wheel.
@@ -300,12 +488,18 @@ runs an eval pack and writes `results.json`, `report.md` and, for layer 3,
 `blind-drafts/` to `--out`. `--out` is required and should be a private
 directory outside the repository; the runner creates it with mode 0700 and
 writes 0600 files. Every layer calls OpenAI, so it needs `OPENAI_API_KEY`.
-Before creating any output or calling any model the runner checks that the pack
+Before creating any output or calling any model the runner checks, for every
+layer it will run (so `--layer all` checks layer 3 before layer 1 calls
+anything), that the pack is a valid `arkive-eval-pack/2` file, that it
 defines the requested layers, that layers 2 and 3 have `--corpus`, that
-`--out` and `--cache` overlap none of the pack, snapshot and corpus paths, that
-the snapshot's `corpus_fingerprint` matches the pack's when the pack sets one,
-and that the fingerprint of the `--corpus` files (found by `discover_corpus`)
-equals the snapshot's.
+`--out` and `--cache` overlap none of the pack, snapshot and corpus paths,
+that the snapshot opens, that its `corpus_fingerprint` matches the pack's
+when the pack sets one, that every retrieval case's `filters` resolve
+against it, that the fingerprint of the `--corpus` files (found by
+`discover_corpus`) equals the snapshot's, and that the holdout's reference
+and included files pass the layer 3 guards below. A failure is a usage error
+(exit 2) without a traceback. A failure after model calls have been made
+prints the usage line before the error.
 
 Eval agents and judges go through `OpenAIGateway` at medium reasoning effort
 on `gpt-6.1-sol`: agents through `converse`, judges through `run`, under the
@@ -321,15 +515,18 @@ exception from a harness tool stops the evaluation. An unexpected exception
 inside an MCP server tool reaches the model as a tool error, as any MCP host
 would see it, and does not stop the evaluation. Each run reports its tokens,
 turns, tool calls and the query embeddings that returned a vector
-(`search_embed_calls`). `--max-cost` sets one spend limit over every model call
-of the evaluation; reaching it is not a run outcome but stops the evaluation
+(`search_embed_calls`). `--max-cost` sets one spend limit, a positive finite
+number of USD, over every model call of the evaluation; reaching it is not a run outcome but stops the evaluation
 with an error, the usage line and a non-zero exit, and writes no report.
 `--trace` turns on hosted Agents SDK tracing, and `results.json` (`usage`) and
 `report.md` (Usage) record calls, tokens and the estimated cost per operation.
 
 An eval pack is a JSON file validated by `EvalPack` in `evals/schema.py`
-(`format` `arkive-eval-pack/1`). It holds `retrieval_cases`, `qa_cases` and an
-optional `holdout_memo` task. Expected facts are *groups* of alternative
+(`format` `arkive-eval-pack/2`). It holds `retrieval_cases`, `qa_cases` and an
+optional `holdout_memo` task. A retrieval case may set `filters`, a mapping
+from facet name to value or alias that layer 1 passes to `rank_channels`;
+facets are induced per snapshot, so `arkive-rag inspect` lists the names and
+values a pack can use. Expected facts are *groups* of alternative
 substrings, matched NFKC-, case-, dash-, whitespace- and
 thousands-separator-insensitively. A `RubricCheck` passes when the memo
 satisfies every `require_groups` group and contains no `forbid_any` phrase.
@@ -341,8 +538,8 @@ is a fictional pack; real packs stay in the private store.
 | Layer | Module | Measures |
 | --- | --- | --- |
 | 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of BM25-only, dense-only and hybrid RRF ranking over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks all three arms from one query embedding per case. |
-| 2 | `agents.py` | An agent conversation answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the eight Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
-| 3 | `agents.py` | One deliverable is held out. Before any file is copied or any model is called, the reference document (`reference_doc_id`) must carry a `held_out_markers` entry in its project or path, and every file under `included_paths` (selected through `discover_corpus`, so symlinks are refused) must have no marker, not belong to the reference's project and not have the reference's bytes. The holdout snapshot is compiled from those bytes in a worker thread with the full snapshot's embedding model and dimensions (reusing `--cache`), checked again, and only then published as `<out>/holdout.arkive.db`. Three arms draft the deliverable from the task's `run_notes` and `memo_instructions`: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts get the task's rubric checks and a blinded side-by-side judge against the reference. |
+| 2 | `agents.py` | An agent conversation answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the nine Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
+| 3 | `agents.py` | One deliverable is held out. Before any file is copied or any model is called, the reference document (`reference_doc_id`) must be a delivered document, not a curator note, and carry a `held_out_markers` entry in its path, and every file under `included_paths` (selected through `discover_corpus`, so symlinks are refused) must have no marker in its path, not share the reference's top-level folder (or, for a reference at the corpus root, not sit at the root) and not have the reference's bytes. Markers match case- and dash-insensitively (`fold_text`). Pack validation refuses an included path that is not written plainly (`./`, an empty part or a trailing `/`). The holdout snapshot is compiled from those bytes alone, in a worker thread (its blueprint agent runs start their own event loop) with the full snapshot's embedding model and dimensions (reusing `--cache`), so its facets, glossary, blueprints and guide are induced without the held-out material; it is checked again and only then published as `<out>/holdout.arkive.db`. The cache cannot serve the full corpus's induction results to the holdout build, because each induction request covers the documents it was built from. Three arms draft the deliverable from the task's `run_notes` and `memo_instructions`: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts get the task's rubric checks and a blinded side-by-side judge against the reference. |
 
 The evaluation harness compiles the holdout snapshot through `compile_corpus`
 itself, the one real OpenAI build outside `arkive-rag build`. Blinded drafts and

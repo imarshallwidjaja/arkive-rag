@@ -47,7 +47,13 @@ from arkive_rag.llm import (
 from arkive_rag.models import DocumentInfo, ProviderError
 from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot, write_snapshot
-from evals.schema import HoldoutMemoTask, QACase, RubricCheck, satisfies_groups
+from evals.schema import (
+    HoldoutMemoTask,
+    QACase,
+    RubricCheck,
+    held_out_markers_in,
+    satisfies_groups,
+)
 
 EVAL_EFFORT: Effort = "medium"
 QA_MAX_TURNS = 12
@@ -413,24 +419,41 @@ async def run_layer2_qa(
 
 
 def check_reference_held_out(task: HoldoutMemoTask, reference: DocumentInfo) -> None:
-    """The reference deliverable must be held-out material, so no included path can hold it."""
-    if not any(m in reference.project_id or m in reference.rel_path for m in task.held_out_markers):
+    """The reference must be a delivered document, not a curator note, and held-out material,
+    so no included path can hold it."""
+    if reference.is_curator_note:
         raise ValueError(
-            f"reference document {reference.doc_id} ({reference.rel_path}, project"
-            f" {reference.project_id}) contains no held-out marker {list(task.held_out_markers)}"
+            f"reference document {reference.doc_id} ({reference.rel_path}) is a curator note,"
+            " not a delivered document"
+        )
+    if not held_out_markers_in(reference.rel_path, task.held_out_markers):
+        raise ValueError(
+            f"reference document {reference.doc_id} ({reference.rel_path}) contains no held-out"
+            f" marker {list(task.held_out_markers)}"
         )
 
 
+def _top_folder(rel_path: str) -> str | None:
+    """The top-level folder of a corpus path; None for a file at the corpus root."""
+    head, separator, _ = rel_path.partition("/")
+    return head if separator else None
+
+
 def _leak_reasons(
-    task: HoldoutMemoTask, reference: DocumentInfo, rel_path: str, project_id: str, sha256: str
+    task: HoldoutMemoTask, reference: DocumentInfo, rel_path: str, sha256: str
 ) -> list[str]:
     reasons = [
-        f"held-out marker {marker!r}"
-        for marker in task.held_out_markers
-        if marker in rel_path or marker in project_id
+        f"held-out marker {m!r}" for m in held_out_markers_in(rel_path, task.held_out_markers)
     ]
-    if project_id == reference.project_id:
-        reasons.append(f"reference project {project_id!r}")
+    folder = _top_folder(reference.rel_path)
+    if _top_folder(rel_path) == folder:
+        # A reference at the corpus root excludes the root's other files, as a reference in a
+        # folder excludes that folder.
+        reasons.append(
+            "the corpus root, where the reference sits"
+            if folder is None
+            else f"the reference's top-level folder {folder!r}"
+        )
     if sha256 == reference.sha256:
         reasons.append("same bytes as the reference document")
     return reasons
@@ -453,7 +476,7 @@ def select_holdout_sources(
         for source in matched:
             data = read_source(source)
             sha256 = hashlib.sha256(data).hexdigest()
-            reasons = _leak_reasons(task, reference, source.rel_path, source.project_id, sha256)
+            reasons = _leak_reasons(task, reference, source.rel_path, sha256)
             if reasons:
                 raise ValueError(
                     f"included file {source.rel_path} is held-out material: {', '.join(reasons)}"
@@ -469,7 +492,7 @@ def assert_holdout_clean(
     leaked = {
         d.rel_path: reasons
         for d in documents
-        if (reasons := _leak_reasons(task, reference, d.rel_path, d.project_id, d.sha256))
+        if (reasons := _leak_reasons(task, reference, d.rel_path, d.sha256))
     }
     if leaked:
         raise ValueError(f"holdout snapshot leaks held-out material: {leaked}")

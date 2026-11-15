@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+from arkive_rag.models import fold_text
 
 _DASHES = re.compile(r"[\u2010-\u2015\u2212]")
 _THOUSANDS = re.compile(r"(?<=\d),(?=\d{3})")
@@ -39,6 +42,13 @@ def satisfies_groups(text: str, groups: Groups) -> bool:
     return all(any(normalize_for_match(alt) in haystack for alt in group) for group in groups)
 
 
+def held_out_markers_in(rel_path: str, markers: Sequence[str]) -> list[str]:
+    """The markers `rel_path` contains, compared in the shared `fold_text` form (NFKC, Unicode
+    dashes as `-`, case-folded), so `P103` and `p103` are the same marker."""
+    folded = fold_text(rel_path)
+    return [m for m in markers if fold_text(m) in folded]
+
+
 class _PackModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -51,8 +61,9 @@ class RetrievalCase(_PackModel):
     query: NonBlank
     required_groups: Annotated[Groups, Field(min_length=1)]
     expected_docs: tuple[NonBlank, ...] = ()
-    project: NonBlank | None = None
-    stage: NonBlank | None = None
+    # Facet name to one value or alias, as `TopicSnapshot.resolve_filters` takes them. The
+    # snapshot's facets are induced from its corpus: `arkive-rag inspect` lists them.
+    filters: dict[NonBlank, NonBlank] = {}
 
 
 class QACase(_PackModel):
@@ -98,10 +109,13 @@ class RubricCheck(_PackModel):
 class HoldoutMemoTask(_PackModel):
     """Layer 3: draft a held-out deliverable from run notes using only the included corpus paths.
 
-    `included_paths` are corpus-relative files or folders copied into the holdout corpus. The
-    holdout corpus must contain no project or path containing a `held_out_markers` entry.
-    `reference_doc_id` names the delivered document, in the full snapshot, that the blind judge
-    compares drafts against; its project or path must contain a held-out marker.
+    `included_paths` are corpus-relative files or folders copied into the holdout corpus,
+    written plainly (`p101` or `p101/memo.pdf`: no `./`, empty part or trailing `/`). No
+    holdout file may have a path containing a `held_out_markers` entry (compared case- and
+    dash-insensitively), the reference's bytes, or the reference's top-level folder; when the
+    reference sits at the corpus root, no other root-level file. `reference_doc_id` names the
+    delivered document, in the full snapshot, that the blind judge compares drafts against; it
+    must not be a curator note, and its path must contain a held-out marker.
     """
 
     included_paths: Annotated[tuple[NonBlank, ...], Field(min_length=1)]
@@ -117,14 +131,19 @@ class HoldoutMemoTask(_PackModel):
             path = PurePosixPath(rel)
             if path.is_absolute() or ".." in path.parts or "\\" in rel:
                 raise ValueError(f"included path {rel!r} must be relative to the corpus root")
-            if any(marker in rel for marker in self.held_out_markers):
+            if rel != path.as_posix() or rel == ".":
+                raise ValueError(
+                    f"included path {rel!r} must be a plain corpus-relative path such as"
+                    f" {path.as_posix()!r}: no './', empty parts or trailing '/'"
+                )
+            if held_out_markers_in(rel, self.held_out_markers):
                 raise ValueError(f"included path {rel!r} contains a held-out marker")
         _require_unique("rubric check_id", [c.check_id for c in self.rubric])
         return self
 
 
 class EvalPack(_PackModel):
-    format: Literal["arkive-eval-pack/1"]
+    format: Literal["arkive-eval-pack/2"]
     name: NonBlank
     description: NonBlank
     # When set, the runner refuses a snapshot built from any other corpus.

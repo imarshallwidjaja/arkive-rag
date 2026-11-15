@@ -72,7 +72,7 @@ def run_layer1(
     with TopicSnapshot.open(snapshot_path) as snapshot:
         for case in cases:
             rankings = snapshot.rank_channels(
-                case.query, embed_query, project=case.project, stage=case.stage, top_k=TOP_K
+                case.query, embed_query, filters=case.filters, top_k=TOP_K
             )
             results.append(
                 CaseResult(

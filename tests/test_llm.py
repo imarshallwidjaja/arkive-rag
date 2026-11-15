@@ -18,6 +18,7 @@ import openai
 import pytest
 from agents import Runner
 from agents.tracing.processors import default_exporter
+from pydantic import BaseModel
 
 from arkive_rag import llm
 from arkive_rag.llm import (
@@ -36,7 +37,6 @@ from arkive_rag.llm import (
     load_dotenv_if_present,
 )
 from arkive_rag.models import (
-    DocumentMetaExtraction,
     NotFoundError,
     ProviderError,
     SnapshotIntegrityError,
@@ -55,7 +55,26 @@ from tests.support import (
 
 JSON_HEADERS = {"content-type": "application/json"}
 REQUEST = httpx2.Request("POST", "https://api.openai.test/v1/responses")
-META = DocumentMetaExtraction(
+
+
+class ProbeOutput(BaseModel):
+    """A structured output owned by this test suite."""
+
+    title: str
+    client: str
+    stage: str
+    doc_date: str | None
+    summary: str
+
+
+def probe_api() -> ScriptedOpenAI:
+    """The scripted provider, answering structured requests with `META` when unscripted."""
+    api = ScriptedOpenAI()
+    api.defaults["ProbeOutput"] = META
+    return api
+
+
+META = ProbeOutput(
     title="Memo", client="Contoso Ports", stage="memorandum", doc_date=None, summary="Bathymetry."
 )
 
@@ -65,7 +84,7 @@ class Probe:
     """A structured request owned by this test suite."""
 
     operation: ClassVar[str] = "probe"
-    output: ClassVar[type[DocumentMetaExtraction]] = DocumentMetaExtraction
+    output: ClassVar[type[ProbeOutput]] = ProbeOutput
     instructions: ClassVar[str] = "Catalogue the document."
     effort: Effort = "low"
     prompt: str = "outline"
@@ -94,7 +113,7 @@ LOOKUP = Tool(
 @dataclass(frozen=True)
 class AgentProbe:
     operation: ClassVar[str] = "agent_probe"
-    output: ClassVar[type[DocumentMetaExtraction]] = DocumentMetaExtraction
+    output: ClassVar[type[ProbeOutput]] = ProbeOutput
     effort: Effort = "medium"
     max_turns: int = 3
     tools: Sequence[Tool] = (LOOKUP,)
@@ -140,11 +159,11 @@ def test_dotenv_fills_unset_variables_only(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_structured_request_sends_model_effort_instructions_text_and_image() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
 
     result = api.gateway().run(Probe(effort="high", prompt="330.9", image_webp=b"RIFF-page"))
 
-    assert isinstance(result, DocumentMetaExtraction)
+    assert isinstance(result, ProbeOutput)
     body = api.requests("/responses")[0]
     assert (body["model"], body["reasoning"], body["instructions"]) == (
         DEFAULT_MODEL,
@@ -154,20 +173,20 @@ def test_structured_request_sends_model_effort_instructions_text_and_image() -> 
     text, image = body["input"][0]["content"]
     assert text == {"type": "input_text", "text": "330.9"}
     assert image["image_url"].startswith("data:image/webp;base64,")
-    assert body["text"]["format"]["name"] == "DocumentMetaExtraction"
+    assert body["text"]["format"]["name"] == "ProbeOutput"
 
 
 def test_transient_errors_retry_within_five_attempts() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", connect_error(), httpx2.ReadTimeout("slow", request=REQUEST))
     api.script("/responses", connect_error(), connect_error())
 
-    assert isinstance(api.gateway().run(Probe()), DocumentMetaExtraction)
+    assert isinstance(api.gateway().run(Probe()), ProbeOutput)
     assert len(api.requests("/responses")) == 5
 
 
 def test_persistent_transient_errors_raise_provider_error() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", *[connect_error() for _ in range(5)])
 
     with pytest.raises(ProviderError, match="after 5 attempts"):
@@ -176,7 +195,7 @@ def test_persistent_transient_errors_raise_provider_error() -> None:
 
 
 def test_non_transient_errors_are_not_retried() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", httpx2.Response(400, json={"error": {"message": "bad schema"}}))
 
     with pytest.raises(ProviderError, match="bad schema"):
@@ -185,7 +204,7 @@ def test_non_transient_errors_are_not_retried() -> None:
 
 
 def test_truncated_output_retries_once_with_doubled_token_budget_and_meters_both() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     truncated = META.model_dump_json()[:20]
     api.script(
         "/responses",
@@ -206,7 +225,7 @@ def test_truncated_output_retries_once_with_doubled_token_budget_and_meters_both
 
 
 def test_other_incomplete_status_or_bad_output_raises_without_retry() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script(
         "/responses",
         response_body([message("{}")], "incomplete", "content_filter"),
@@ -231,7 +250,7 @@ def test_retries_honour_retry_after_and_share_one_deadline() -> None:
     def rate_limited(header: str, value: str) -> httpx2.Response:
         return httpx2.Response(429, headers={header: value}, json={"error": {"message": "slow"}})
 
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", rate_limited("retry-after-ms", "1"))
     api.gateway(request_timeout=30.0, operation_deadline=60.0, retry_delays=(9.0,) * 4).run(Probe())
     timeouts = [e.read_timeout for e in api.exchanges]
@@ -254,7 +273,7 @@ def test_no_attempt_starts_once_the_deadline_has_passed(monkeypatch: pytest.Monk
         clock[0] += seconds + 10.0
 
     monkeypatch.setattr(llm, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=oversleep))
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", connect_error())
 
     with pytest.raises(ProviderError, match="deadline passed before attempt 2"):
@@ -281,7 +300,7 @@ def test_an_async_attempt_that_outlasts_the_deadline_ends_it_without_another_att
         )
 
     gateway = OpenAIGateway(
-        client=ScriptedOpenAI().client(),
+        client=probe_api().client(),
         async_client_factory=stalling_client,
         request_timeout=30.0,
         operation_deadline=0.2,
@@ -294,7 +313,7 @@ def test_an_async_attempt_that_outlasts_the_deadline_ends_it_without_another_att
 
 @pytest.mark.parametrize("value", ["NaN", "inf", "soon"])
 def test_retry_after_that_is_not_a_finite_number_is_ignored(value: str) -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     rate_limited = httpx2.Response(
         429, headers={"retry-after": value}, json={"error": {"message": "slow"}}
     )
@@ -306,7 +325,7 @@ def test_retry_after_that_is_not_a_finite_number_is_ignored(value: str) -> None:
 
 def test_spend_limit_is_checked_before_every_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     meter = UsageMeter(max_cost_usd=0.30)
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", connect_error())
     handle = api._handle
 
@@ -322,7 +341,7 @@ def test_spend_limit_is_checked_before_every_retry(monkeypatch: pytest.MonkeyPat
 
 
 def test_structured_call_fails_after_both_output_token_budgets_are_exhausted() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     truncated = response_body([message('{"title": ')], "incomplete", "max_output_tokens")
     api.script("/responses", truncated, truncated)
     gateway = api.gateway()
@@ -340,7 +359,7 @@ def html_page() -> httpx2.Response:
 
 
 def test_malformed_responses_raise_provider_error_on_every_call_type() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     gateway = api.gateway()
     no_usage_decision = decision_body([0.5]) | {"usage": None}
     no_count_embedding = {
@@ -407,7 +426,7 @@ def test_malformed_responses_raise_provider_error_on_every_call_type() -> None:
 
 
 def test_embeddings_batch_map_rows_by_index_normalize_and_reject_bad_indices() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     gateway = api.gateway()
     texts = [f"chunk {i}" for i in range(300)]
 
@@ -435,7 +454,7 @@ def test_embeddings_batch_map_rows_by_index_normalize_and_reject_bad_indices() -
 def test_only_the_embedding_sdk_call_turns_type_errors_into_malformed_bodies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gateway = ScriptedOpenAI().gateway()
+    gateway = probe_api().gateway()
 
     def broken_meter() -> None:
         raise TypeError("meter bug")
@@ -449,7 +468,7 @@ def test_only_the_embedding_sdk_call_turns_type_errors_into_malformed_bodies(
 
 
 def test_judge_returns_probabilities_in_order_with_refusals_as_none() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     gateway = api.gateway()
 
     assert gateway.judge("bind_facet", "evidence", []) == []
@@ -465,7 +484,7 @@ def test_judge_returns_probabilities_in_order_with_refusals_as_none() -> None:
 
 
 def test_judge_splits_more_than_400_predicates_across_requests() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/decisions", decision_body([0.2] * 400), decision_body([0.8]))
     gateway = api.gateway()
 
@@ -482,7 +501,7 @@ def test_judge_splits_more_than_400_predicates_across_requests() -> None:
 def test_judge_rejects_probabilities_that_are_not_finite_or_outside_0_to_1(
     probability: float,
 ) -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     # httpx2 refuses to serialise NaN as JSON; json.dumps writes it as the provider would.
     body = json.dumps(decision_body([0.4, probability])).encode()
     api.script("/decisions", httpx2.Response(200, content=body, headers=JSON_HEADERS))
@@ -495,7 +514,7 @@ def test_judge_rejects_probabilities_that_are_not_finite_or_outside_0_to_1(
 def test_judge_cache_entries_that_are_not_numbers_within_0_to_1_are_misses(
     tmp_path: Path, entry: str
 ) -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     path = tmp_path / "cache.db"
     with BuildCache(path) as cache:
         gateway = api.gateway(cache=cache)
@@ -512,7 +531,7 @@ def test_judge_cache_entries_that_are_not_numbers_within_0_to_1_are_misses(
 
 
 def agent_turns(*bodies: Outcome) -> ScriptedOpenAI:
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", *bodies)
     return api
 
@@ -652,8 +671,8 @@ def test_trace_passes_its_key_with_each_run_and_leaves_the_global_exporter_alone
         return SimpleNamespace(final_output=META)
 
     monkeypatch.setattr(Runner, "run", record_run)
-    ScriptedOpenAI().gateway(api_key="sk-trace-test", trace=True).run_agent(AgentProbe())
-    ScriptedOpenAI().gateway(api_key="sk-other-test").run_agent(AgentProbe())
+    probe_api().gateway(api_key="sk-trace-test", trace=True).run_agent(AgentProbe())
+    probe_api().gateway(api_key="sk-other-test").run_agent(AgentProbe())
 
     traced, untraced = configs
     assert (traced.tracing_disabled, traced.tracing) == (False, {"api_key": "sk-trace-test"})
@@ -663,15 +682,15 @@ def test_trace_passes_its_key_with_each_run_and_leaves_the_global_exporter_alone
 
     monkeypatch.setenv(llm.TRACING_KILL_SWITCH, "1")
     with pytest.raises(ProviderError, match=llm.TRACING_KILL_SWITCH):
-        ScriptedOpenAI().gateway(api_key="sk-trace-test", trace=True)
-    ScriptedOpenAI().gateway(api_key="sk-trace-test")
+        probe_api().gateway(api_key="sk-trace-test", trace=True)
+    probe_api().gateway(api_key="sk-trace-test")
 
 
 # Usage and the spend limit.
 
 
 def test_spend_limit_stops_the_next_call_once_the_estimate_reaches_it() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     # 100k input tokens at $2.00/1M plus 10k output at $10.00/1M: $0.30.
     api.script("/responses", structured_body(META, tokens=usage(100_000, 10_000)))
     gateway = api.gateway(meter=UsageMeter(max_cost_usd=0.30))
@@ -704,13 +723,13 @@ def test_usage_meter_prices_cached_input_and_rejects_unpriced_models_under_a_lim
     assert meter.summary()["unpriced_models"] == ["unlisted-model"]
     assert "excluding unpriced unlisted-model" in meter.summary_line()
     with pytest.raises(ProviderError, match="needs prices for other-model"):
-        ScriptedOpenAI().gateway(model="other-model", meter=UsageMeter(max_cost_usd=1.0))
+        probe_api().gateway(model="other-model", meter=UsageMeter(max_cost_usd=1.0))
     with pytest.raises(ValueError, match="positive"):
         UsageMeter(max_cost_usd=0)
 
 
 def test_usage_with_more_cached_than_input_tokens_is_rejected_before_it_is_metered() -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     # Metered, 10 of 20 cached tokens would be a negative cost under the spend limit.
     api.script("/responses", structured_body(META, tokens=usage(10, 1, cached=20)))
     gateway = api.gateway(meter=UsageMeter(max_cost_usd=0.30))
@@ -724,7 +743,7 @@ def test_usage_with_more_cached_than_input_tokens_is_rejected_before_it_is_meter
 
 
 def test_cache_hits_make_no_requests_and_every_key_input_is_a_miss(tmp_path: Path) -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     for _ in range(6):
         api.script("/responses", structured_body(META))
     with BuildCache(tmp_path / "cache.db") as cache:
@@ -763,11 +782,11 @@ def test_concurrent_misses_for_one_key_return_the_first_stored_response(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first, second = META, META.model_copy(update={"title": "Other transcript"})
-    api = ScriptedOpenAI()
+    api = probe_api()
     api.script("/responses", structured_body(first), structured_body(second))
     handle = api._handle
     started: list[bool] = []
-    overtaken: list[DocumentMetaExtraction] = []
+    overtaken: list[ProbeOutput] = []
 
     def overtake(request: httpx2.Request) -> httpx2.Response:
         # While the first request is in flight, another thread misses the same key and finishes.
@@ -819,7 +838,7 @@ def test_cache_instances_on_one_file_keep_the_first_stored_value(
 
 
 def test_undecodable_cache_entries_are_misses_that_get_replaced(tmp_path: Path) -> None:
-    api = ScriptedOpenAI()
+    api = probe_api()
     path = tmp_path / "new-dir" / "cache.db"
     with BuildCache(path) as cache:
         gateway = api.gateway(cache=cache)

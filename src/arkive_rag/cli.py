@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Iterator
@@ -27,8 +28,14 @@ from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot, check_build_paths,
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
 
-ProjectOption = Annotated[str | None, typer.Option(help="Only this project folder.")]
-StageOption = Annotated[str | None, typer.Option(help="Only this lifecycle stage.")]
+FilterOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--filter",
+        help="FACET=VALUE; only documents holding this facet value or alias. Repeat for"
+        " several facets, which combine with AND.",
+    ),
+]
 
 
 @contextmanager
@@ -42,6 +49,23 @@ def _domain_errors() -> Iterator[None]:
 
 def _echo_json(value: object) -> None:
     typer.echo(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def _parse_filters(values: list[str] | None) -> dict[str, str]:
+    filters: dict[str, str] = {}
+    for item in values or []:
+        facet, separator, value = item.partition("=")
+        facet, value = facet.strip(), value.strip()
+        if not separator or not facet or not value:
+            raise typer.BadParameter(f"{item!r} is not FACET=VALUE", param_hint="--filter")
+        if facet in filters:
+            raise typer.BadParameter(
+                f"facet {facet!r} is given twice; each facet takes one value and facets"
+                " combine with AND",
+                param_hint="--filter",
+            )
+        filters[facet] = value
+    return filters
 
 
 def _slug(name: str) -> str:
@@ -71,8 +95,8 @@ def build(
 ) -> None:
     """Compile CORPUS_DIR into a snapshot file."""
     slug = topic or _slug(corpus_dir.resolve().name)
-    if max_cost is not None and not max_cost > 0:
-        raise typer.BadParameter("--max-cost must be positive")
+    if max_cost is not None and not (math.isfinite(max_cost) and max_cost > 0):
+        raise typer.BadParameter("--max-cost must be a positive finite number of USD")
     meter = UsageMeter(max_cost)
     with _domain_errors():
         check_build_paths(corpus_dir, output, *([cache] if cache else []))
@@ -93,6 +117,7 @@ def build(
             typer.echo(meter.summary_line())
         write_snapshot(corpus, output)
     chunk_count = len(corpus.all_chunks())
+    typer.echo(f"build report: {corpus.build_report.model_dump_json()}")
     typer.echo(f"wrote {output}: {len(corpus.documents)} documents, {chunk_count} chunks")
 
 
@@ -107,6 +132,11 @@ def inspect(snapshot: Path) -> None:
                 **snap.summary().model_dump(),
                 "embedding_model": snap.embedding_model,
                 "embedding_dimensions": snap.embedding_dimensions,
+                "build_settings": snap.build_settings,
+                "build_report": snap.build_report.model_dump(),
+                "facets": [f.model_dump() for f in snap.facets],
+                "glossary": [e.model_dump() for e in snap.glossary],
+                "blueprints": [b.model_dump() for b in snap.blueprints],
                 "documents": [
                     {**o.document.model_dump(exclude={"summary"}), "sections": len(o.sections)}
                     for o in outlines
@@ -138,16 +168,16 @@ def _embedder_for(snapshots: list[TopicSnapshot]) -> QueryEmbedder | None:
 def search(
     snapshot: Path,
     query: str,
-    project: ProjectOption = None,
-    stage: StageOption = None,
+    filter_values: FilterOption = None,
     top_k: int = 8,
 ) -> None:
     """Hybrid search of a snapshot (needs OPENAI_API_KEY)."""
+    filters = _parse_filters(filter_values)
     with _domain_errors(), TopicSnapshot.open(snapshot) as snap:
         embedder = _embedder_for([snap])
         if embedder is None:
             raise ArkiveError("search needs OPENAI_API_KEY; use grep for offline exact matching")
-        hits = snap.search(query, embedder, project=project, stage=stage, top_k=top_k)
+        hits = snap.search(query, embedder, filters=filters, top_k=top_k)
         _echo_json([hit.model_dump() for hit in hits])
 
 
@@ -155,13 +185,13 @@ def search(
 def grep(
     snapshot: Path,
     pattern: str,
-    project: ProjectOption = None,
-    stage: StageOption = None,
+    filter_values: FilterOption = None,
     max_matches: int = 20,
 ) -> None:
     """Literal case-insensitive search of section text (offline)."""
+    filters = _parse_filters(filter_values)
     with _domain_errors(), TopicSnapshot.open(snapshot) as snap:
-        matches = snap.grep(pattern, project=project, stage=stage, max_matches=max_matches)
+        matches = snap.grep(pattern, filters=filters, max_matches=max_matches)
         _echo_json([match.model_dump() for match in matches])
 
 

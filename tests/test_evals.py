@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import sqlite3
 import stat
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -113,7 +115,9 @@ def pack_with(**overrides: Any) -> dict[str, Any]:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"format": "arkive-eval-pack/0"}, "format"),
+        ({"format": "arkive-eval-pack/1"}, "format"),
+        ({"retrieval_cases__3__project": "p102-estuary-multibeam"}, "Extra inputs"),
+        ({"retrieval_cases__3__filters": {"project": " "}}, "pattern"),
         ({"corpus_fingerprint": "abc"}, "corpus_fingerprint"),
         ({"surprise": 1}, "Extra inputs"),
         ({"retrieval_cases__1__case_id": "exact_identifiers_1"}, "duplicate retrieval case_id"),
@@ -121,9 +125,13 @@ def pack_with(**overrides: Any) -> dict[str, Any]:
         ({"qa_cases__0__required_groups": [["  "]]}, "pattern"),
         ({"holdout_memo__included_paths": ["../outside"]}, "relative to the corpus root"),
         ({"holdout_memo__included_paths": ["/abs"]}, "relative to the corpus root"),
-        ({"holdout_memo__included_paths": ["p103-notes"]}, "held-out marker"),
+        ({"holdout_memo__included_paths": ["P102-notes"]}, "held-out marker"),
+        ({"holdout_memo__included_paths": ["p101-harbour-lidar/"]}, "plain corpus-relative"),
+        ({"holdout_memo__included_paths": ["./p101-harbour-lidar"]}, "plain corpus-relative"),
+        ({"holdout_memo__included_paths": ["p101//memo.md"]}, "plain corpus-relative"),
+        ({"holdout_memo__included_paths": ["."]}, "plain corpus-relative"),
         ({"holdout_memo__rubric__0__require_groups": []}, "no require_groups or forbid_any"),
-        ({"holdout_memo__rubric__1__check_id": "executive_summary"}, "duplicate rubric check_id"),
+        ({"holdout_memo__rubric__1__check_id": "scope_and_budget"}, "duplicate rubric check_id"),
     ],
 )
 def test_eval_pack_rejects_malformed_packs(overrides: dict[str, Any], message: str) -> None:
@@ -199,14 +207,15 @@ def test_layer1_runs_the_example_pack_with_one_embedding_per_case(
 
 
 FAITHFUL_MEMO = """\
-# Reef Sonar Habitat Survey
-## Executive Summary
-Recommendations: diver survey of high-likelihood reef.
-Tiles were 2000 x 2000 pixels over 812 km2. Unlike the harbour project's 1 m lidar grid,
-the sidescan mosaic was not resampled.
+# Estuary Multibeam Bathymetry Proposal
+## Scope
+A multibeam survey of 812 km2 delivered in 2000 x 2000 pixel tiles. Unlike the harbour
+project's 1 m lidar grid, the multibeam surface is not resampled.
 | File Name | Masking |
-| reef_habitat_likelihood.tif | No masking applied. |
-| reef_habitat_threshold.tif | No masking applied. |
+| estuary_depth_grid.tif | No masking applied. |
+| estuary_depth_uncertainty.tif | No masking applied. |
+## Budget
+Total fee 120,000 AUD.
 ## Limitations
 Ground truth is needed over moorings and dredged channels.
 """
@@ -217,14 +226,14 @@ def test_rubric_rewards_faithful_memos_and_catches_targeted_contamination(
 ) -> None:
     rubric = holdout_task(example_pack).rubric
     assert all(score_memo_rubric(FAITHFUL_MEMO, rubric).values())
-    borrowed_tiles = FAITHFUL_MEMO.replace("2000 x 2000 pixels", "500 x 500 pixels")
+    borrowed_tiles = FAITHFUL_MEMO.replace("2000 x 2000 pixel", "500 x 500 pixel")
     borrowed_mask = FAITHFUL_MEMO + "\nShallows were masked using the harbour coastline land mask."
     assert score_memo_rubric(borrowed_tiles, rubric) == {
         **score_memo_rubric(FAITHFUL_MEMO, rubric),
         "tile_size_not_contaminated": False,
     }
     assert not score_memo_rubric(borrowed_mask, rubric)["no_borrowed_masking_claim"]
-    dropped = FAITHFUL_MEMO.replace("reef_habitat_threshold.tif", "")
+    dropped = FAITHFUL_MEMO.replace("estuary_depth_uncertainty.tif", "")
     assert not score_memo_rubric(dropped, rubric)["deliverables_and_area_kept"]
     assert not any(score_memo_rubric("", rubric).values())
 
@@ -237,27 +246,29 @@ def write_corpus(root: Path, files: dict[str, str | bytes]) -> Path:
     return root
 
 
+REFERENCE_PATH = "p102-estuary-multibeam/Estuary Proposal FINAL.md"
+REFERENCE_TEXT = "# Estuary\n\nMultibeam 2000 x 2000 tiles."
 HOLDOUT_FILES: dict[str, str | bytes] = {
     "p101-harbour-lidar/memo.md": "# Harbour\n\nLidar grid 1 m.",
-    "p102-estuary-multibeam/memo.md": "# Estuary\n\nMultibeam fee.",
-    "p103-reef-sonar/Reef Sonar Memo FINAL.md": "# Reef\n\nSidescan 2000 x 2000 tiles.",
+    REFERENCE_PATH: REFERENCE_TEXT,
+    "p103-reef-sonar/memo.md": "# Reef\n\nSidescan notes.",
     "AGENTS.md": "# Notes\n\nCorpus guidance.",
 }
 
 
 def reference_doc(**overrides: Any) -> DocumentInfo:
-    fields = {
+    fields: dict[str, Any] = {
         "doc_id": "doc_003",
-        "rel_path": "p103-reef-sonar/Reef Sonar Memo FINAL.md",
-        "sha256": hashlib.sha256(b"# Reef\n\nSidescan 2000 x 2000 tiles.").hexdigest(),
+        "rel_path": REFERENCE_PATH,
+        "sha256": hashlib.sha256(REFERENCE_TEXT.encode()).hexdigest(),
         "format": "md",
-        "project_id": "p103-reef-sonar",
-        "client": "Contoso Ports",
-        "stage": "memorandum",
-        "title": "Reef Sonar Memo",
+        "title": "Estuary Proposal",
         "doc_date": None,
-        "summary": "Reef memo.",
+        "deliverable_type": "proposal",
+        "summary": "Estuary proposal.",
         "page_count": 1,
+        "is_curator_note": False,
+        "facets": {},
     }
     return DocumentInfo.model_validate(fields | overrides)
 
@@ -269,38 +280,55 @@ def test_holdout_selection_keeps_included_files_and_refuses_held_out_material(
     reference = reference_doc()
     check_reference_held_out(task, reference)
     with pytest.raises(ValueError, match="no held-out marker"):
-        check_reference_held_out(
-            task, reference_doc(rel_path="p101-harbour-lidar/memo.md", project_id="p101-harbour")
-        )
+        check_reference_held_out(task, reference_doc(rel_path="p101-harbour-lidar/memo.md"))
 
     corpus = write_corpus(tmp_path / "corpus", HOLDOUT_FILES)
     selected = select_holdout_sources(corpus, task, reference)
-    assert sorted(selected) == ["p101-harbour-lidar/memo.md", "p102-estuary-multibeam/memo.md"]
+    assert sorted(selected) == ["p101-harbour-lidar/memo.md", "p103-reef-sonar/memo.md"]
 
     renamed = write_corpus(
         tmp_path / "renamed",
-        HOLDOUT_FILES | {"p102-estuary-multibeam/old draft.md": HOLDOUT_FILES[reference.rel_path]},
+        HOLDOUT_FILES | {"p103-reef-sonar/old draft.md": HOLDOUT_FILES[reference.rel_path]},
     )
     with pytest.raises(ValueError, match="same bytes as the reference"):
         select_holdout_sources(renamed, task, reference)
     misfiled = write_corpus(
-        tmp_path / "misfiled", HOLDOUT_FILES | {"p101-harbour-lidar/reef-sonar notes.md": "x"}
+        tmp_path / "misfiled",
+        HOLDOUT_FILES | {"p101-harbour-lidar/Estuary\u2010Multibeam notes.md": "x"},
     )
-    with pytest.raises(ValueError, match="held-out marker 'reef-sonar'"):
+    # Markers match case- and dash-insensitively.
+    with pytest.raises(ValueError, match="held-out marker 'estuary-multibeam'"):
         select_holdout_sources(misfiled, task, reference)
+    # A file under the reference's top-level folder is held out even without a marker in it.
+    sibling = task.model_copy(update={"included_paths": ("p101-harbour-lidar",)})
+    in_folder = reference_doc(rel_path="p101-harbour-lidar/final/memo.md")
+    with pytest.raises(ValueError, match="the reference's top-level folder 'p101-harbour-lidar'"):
+        select_holdout_sources(corpus, sibling, in_folder)
+    # A reference at the corpus root excludes the root's other files the same way.
+    at_root = task.model_copy(update={"included_paths": ("AGENTS.md",)})
+    root_reference = reference_doc(rel_path="P102 Proposal FINAL.md", sha256="0")
+    check_reference_held_out(at_root, root_reference)
+    with pytest.raises(ValueError, match=r"AGENTS\.md is held-out material: the corpus root"):
+        select_holdout_sources(corpus, at_root, root_reference)
+    with pytest.raises(ValueError, match="is a curator note"):
+        check_reference_held_out(
+            task, reference_doc(rel_path="p102-estuary-multibeam/AGENTS.md", is_curator_note=True)
+        )
     linked = write_corpus(tmp_path / "linked", HOLDOUT_FILES)
     (linked / "p101-harbour-lidar" / "reef.md").symlink_to(linked / reference.rel_path)
     with pytest.raises(UnsafePathError, match="symlinks"):
         select_holdout_sources(linked, task, reference)
     missing = write_corpus(tmp_path / "missing", {"p101-harbour-lidar/memo.md": "x"})
-    with pytest.raises(ValueError, match="'p102-estuary-multibeam' matches no corpus file"):
+    with pytest.raises(ValueError, match="'p103-reef-sonar' matches no corpus file"):
         select_holdout_sources(missing, task, reference)
 
-    with pytest.raises(ValueError, match="p103"):
-        assert_holdout_clean(task, reference, [reference_doc(rel_path="moved/memo.md")])
+    with pytest.raises(ValueError, match="held-out marker 'p102'"):
+        assert_holdout_clean(task, reference, [reference_doc(rel_path="moved/P102.md", sha256="0")])
     with pytest.raises(ValueError, match="same bytes"):
+        assert_holdout_clean(task, reference, [reference_doc(rel_path="p101/x.md")])
+    with pytest.raises(ValueError, match="top-level folder 'p102-estuary-multibeam'"):
         assert_holdout_clean(
-            task, reference, [reference_doc(rel_path="p101/x.md", project_id="p101")]
+            task, reference, [reference_doc(rel_path="p102-estuary-multibeam/other.md", sha256="0")]
         )
 
 
@@ -313,7 +341,15 @@ def test_holdout_snapshot_is_published_only_after_its_guard_passes(
     output.parent.mkdir()
     compile_holdout_snapshot(corpus, output, FakeGateway(), task, reference_doc())
     with TopicSnapshot.open(output) as holdout:
-        assert holdout.projects == ["p101-harbour-lidar", "p102-estuary-multibeam"]
+        assert [d.rel_path for d in holdout.list_documents()] == [
+            "p101-harbour-lidar/memo.md",
+            "p103-reef-sonar/memo.md",
+        ]
+        # Facets are induced from the included files only.
+        assert [v.value for v in holdout.facets[0].values] == [
+            "p101-harbour-lidar",
+            "p103-reef-sonar",
+        ]
     output.unlink()
 
     def leak(*args: object) -> None:
@@ -322,8 +358,7 @@ def test_holdout_snapshot_is_published_only_after_its_guard_passes(
     gateway = FakeGateway()
     renamed = write_corpus(
         tmp_path / "renamed",
-        HOLDOUT_FILES
-        | {"p101-harbour-lidar/copy.md": HOLDOUT_FILES["p103-reef-sonar/Reef Sonar Memo FINAL.md"]},
+        HOLDOUT_FILES | {"p101-harbour-lidar/copy.md": REFERENCE_TEXT},
     )
     with pytest.raises(ValueError, match="same bytes"):
         compile_holdout_snapshot(renamed, output, gateway, task, reference_doc())
@@ -350,10 +385,10 @@ def test_eval_cli_refuses_mismatched_inputs_before_outputs_or_model_calls(
     out = tmp_path / "o"
     runner = CliRunner()
 
-    def run(pack: Path, *extra: str, out: Path = out) -> str:
+    def run(pack: Path, *extra: str, out: Path = out, snapshot: Path = snapshot_path) -> str:
         result = runner.invoke(
             eval_app,
-            ["--pack", str(pack), "--snapshot", str(snapshot_path), "--out", str(out), *extra],
+            ["--pack", str(pack), "--snapshot", str(snapshot), "--out", str(out), *extra],
         )
         assert result.exit_code == 2, result.output
         # Drop the error panel's borders so wrapped messages read as one line.
@@ -374,6 +409,36 @@ def test_eval_cli_refuses_mismatched_inputs_before_outputs_or_model_calls(
     assert "overlaps --pack" in run(
         EXAMPLE_PACK_PATH, "--layer", "1", "--cache", str(EXAMPLE_PACK_PATH)
     )
+
+    def pack_file(name: str, **overrides: Any) -> Path:
+        path = tmp_path / f"{name}.eval.json"
+        path.write_text(json.dumps(pack_with(**overrides)))
+        return path
+
+    # An invalid pack or snapshot is a clean usage error, not a traceback.
+    assert "is not a valid eval pack" in run(pack_file("v1", format="arkive-eval-pack/1"))
+    not_utf8 = tmp_path / "latin1.eval.json"
+    not_utf8.write_bytes(b'{"name": "caf\xe9"}')
+    assert "is not a valid eval pack" in run(not_utf8)
+    garbage = tmp_path / "garbage.arkive.db"
+    garbage.write_bytes(b"not a database")
+    assert "--snapshot" in run(EXAMPLE_PACK_PATH, "--layer", "1", snapshot=garbage)
+    older = tmp_path / "older.arkive.db"
+    older.write_bytes(snapshot_path.read_bytes())
+    with closing(sqlite3.connect(older)) as db, db:
+        db.execute("UPDATE corpus_meta SET value = '2.0' WHERE key = 'schema_version'")
+    assert "schema version '2.0'" in run(EXAMPLE_PACK_PATH, "--layer", "1", snapshot=older)
+    # With --layer all, a later layer's inputs are checked before layer 1 calls any model.
+    everything = ("--corpus", str(corpus))
+    unknown_filter = pack_file("filter", retrieval_cases__3__filters={"project": "p999"})
+    assert "retrieval case 'disambiguation_and_structure_1': unknown project value" in run(
+        unknown_filter, *everything
+    )
+    note_reference = pack_file("note", holdout_memo__reference_doc_id="doc_003")
+    assert "holdout_memo: reference document doc_003" in run(note_reference, *everything)
+    assert "is a curator note" in run(note_reference, *everything)
+    missing_part = pack_file("part", holdout_memo__included_paths=["p101-harbour-lidar", "p104"])
+    assert "'p104' matches no corpus file" in run(missing_part, *everything)
 
     (corpus / "p102-estuary-multibeam" / "estuary-proposal.md").write_text("# Edited\n")
     drift = run(EXAMPLE_PACK_PATH, *layer2)
@@ -471,6 +536,7 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
             "grep",
             "read_section",
             "view_page",
+            "lookup_glossary",
         ]
     )
     assert isinstance(grep, str) and "330.9" in grep
@@ -675,7 +741,7 @@ def test_layer3_compiles_the_holdout_off_the_event_loop_and_judges_completed_dra
     full = compile_snapshot(tmp_path, {k: cast(str, v) for k, v in HOLDOUT_FILES.items()})
     with TopicSnapshot.open(full) as snapshot:
         reference_id = next(
-            d.doc_id for d in snapshot.list_documents() if d.rel_path.startswith("p103")
+            d.doc_id for d in snapshot.list_documents() if d.rel_path.startswith("p102")
         )
     task = task.model_copy(update={"reference_doc_id": reference_id})
     out = tmp_path / "out"
@@ -745,3 +811,27 @@ def test_eval_runner_stops_with_usage_and_no_report_when_the_spend_limit_is_reac
     assert "usage: 1 provider calls" in result.stdout and "estimated $0.3000" in result.stdout
     assert api.request_count == 1
     assert list(out.iterdir()) == []
+
+
+def test_eval_runner_prints_usage_when_a_layer_fails_after_calls_and_refuses_infinite_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
+    arguments = ["--pack", str(EXAMPLE_PACK_PATH), "--snapshot", str(snapshot_path)]
+    arguments += ["--out", str(tmp_path / "out"), "--layer", "1"]
+    runner = CliRunner()
+    for limit in ("inf", "nan", "-1"):
+        refused = runner.invoke(eval_app, [*arguments, "--max-cost", limit])
+        assert refused.exit_code == 2 and "positive finite" in refused.output, refused.output
+
+    def fails_after_calls(*args: object) -> None:
+        raise ValueError("layer stopped after its calls")
+
+    monkeypatch.setattr(eval_run, "_embedder", lambda *args: None)
+    monkeypatch.setattr(eval_run, "OpenAIGateway", lambda **options: None)
+    monkeypatch.setattr(eval_run, "run_layer1", fails_after_calls)
+    result = runner.invoke(eval_app, arguments)
+
+    assert result.exit_code == 1, result.output
+    assert "usage: 0 provider calls" in result.stdout
+    assert "layer stopped after its calls" in result.stderr

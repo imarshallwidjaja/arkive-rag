@@ -6,13 +6,14 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 import anyio
 import typer
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from arkive_rag.compiler import discover_corpus, read_source
 from arkive_rag.llm import (
@@ -26,7 +27,13 @@ from arkive_rag.llm import (
 from arkive_rag.models import ArkiveError, corpus_fingerprint
 from arkive_rag.snapshot import TopicSnapshot
 from evals.ablation import ARMS, RankSummary, run_layer1
-from evals.agents import CountingEmbedder, run_layer2_qa, run_layer3_holdout_memo
+from evals.agents import (
+    CountingEmbedder,
+    check_reference_held_out,
+    run_layer2_qa,
+    run_layer3_holdout_memo,
+    select_holdout_sources,
+)
 from evals.schema import EvalPack, RubricCheck
 
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
@@ -207,9 +214,12 @@ def main(
     ] = False,
 ) -> None:
     """Run the eval pack's layers against a snapshot and its corpus (needs OPENAI_API_KEY)."""
-    if max_cost is not None and not max_cost > 0:
-        raise typer.BadParameter("--max-cost must be positive")
-    eval_pack = EvalPack.load(pack)
+    if max_cost is not None and not (math.isfinite(max_cost) and max_cost > 0):
+        raise typer.BadParameter("--max-cost must be a positive finite number of USD")
+    try:
+        eval_pack = EvalPack.load(pack)
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise typer.BadParameter(f"--pack {pack} is not a valid eval pack: {exc}") from exc
     layers = _check_inputs(eval_pack, layer, pack, snapshot, corpus, out, cache)
     load_dotenv_if_present(Path.cwd() / ".env")
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -267,12 +277,14 @@ def main(
                 blind_dir / "blind_key.json", json.dumps(layer3_result["blind_key"], indent=2)
             )
             report += _layer3_report(layer3_result, task.rubric)
-    except ArkiveError as exc:
+    except BaseException as exc:
         # A stopped evaluation (the spend limit, or a failure outside any agent run) writes
         # no report, but still states what it spent.
         typer.echo(meter.summary_line())
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        if isinstance(exc, ArkiveError | ValueError):
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        raise
     typer.echo(meter.summary_line())
     results["usage"] = meter.summary()
     report += _usage_report(results["usage"])
@@ -306,9 +318,10 @@ def _check_inputs(
     """The layers to run: `all` means every layer the pack defines.
 
     Refuses, before creating any output or calling any model: a layer the pack cannot run, a
-    missing corpus, an output or cache path that overlaps an input, a snapshot of another corpus
-    than the pack's, and a corpus folder whose files no longer match the snapshot. `main`
-    relies on these checks.
+    missing corpus, an output or cache path that overlaps an input, a snapshot that cannot be
+    opened or was built from another corpus than the pack's, a retrieval case filter the
+    snapshot cannot resolve, a corpus folder whose files no longer match the snapshot, and a
+    holdout whose reference or included files break its guards. `main` relies on these checks.
     """
     available = {
         name
@@ -333,8 +346,18 @@ def _check_inputs(
         for name, input_path in inputs.items():
             if _overlaps(written_path.resolve(), input_path.resolve()):
                 raise typer.BadParameter(f"{written} {written_path} overlaps {name} {input_path}")
-    with TopicSnapshot.open(snapshot) as snap:
-        fingerprint = snap.corpus_fingerprint
+    try:
+        with TopicSnapshot.open(snapshot) as snap:
+            fingerprint = snap.corpus_fingerprint
+            for case in pack.retrieval_cases if "1" in layers else ():
+                try:
+                    snap.resolve_filters(case.filters)
+                except ArkiveError as exc:
+                    raise typer.BadParameter(f"retrieval case {case.case_id!r}: {exc}") from exc
+            task = pack.holdout_memo if "3" in layers else None
+            reference = snap.document(task.reference_doc_id) if task else None
+    except ArkiveError as exc:
+        raise typer.BadParameter(f"--snapshot {snapshot}: {exc}") from exc
     if pack.corpus_fingerprint not in (None, fingerprint):
         raise typer.BadParameter(
             f"snapshot corpus_fingerprint {fingerprint} does not match pack {pack.name!r}"
@@ -350,6 +373,12 @@ def _check_inputs(
                 f"--corpus {corpus} has corpus_fingerprint {live}, but the snapshot was built"
                 f" from {fingerprint}; rebuild the snapshot or restore the corpus"
             )
+    if task is not None and reference is not None and corpus is not None:
+        try:
+            check_reference_held_out(task, reference)
+            select_holdout_sources(corpus, task, reference)
+        except (ArkiveError, ValueError) as exc:
+            raise typer.BadParameter(f"holdout_memo: {exc}") from exc
     return layers
 
 
