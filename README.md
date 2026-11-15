@@ -50,7 +50,17 @@ The build reads every document, then induces from the whole corpus up to six
 facets to filter by (path-bound when the folders already encode them, such as
 projects or campaigns, otherwise judged per document, such as client or
 author), a cited glossary, and a blueprint for each recurring deliverable type
-(at most eight).
+(at most eight). A blueprint holds a section outline, conventions and reviewer
+pitfalls stated generically, and standing passages: house text such as a
+method background, a reference entry or a disclaimer. Code finds the
+candidates: a paragraph, list item or table header row of one exemplar section
+that recurs in another exemplar document (at least 0.8 of its word 4-grams, or
+the same table header row), under a different top-level folder when the
+exemplars span several folders. The blueprint agent only selects and labels
+candidates, so a stored passage is exemplar text exactly as written. Code
+cannot know that two folders are different projects, or that a recurring
+sentence holds no project facts; the agent is told to leave out candidates
+specific to one project, client, place, period or result.
 `inspect` prints them. `search` and `grep` take repeated `--filter FACET=VALUE`
 (a canonical value or an alias; several facets combine with AND), and the MCP
 tools `list_documents`, `search` and `grep` take the same `filters` mapping.
@@ -59,6 +69,16 @@ appears in the topic guide and is searchable, but is never cited. With
 `--cache`, rebuilding an unchanged corpus makes no provider calls. Snapshots
 use schema `3.0`; a snapshot from an earlier version is rebuilt from its
 corpus.
+
+The MCP server has ten tools. `get_topic_guide` returns the guide, curator
+notes, facets, glossary terms and a summary of each blueprint;
+`get_blueprint(topic, deliverable_type)` returns one blueprint in full. Its
+instructions tell a drafting agent to follow the blueprint, take every
+project-specific fact from the user's inputs, reproduce the standing passages
+word for word without commentary on their origin (adapting or leaving out a
+passage that holds a project fact the user did not give, since the user's
+inputs take precedence), and reuse corpus names and references only from
+those passages.
 
 ## Private corpora, snapshots and eval packs
 

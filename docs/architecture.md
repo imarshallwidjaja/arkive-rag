@@ -19,7 +19,7 @@ them in the snapshot next to the sections, pages and chunks.
 | `compiler.py` | Reading (discovery, rendering, the transcription fidelity gate, section stitching, chunk pieces, observation cards with quote location) and binding (IDs, breadcrumbs, embeddings). `compile_corpus` composes reading, induction and binding into a `CompiledCorpus`. Its request types (`PageTranscription`, `ObserveSections`, `ConsolidateCard`) own their prompts, output schemas and reasoning efforts. |
 | `induction.py` | Induction: corpus organisation, facet binding, the glossary, blueprints and the topic guide; the validate-and-retry helper `generate_checked`; support checks; the read-only source tools of the blueprint agent. Its request types (`OrganiseCorpus`, `WriteGlossary`, `WriteBlueprint`, `WriteGuide`) own their prompts, schemas and efforts. |
 | `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup). |
-| `server.py` | `TopicCatalog` (open snapshots keyed by topic) and the nine MCP tools. |
+| `server.py` | `TopicCatalog` (open snapshots keyed by topic), the ten MCP tools and the server instructions. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
 
 Dependencies point one way: `cli` → `server` → `snapshot`, and `cli` →
@@ -169,8 +169,7 @@ not confirm.
 1. **Organise** (`organise_corpus`, medium effort). The request holds the
    folder tree, the curator notes and every citable document's card. The
    model returns up to six facets and up to eight recurring deliverable types
-   (each type costs one blueprint run, and `get_topic_guide` returns every
-   blueprint). A facet has a snake_case name, a description and a closed
+   (each type costs one blueprint run). A facet has a snake_case name, a description and a closed
    list of values, each with a description and aliases. A facet is
    *path-bound* when every value names the corpus folders it stands for, or
    *content-bound* when no value names a folder. Values and aliases are
@@ -181,7 +180,8 @@ not confirm.
    an unknown folder, a duplicate facet name, a blank value, a value given
    twice, a folded form that names two values of one facet, more than six
    facets, more than eight deliverable types, and a deliverable type with no
-   exemplar or with an unknown document ID. An organisation that passes is
+   exemplar, with an unknown document ID, or with a document that is both
+   its exemplar and its feedback document. An organisation that passes is
    always storable. A
    path-bound value also answers to the paths of its folders, unless a path
    already names a value of the facet or belongs to several values.
@@ -220,13 +220,74 @@ not confirm.
    its request lists the exemplars' outlines, the feedback documents and,
    as leads the agent must verify in the source before using, the craft
    observations located in those documents (aspect, statement, section ID),
-   in sorted order. It returns a description, exemplar document IDs,
-   a section outline (heading, purpose, citations), conventions and reviewer
-   pitfalls (statement, citations), stated without project-specific values.
-   Validation requires a non-empty outline, citable exemplars and citations
-   that resolve to citable sections. `check_blueprint` then asks the
-   Decisions API whether the cited sections support each convention and
-   pitfall; unsupported or refused ones are dropped and counted.
+   in sorted order, and the type's standing passage candidates (below). It
+   returns a description, a section outline (heading, purpose, citations),
+   conventions and reviewer pitfalls (statement, citations), stated without
+   project-specific values, and the standing passages it selects (candidate
+   ID and label). The blueprint's exemplar documents are the organisation
+   step's exemplars of the type. Validation requires a non-empty outline,
+   citations of the outline, conventions and pitfalls that resolve to
+   citable sections, and standing passage selections that name a listed
+   candidate, each at most once, with a non-blank label. `check_blueprint`
+   then asks the Decisions API whether the cited sections support each
+   convention and pitfall; unsupported or refused ones are dropped and
+   counted.
+
+   A standing passage is house text: organisation or tool background, method
+   references, reference entries, acknowledgements, disclaimers, disclosures,
+   standard table headers and standing caveats. Code computes the candidates
+   (`standing_candidates`, no provider call) from the Markdown of the type's
+   exemplar sections:
+
+   - A *unit* is a paragraph, one item of a list (a list marker starts an
+     item; an unmarked line right after it continues it), or a table's header
+     row with its separator row. A table starts at a line opening with `|`,
+     or at a line holding `|` right above a separator row (a table without
+     outer pipes), and runs through every following line that holds `|`. A
+     block quote that is not a visual transcript is a paragraph. Headings,
+     visual transcripts (`> **[Visual` blocks), fenced blocks and table body
+     rows are not units. A unit's text keeps its inner bytes, such as the
+     trailing spaces of a hard line break; only the whole unit is stripped.
+   - A unit is eligible with at least 8 words (`STANDING_MIN_WORDS`, counted
+     after `fold_for_quote`), or as a table header row of at least two
+     columns (`STANDING_MIN_TABLE_COLUMNS`).
+   - A unit *recurs* in a section of another exemplar document that holds at
+     least 0.8 (`STANDING_RECURRENCE_CONTAINMENT`) of the unit's word 4-grams
+     after `fold_for_quote`, so light wording drift still counts; a table
+     header recurs in a section with a table header of the same folded row.
+     When the exemplars span more than one top-level folder, that document
+     must sit under a different top-level folder than the unit's own; when
+     they share one folder or sit at the corpus root, another document is
+     enough.
+   - Recurring units that say the same thing (the same folded text, or
+     containment of at least 0.8 both ways) are one candidate. Its text is
+     the first such unit in canonical order (document, section ordinal,
+     position in the section), exactly as it appears there; its citations
+     are that section, then every section where that unit recurs, in
+     canonical order. Candidates are numbered `candidate_01`, ... in that
+     order.
+
+   The request lists at most 60 candidates (`MAX_STANDING_CANDIDATES`,
+   `offered_candidates`), each with its ID, citations and full text, so
+   candidates are covered by the request's cache key and the request stays
+   bounded. When more are found, it keeps those that recur in the most
+   exemplar documents, ties in canonical order; the kept candidates stay in
+   canonical order with their IDs, and the request says how many were found
+   and how many it lists. A type with one
+   exemplar, or with no recurring unit, has no candidates, and the request
+   says which. A stored passage takes its text and citations from the
+   candidate, in candidate order, so it is exemplar text by construction.
+
+   What recurrence proves is limited. The code checks that the text of one
+   exemplar section recurs in another exemplar document, under a different
+   top-level folder when the exemplars span folders. It cannot know that two
+   folders are different projects, or that a recurring sentence is free of
+   project facts: two projects for one client can share the client's name.
+   The agent is instructed to leave out candidates specific to one project,
+   client, place, period or result, and the drafting instructions let the
+   user's inputs take precedence over a passage. The outline, conventions
+   and pitfalls stay generic, and standing passages are the only source text
+   a blueprint holds.
 5. **Guide** (`write_guide`, medium effort). A cited Markdown overview from
    the cards, the bound facets, the glossary terms, the blueprint summaries
    and the curator notes. Every bracketed `[doc...]` token must have the exact
@@ -389,7 +450,11 @@ naming the file. `open` recomputes the fingerprint from the
 `documents` table and raises `SnapshotIntegrityError` when the recorded one
 differs. It validates every glossary and blueprint row through its model and
 checks that every cited section belongs to a citable document of the
-snapshot and that every blueprint exemplar and feedback document is one. It
+snapshot, that every blueprint exemplar and feedback document is one, that
+every standing passage cites sections of at least two of its blueprint's
+exemplar documents and no other section, and that no two blueprints have
+deliverable types with the same `fold_facet_label` form (`get_blueprint`
+resolves a type by that form). It
 loads the facets, aliases and document-to-facets map once, with chunk
 metadata and the embedding matrix. `list_topics` and `arkive-rag inspect`
 report the fingerprint and version; `inspect` also prints the facets,
@@ -454,19 +519,48 @@ local packs are not staged by accident.
 ## MCP server
 
 `arkive-rag serve a.arkive.db b.arkive.db` opens every snapshot into a
-`TopicCatalog` and refuses two snapshots with the same topic. The tools are
-`list_topics` (each topic's facets and allowed values), `get_topic_guide`
-(guide, curator notes, facet definitions, blueprints and glossary terms),
-`list_documents`, `get_document_outline`, `search`, `grep`, `read_section`,
-`view_page` and `lookup_glossary`. `list_documents`, `search` and `grep` take
-`filters: dict[str, str] | None`. `view_page` returns the caption as text
-content and the page as `image/webp` image content. Domain errors become tool
-errors whose message names the valid topics, facets, values or pages.
+`TopicCatalog` and refuses two snapshots with the same topic. It has ten
+tools:
+
+- `list_topics`: each topic's facets with their allowed values, and the
+  deliverable types that have a blueprint.
+- `get_topic_guide(topic)`: the cited guide, curator notes, facet
+  definitions, glossary terms and one summary per blueprint
+  (`deliverable_type`, `description`, `exemplar_count`). It carries no
+  outline, conventions, pitfalls or passages, which keeps it small for
+  question answering.
+- `get_blueprint(topic, deliverable_type)`: one full `Blueprint` (outline,
+  conventions, pitfalls, exemplar and feedback documents, standing
+  passages). The type matches after `fold_facet_label`, so case and
+  surrounding spaces do not matter; an unknown type is a `NotFoundError`
+  that names the valid types.
+- `list_documents`, `get_document_outline`, `search`, `grep`,
+  `read_section`, `view_page` and `lookup_glossary`.
+
+`list_documents`, `search` and `grep` take `filters: dict[str, str] | None`.
+`view_page` returns the caption as text content and the page as `image/webp`
+image content. Domain errors become tool errors whose message names the valid
+topics, facets, values, deliverable types or pages. `arkive-rag inspect`
+still prints every blueprint in full.
 
 The server's instructions describe two modes. Answering questions cites
-`doc_id`, `section_id` and pages. Drafting a deliverable starts from the
-blueprint for its deliverable type, reads the blueprint's feedback documents
-and exemplars, and keeps every project fact to the user's own inputs.
+`doc_id`, `section_id` and pages; the guide is suggested when scope, curator
+notes or missing material matter, not before every search. Drafting a
+deliverable calls `get_blueprint` and follows its outline, conventions and
+pitfalls; mirrors a cited exemplar section's heading levels and table column
+headers where layout matters, not its project-specific headings; takes
+every fact about the user's project (its client and other parties, people,
+places, dates, quantities, budgets, targets, findings, identifiers, file
+names) only from the user's inputs, which take precedence over a passage;
+treats the standing passages as the collection's own house text, reproducing
+them with their wording, without commentary about their origin, and keeping
+their organisation names, method references and attributions as written,
+while adapting or leaving out only the part of a passage that belongs to one
+particular project (its client, site, dates, quantities or results); reuses
+names, references and attributions from the corpus only when a standing
+passage holds them; lists every item the user's inputs enumerate in full;
+and leaves out Arkive document and section IDs. The `read_section` and
+`get_blueprint` descriptions say the same.
 
 Over `streamable-http` the server has no authentication, so `serve` refuses a
 host other than `127.0.0.1`, `localhost` or `::1` unless `--allow-nonlocal` is
@@ -538,7 +632,7 @@ is a fictional pack; real packs stay in the private store.
 | Layer | Module | Measures |
 | --- | --- | --- |
 | 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of BM25-only, dense-only and hybrid RRF ranking over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks all three arms from one query embedding per case. |
-| 2 | `agents.py` | An agent conversation answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the nine Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
+| 2 | `agents.py` | An agent conversation answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the ten Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
 | 3 | `agents.py` | One deliverable is held out. Before any file is copied or any model is called, the reference document (`reference_doc_id`) must be a delivered document, not a curator note, and carry a `held_out_markers` entry in its path, and every file under `included_paths` (selected through `discover_corpus`, so symlinks are refused) must have no marker in its path, not share the reference's top-level folder (or, for a reference at the corpus root, not sit at the root) and not have the reference's bytes. Markers match case- and dash-insensitively (`fold_text`). Pack validation refuses an included path that is not written plainly (`./`, an empty part or a trailing `/`). The holdout snapshot is compiled from those bytes alone, in a worker thread (its blueprint agent runs start their own event loop) with the full snapshot's embedding model and dimensions (reusing `--cache`), so its facets, glossary, blueprints and guide are induced without the held-out material; it is checked again and only then published as `<out>/holdout.arkive.db`. The cache cannot serve the full corpus's induction results to the holdout build, because each induction request covers the documents it was built from. Three arms draft the deliverable from the task's `run_notes` and `memo_instructions`: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts get the task's rubric checks and a blinded side-by-side judge against the reference. |
 
 The evaluation harness compiles the holdout snapshot through `compile_corpus`
@@ -565,8 +659,11 @@ ways, and induction gives them different facet schemas:
 
 Both repeat deliverable types, reviewer feedback, defined and undefined
 acronyms, one acronym with two meanings, tool names, stated attributes,
-exact numbers and filenames. They are built with the ordinary `arkive-rag
-build` command; the snapshots are not tracked.
+exact numbers and filenames. Each also has one standing section that recurs
+across projects: every coastal proposal ends with the same standard terms,
+and every campaign brief ends with the same disclosure, so their blueprints
+have standing passage candidates to select. They are built with the ordinary
+`arkive-rag build` command; the snapshots are not tracked.
 
 ### OpenCode check
 
@@ -589,14 +686,18 @@ non-interactively, on several topics at once. It needs Docker and
   `/etc/opencode/opencode.json`, which outranks global and project files. It
   declares one local stdio MCP server, `arkive`, that runs `arkive-rag serve`
   on every snapshot under `/snapshots`, with `codemode: false` so the tools sit
-  on the model's native tool list as `arkive_<tool>`. Its permissions deny
-  every action and then allow `arkive_*`.
+  on the model's native tool list as `arkive_<tool>`, and a start-up timeout of
+  180 s (`timeout.startup`): OpenCode marks a server that misses it failed and
+  never retries it, and on a loaded machine `arkive-rag serve` has needed 10
+  to 20 s to answer `initialize`. Its permissions deny every action and then
+  allow `arkive_*`.
 - **Startup.** `opencode run --standalone` sends the first model request
   without waiting for local MCP servers, so `arkive`, which needs several
   seconds to open its snapshots, is missing from the tool list.
   `run-scenario.sh` therefore starts a private `opencode serve`, waits until
-  `opencode mcp list` reports `arkive` connected (120 s at most, each listing
-  bounded to 10 s, exit 3 otherwise) and then runs the prompt with `opencode
+  `opencode mcp list` reports `arkive` connected (240 s at most, each listing
+  bounded to 10 s; exit 3 when the deadline passes or the server is reported
+  failed) and then runs the prompt with `opencode
   run --server ... --format json --auto -- PROMPT`, so a prompt that starts
   with a dash is still the message.
 - **Isolation.** Each scenario runs in a fresh container, as the invoking
@@ -628,8 +729,17 @@ non-interactively, on several topics at once. It needs Docker and
   facet to another value, completed), the topics its calls must query, answer
   phrase groups matched as in eval packs, an optional requirement that the
   answer names every facet of its topics (read from the served snapshots,
-  because facets are induced per build), and an optional page (`page_image`:
-  topic, `doc_id`, `page_number`) whose `view_page` call must return an image.
+  because facets are induced per build), an optional requirement that the
+  answer reproduces a standing passage (`answer_reproduces_standing_passage_of`,
+  a topic: the passages come from the blueprint that the last completed
+  `get_blueprint` call on that topic returned, because passages and
+  deliverable types are induced per build; a passage counts when its text, or
+  its first 12 words for a longer one, appears in the answer as words after
+  `fold_for_quote`; when that blueprint holds no standing passage the
+  scenario fails a separate check, `precondition: blueprint has a standing
+  passage`, which marks the snapshot rather than the client), and an optional
+  page (`page_image`: topic, `doc_id`, `page_number`) whose `view_page` call
+  must return an image.
   Document IDs follow sorted path order, so they are stable across builds of
   one corpus. Every scenario also requires that the run ended with an answer
   and no error event, and that no tool outside the `arkive` server was called. The shipped scenarios cover
@@ -637,7 +747,9 @@ non-interactively, on several topics at once. It needs Docker and
   the corpus never defines and a term with two meanings), a filtered listing
   with a facet the agent finds itself, recovery from an invalid filter value,
   an exact number found with `grep`, a chart value read through `view_page`,
-  a draft that starts from a blueprint, and a question that needs both topics.
+  a draft that must fetch the full blueprint with `get_blueprint` and
+  reproduce one of its standing passages, and a question that needs both
+  topics.
 - **Results.** The runner parses the newline-delimited JSON events
   (`tool_use`, `text`, `step_finish`, `error`); the final answer is the text
   written after the last tool call. It writes `results.json` (per scenario:

@@ -26,6 +26,7 @@ from pydantic import TypeAdapter, ValidationError
 from arkive_rag import __version__
 from arkive_rag.models import (
     Blueprint,
+    BlueprintSummary,
     BuildReport,
     CompiledCorpus,
     CuratorNote,
@@ -550,10 +551,10 @@ class TopicSnapshot:
     def _load_knowledge(self, db: sqlite3.Connection) -> None:
         """Glossary and blueprint rows, validated and with every reference resolved."""
         citable = {
-            r["section_id"]
+            r["section_id"]: r["doc_id"]
             for r in db.execute(
-                "SELECT s.section_id FROM sections s JOIN documents d ON d.doc_id = s.doc_id"
-                " WHERE d.is_curator_note = 0"
+                "SELECT s.section_id, s.doc_id FROM sections s JOIN documents d"
+                " ON d.doc_id = s.doc_id WHERE d.is_curator_note = 0"
             )
         }
         documents = {d for d, info in self._documents.items() if not info.is_curator_note}
@@ -576,8 +577,17 @@ class TopicSnapshot:
             for s in e.senses
             for c in s.citations
         ]
+        types: dict[str, str] = {}
         for b in self.blueprints:
             label = f"blueprint {b.deliverable_type!r}"
+            # `blueprint()` resolves a type by this folded label, so two would be ambiguous.
+            folded = fold_facet_label(b.deliverable_type)
+            if folded in types:
+                raise SnapshotIntegrityError(
+                    f"{self.path}: blueprints {types[folded]!r} and {b.deliverable_type!r} have"
+                    " the same deliverable type"
+                )
+            types[folded] = b.deliverable_type
             cited += [(label, c) for s in b.outline for c in s.citations]
             cited += [(label, c) for g in (*b.conventions, *b.pitfalls) for c in g.citations]
             for doc_id in (*b.exemplar_doc_ids, *b.feedback_doc_ids):
@@ -585,6 +595,21 @@ class TopicSnapshot:
                     raise SnapshotIntegrityError(
                         f"{self.path}: {label} names document {doc_id!r}, which is not a"
                         " citable document of this snapshot"
+                    )
+            for passage in b.standing_passages:
+                # A missing section is refused below with every other unresolved citation.
+                cited += [(label, c) for c in passage.citations]
+                for c in passage.citations:
+                    if c in citable and citable[c] not in b.exemplar_doc_ids:
+                        raise SnapshotIntegrityError(
+                            f"{self.path}: {label} has a standing passage citing {c!r}, which"
+                            " is not a section of the blueprint's exemplars"
+                        )
+                resolved = all(c in citable for c in passage.citations)
+                if resolved and len({citable[c] for c in passage.citations}) < 2:
+                    raise SnapshotIntegrityError(
+                        f"{self.path}: {label} has a standing passage {passage.label!r} whose"
+                        " citations name fewer than two exemplar documents"
                     )
         for label, section_id in cited:
             if section_id not in citable:
@@ -671,8 +696,26 @@ class TopicSnapshot:
             guide_markdown=self.guide_markdown,
             curator_notes=self.curator_notes(),
             facets=self.facets,
-            blueprints=self.blueprints,
+            blueprints=[
+                BlueprintSummary(
+                    deliverable_type=b.deliverable_type,
+                    description=b.description,
+                    exemplar_count=len(b.exemplar_doc_ids),
+                )
+                for b in self.blueprints
+            ],
             glossary_terms=[e.term for e in self.glossary],
+        )
+
+    def blueprint(self, deliverable_type: str) -> Blueprint:
+        """The full blueprint whose type matches `deliverable_type` after `fold_facet_label`."""
+        wanted = fold_facet_label(deliverable_type)
+        for blueprint in self.blueprints:
+            if fold_facet_label(blueprint.deliverable_type) == wanted:
+                return blueprint
+        valid = ", ".join(b.deliverable_type for b in self.blueprints) or "none"
+        raise NotFoundError(
+            f"no blueprint for deliverable type {deliverable_type!r}; valid types: {valid}"
         )
 
     def lookup_glossary(self, query: str | None = None) -> GlossaryLookup:

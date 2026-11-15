@@ -506,6 +506,38 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
         ("glossary", "entry_json", "doc_002_sec_002", "doc_001_sec_001", "cites 'doc_001_sec_001'"),
         ("blueprints", "blueprint_json", '"doc_002"', '"doc_001"', "names document 'doc_001'"),
         ("blueprints", "blueprint_json", '"outline"', '"sketch"', "row is malformed"),
+        # doc_003_sec_004 is cited only by the campaign brief's standing passage.
+        (
+            "blueprints",
+            "blueprint_json",
+            '"doc_003_sec_004"',
+            '"doc_003_sec_099"',
+            "cites 'doc_003_sec_099'",
+        ),
+        (
+            "blueprints",
+            "blueprint_json",
+            '"doc_003_sec_004"',
+            '"doc_004_sec_001"',
+            "standing passage citing 'doc_004_sec_001', which is not a section of the"
+            " blueprint's exemplars",
+        ),
+        # Both citations then name doc_002: a passage must recur in another exemplar.
+        (
+            "blueprints",
+            "blueprint_json",
+            '"doc_003_sec_004"',
+            '"doc_002_sec_003"',
+            "standing passage 'Disclosure' whose citations name fewer than two exemplar documents",
+        ),
+        # `get_blueprint` resolves a folded type, so it must name one blueprint.
+        (
+            "blueprints",
+            "blueprint_json",
+            '"campaign brief"',
+            '" Review NOTES"',
+            "blueprints ' Review NOTES' and 'review notes' have the same deliverable type",
+        ),
     ],
 )
 def test_glossary_and_blueprint_rows_are_validated_when_a_snapshot_opens(
@@ -526,6 +558,40 @@ def test_glossary_and_blueprint_rows_are_validated_when_a_snapshot_opens(
     assert changed == 1
     with pytest.raises(SnapshotIntegrityError, match=message):
         TopicSnapshot.open(output)
+
+
+def test_guide_summarises_blueprints_and_one_blueprint_is_read_in_full_by_folded_type(
+    tmp_path: Path,
+) -> None:
+    path = compile_snapshot(tmp_path, MARKETING_CORPUS, topic="campaigns")
+
+    with TopicSnapshot.open(path) as snap:
+        guide = snap.guide()
+        brief = snap.blueprint("  Campaign BRIEF ")
+        with pytest.raises(
+            NotFoundError,
+            match="no blueprint for deliverable type 'press release'; valid types: campaign"
+            " brief, review notes",
+        ):
+            snap.blueprint("press release")
+        assert brief == snap.blueprints[0]
+
+    assert [b.model_dump() for b in guide.blueprints] == [
+        {
+            "deliverable_type": "campaign brief",
+            "description": "How the collection writes a campaign brief.",
+            "exemplar_count": 2,
+        },
+        {
+            "deliverable_type": "review notes",
+            "description": "How the collection writes a review notes.",
+            "exemplar_count": 1,
+        },
+    ]
+    assert brief.outline and brief.conventions
+    assert [p.citations for p in brief.standing_passages] == [
+        ("doc_002_sec_004", "doc_003_sec_004")
+    ]
 
 
 def test_glossary_lookup_by_term_alias_list_and_miss(tmp_path: Path) -> None:

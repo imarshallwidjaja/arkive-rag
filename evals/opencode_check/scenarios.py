@@ -7,7 +7,10 @@ optional page whose image `view_page` must return, and answer phrase groups matc
 eval packs (`evals.schema.satisfies_groups`). Every scenario also
 requires that the agent called no tool outside the Arkive server and that the run ended with
 an answer. Facet names are induced per build, so a scenario never names one: it can instead
-require the answer to name every facet of its topics, read from the served snapshots.
+require the answer to name every facet of its topics, read from the served snapshots. For the
+same reason a drafting scenario never names a standing passage or a deliverable type: it names
+a topic, and can require the answer to reproduce one of the passages of the blueprint its last
+`get_blueprint` call on that topic returned.
 """
 
 from __future__ import annotations
@@ -21,12 +24,14 @@ from typing import Annotated, Any, Literal, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from arkive_rag.models import fold_for_quote
 from evals.schema import Groups, NonBlank, normalize_for_match, satisfies_groups
 
 ARKIVE_SERVER = "arkive"
 ArkiveTool = Literal[
     "list_topics",
     "get_topic_guide",
+    "get_blueprint",
     "list_documents",
     "get_document_outline",
     "search",
@@ -94,6 +99,9 @@ class Scenario(_ScenarioModel):
     # The answer names every facet of each topic in `topics_queried` (or of every served
     # topic when that is empty), compared with `_` and `-` read as spaces.
     answer_names_facets: bool = False
+    # A topic: the answer reproduces at least one standing passage of the blueprint that the
+    # last completed `get_blueprint` call on this topic returned (`_reproduction_outcome`).
+    answer_reproduces_standing_passage_of: NonBlank | None = None
     page_image: PageImage | None = None
 
 
@@ -111,7 +119,11 @@ class ScenarioFile(_ScenarioModel):
         if duplicates:
             raise ValueError(f"duplicate scenario_id: {duplicates}")
         for s in self.scenarios:
-            named = {*s.topics_queried, *([s.page_image.topic] if s.page_image else [])}
+            named = set(s.topics_queried)
+            if s.page_image:
+                named.add(s.page_image.topic)
+            if s.answer_reproduces_standing_passage_of:
+                named.add(s.answer_reproduces_standing_passage_of)
             unknown = sorted(named - set(self.topics))
             if unknown:
                 raise ValueError(f"scenario {s.scenario_id!r} queries undeclared topics {unknown}")
@@ -312,7 +324,77 @@ def evaluate(
                 f"absent: {absent}" if absent else f"named {names}",
             )
         )
+    if scenario.answer_reproduces_standing_passage_of:
+        outcomes.append(
+            _reproduction_outcome(completed, answer, scenario.answer_reproduces_standing_passage_of)
+        )
     return outcomes
+
+
+# A long passage counts as reproduced when its opening words are; the agent may adapt a
+# project fact later in it, as the drafting instructions require.
+REPRODUCED_PREFIX_WORDS = 12
+_WORD = re.compile(r"\w+")
+
+
+def _words(text: str) -> str:
+    """Text as space-separated words after `fold_for_quote`, padded so a containment test
+    matches whole words only."""
+    return f" {' '.join(_WORD.findall(fold_for_quote(text)))} "
+
+
+def _reproduction_outcome(completed: Sequence[ToolCall], answer: str, topic: str) -> CheckOutcome:
+    """Whether the answer reproduces a standing passage of the blueprint that the last
+    completed `get_blueprint` call on `topic` returned, the one the agent drafted from: its
+    text, or its first `REPRODUCED_PREFIX_WORDS` words, compared after `fold_for_quote`. A
+    blueprint without standing passages is a missing precondition of the snapshot, reported
+    under its own check name so it is not read as an agent failure."""
+    fetched = [
+        c
+        for c in completed
+        if c.arkive_tool == "get_blueprint" and c.arguments.get("topic") == topic
+    ]
+    if not fetched:
+        return CheckOutcome(
+            "answer reproduces a standing passage",
+            False,
+            f"no completed get_blueprint call on {topic}",
+        )
+    blueprint = _json_object(fetched[-1].output)
+    items = blueprint.get("standing_passages")
+    passages = [
+        p["text"]
+        for p in (items if isinstance(items, list) else [])
+        if isinstance(p, dict) and isinstance(p.get("text"), str)
+    ]
+    if not passages:
+        return CheckOutcome(
+            "precondition: blueprint has a standing passage",
+            False,
+            f"the {blueprint.get('deliverable_type')!r} blueprint of {topic} holds no standing"
+            " passage, so reproduction cannot be checked; the served snapshot, not the agent,"
+            " fails this scenario",
+        )
+    spoken = _words(answer)
+    for text in passages:
+        words = _words(text).split()
+        needle = f" {' '.join(words[:REPRODUCED_PREFIX_WORDS])} "
+        if words and needle in spoken:
+            return CheckOutcome(
+                "answer reproduces a standing passage", True, f"reproduced {text[:60]!r}"
+            )
+    return CheckOutcome(
+        "answer reproduces a standing passage",
+        False,
+        f"none of {len(passages)} standing passage(s) appears in the answer",
+    )
+
+
+def _json_object(text: str | None) -> dict[str, Any]:
+    try:
+        return _object(json.loads(text or ""))
+    except json.JSONDecodeError:
+        return {}
 
 
 def _spaced(text: str) -> str:

@@ -19,8 +19,10 @@ from arkive_rag.induction import (
     Checked,
     CorpusView,
     CraftLead,
+    DeliverableType,
     InductionExecutor,
     OrganiseCorpus,
+    StandingCandidate,
     WriteBlueprint,
     WriteGlossary,
     WriteGuide,
@@ -28,11 +30,13 @@ from arkive_rag.induction import (
     check_organisation,
     generate_checked,
     induce,
+    standing_candidates,
     term_clusters,
 )
 from arkive_rag.llm import AgentRequest, StructuredRequest
 from arkive_rag.models import (
     BlueprintDraft,
+    BlueprintSectionDraft,
     CompiledCorpus,
     CorpusDocument,
     DeliverableTypeDraft,
@@ -47,10 +51,11 @@ from arkive_rag.models import (
     ReadSection,
     RejectedOutputError,
     SenseDraft,
+    StandingPassageSelection,
     TermObservation,
 )
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
-from tests.support import BATHYMETRY_CORPUS, MARKETING_CORPUS, FakeGateway
+from tests.support import BATHYMETRY_CORPUS, HOUSE_DISCLOSURE, MARKETING_CORPUS, FakeGateway
 
 
 def compile_files(
@@ -146,7 +151,13 @@ BROKEN = organisation(
     types=[
         DeliverableTypeDraft(
             name="memo", description="Memo.", exemplar_doc_ids=["doc_009"], feedback_doc_ids=[]
-        )
+        ),
+        DeliverableTypeDraft(
+            name="proposal",
+            description="Proposal.",
+            exemplar_doc_ids=["doc_001", "doc_002"],
+            feedback_doc_ids=["doc_002"],
+        ),
     ],
 )
 
@@ -163,8 +174,11 @@ def test_structurally_invalid_organisation_is_rerun_once_then_raises(tmp_path: P
     assert "facet name 'Region' is not snake_case" in message
     assert "unknown folder 'nowhere'" in message
     assert "unknown document ID 'doc_009'" in message
+    # A feedback document of a type must not also supply its exemplar text.
+    assert "'proposal': 'doc_002' is both an exemplar and a feedback document" in message
     first, rerun = gateway.of_type(OrganiseCorpus)
     assert first.feedback is None and rerun.feedback is not None and "doc_009" in rerun.feedback
+    assert "'doc_002' is both an exemplar and a feedback document" in rerun.feedback
 
 
 def test_organisation_normalises_repetition_within_a_value_so_the_snapshot_stores_it(
@@ -601,9 +615,28 @@ def test_blueprints_cite_resolvable_sections_and_exemplars(tmp_path: Path) -> No
     ]
     assert brief.conventions[0].citations == ("doc_002_sec_003", "doc_003_sec_003")
     assert [g.statement for g in brief.pitfalls] == ["Cut the jargon from the opening line."]
-    assert [s.heading for s in brief.outline] == ["Title and summary", "Audience", "Messaging"]
+    assert [s.heading for s in brief.outline] == [
+        "Title and summary",
+        "Audience",
+        "Messaging",
+        "Disclosure",
+    ]
+    # Both briefs share the convention line and the disclosure; the fake leaves the
+    # `Convention:` line unselected. The single review-notes exemplar has no candidates.
+    request, review_request = gateway.of_type(WriteBlueprint)
+    assert [(c.candidate_id, c.citations) for c in request.standing_candidates] == [
+        ("candidate_01", ("doc_002_sec_003", "doc_003_sec_003")),
+        ("candidate_02", ("doc_002_sec_004", "doc_003_sec_004")),
+    ]
+    (disclosure,) = brief.standing_passages
+    assert disclosure.label == "Disclosure"
+    assert disclosure.text == HOUSE_DISCLOSURE.split("\n\n")[1].strip()
+    assert disclosure.citations == ("doc_002_sec_004", "doc_003_sec_004")
+    assert "[candidate_02] found in doc_002_sec_004, doc_003_sec_004" in request.text()
+    assert review.standing_passages == () and review_request.standing_candidates == ()
+    assert "(none: this type has one exemplar document" in review_request.text()
+    assert corpus.build_report.dropped_blueprint_statements == 0
     # The agent run used its tools; its cache identity covers everything they can read.
-    request = gateway.of_type(WriteBlueprint)[0]
     # Craft observations of the exemplars and the feedback document are leads to verify.
     assert request.craft_leads == (
         CraftLead(
@@ -668,16 +701,18 @@ def test_blueprint_guidance_the_judge_does_not_support_is_dropped_and_counted(
     brief = corpus.blueprints[0]
     assert (brief.conventions, brief.pitfalls) == ((), ())
     assert brief.outline
+    # Only the unsupported convention and pitfall count; standing passages are never dropped.
+    assert brief.standing_passages
     assert corpus.build_report.dropped_blueprint_statements == 2
 
 
 def test_a_blueprint_with_an_empty_outline_fails_after_one_rerun(tmp_path: Path) -> None:
     empty = BlueprintDraft(
         description="Nothing.",
-        exemplar_doc_ids=["doc_002"],
         outline=[],
         conventions=[],
         pitfalls=[],
+        standing_passages=[],
     )
     gateway = FakeGateway(blueprint_script=[empty, empty])
 
@@ -688,6 +723,218 @@ def test_a_blueprint_with_an_empty_outline_fails_after_one_rerun(tmp_path: Path)
     first, rerun = gateway.of_type(WriteBlueprint)[:2]
     assert first.feedback is None and rerun.feedback is not None
     assert "the outline is empty" in rerun.feedback
+
+
+# Standing passage candidates.
+
+# Thirteen words, so ten word 4-grams: changing word 11 breaks two of them (0.8 recurs),
+# changing word 10 breaks three (0.7 does not).
+TERMS = "Quillfen Geomatics carries out every survey under its quality manual and audit schedule"
+AT_THRESHOLD = TERMS.replace("audit", "review")
+BELOW_THRESHOLD = TERMS.replace("and audit", "plus audit")
+HEADER = "| Deliverable | File name | Format |\n| --- | --- | --- |"
+DISCLAIMER = (
+    "Survey results describe the seabed on the survey dates only and certify nothing later."
+)
+
+
+def candidate_view(*docs: tuple[str, Sequence[str]]) -> CorpusView:
+    """Documents doc_001, doc_002, ... in argument order; each section's Markdown as given."""
+    return CorpusView(
+        tuple(
+            CorpusDocument(f"doc_{n:03d}", rel_path, reading(markdowns, ()))
+            for n, (rel_path, markdowns) in enumerate(docs, start=1)
+        )
+    )
+
+
+def texts(view: CorpusView, exemplars: Sequence[str]) -> list[str]:
+    return [c.text for c in standing_candidates(view, exemplars)]
+
+
+def test_prose_recurs_at_exactly_the_containment_threshold_and_not_below() -> None:
+    assert induction.STANDING_RECURRENCE_CONTAINMENT == 0.8
+    at = candidate_view(("p1/a.md", [TERMS]), ("p2/b.md", [AT_THRESHOLD]))
+    below = candidate_view(("p1/a.md", [TERMS]), ("p2/b.md", [BELOW_THRESHOLD]))
+
+    (candidate,) = standing_candidates(at, ("doc_001", "doc_002"))
+
+    # The two wordings say the same thing, so they are one candidate held by the first.
+    assert candidate == StandingCandidate(
+        "candidate_01", TERMS, ("doc_001_sec_001", "doc_002_sec_001")
+    )
+    assert standing_candidates(below, ("doc_001", "doc_002")) == ()
+
+
+def test_recurrence_needs_another_top_level_folder_only_when_the_exemplars_span_folders() -> None:
+    view = candidate_view(
+        ("p1/a.md", [DISCLAIMER]), ("p1/b.md", [DISCLAIMER]), ("p2/c.md", ["Scope only."])
+    )
+    flat = candidate_view(("a.md", [DISCLAIMER]), ("b.md", [DISCLAIMER]))
+
+    assert texts(view, ("doc_001", "doc_002", "doc_003")) == []
+    assert texts(view, ("doc_001", "doc_002")) == [DISCLAIMER]
+    assert [c.citations for c in standing_candidates(flat, ("doc_001", "doc_002"))] == [
+        ("doc_001_sec_001", "doc_002_sec_001")
+    ]
+    # Recurrence within one document is not recurrence.
+    same_doc = candidate_view(("a.md", [DISCLAIMER, DISCLAIMER]), ("b.md", ["Other."]))
+    assert texts(same_doc, ("doc_001", "doc_002")) == []
+
+
+def test_units_are_paragraphs_list_items_and_table_header_rows_only() -> None:
+    reference = "- Harlow, J. (2019). *Multibeam practice for inland waters*. Survey Press."
+    heading = "## Quality assurance under the survey quality manual of the house"
+    visual = f"> **[Visual \u2014 Page 1: Chart]**\n> {DISCLAIMER}"
+    first = [
+        f"{heading}\n\n{reference}\n- Field notes of the first crew on the estuary.",
+        f"{HEADER}\n| Grid | `p1_grid.tif` | GeoTIFF |",
+        f"{visual}\n\n```\n{TERMS}\n```",
+        "| Name |\n| --- |\n| Grid |",
+    ]
+    second = [
+        f"{heading}\n\n- Moreau, L. (2021). Tide reduction.\n{reference}",
+        f"{HEADER}\n| Lines | `p2_lines.shp` | Shapefile |",
+        f"{visual}\n\n```\n{TERMS}\n```",
+        "| Name |\n| --- |\n| Lines |",
+    ]
+    view = candidate_view(("p1/a.md", first), ("p2/b.md", second))
+
+    # Each list item is its own unit; the header row keeps its separator row and the body
+    # differs; headings, visual transcripts, fenced blocks and one-column headers are not units.
+    assert texts(view, ("doc_001", "doc_002")) == [reference, HEADER]
+    other_header = candidate_view(
+        ("p1/a.md", [HEADER]), ("p2/b.md", [HEADER.replace("Format", "Size")])
+    )
+    assert texts(other_header, ("doc_001", "doc_002")) == []
+    # A table without outer pipes is a table too: a short one still has its header unit, and
+    # the body rows of a long one never join it, even when they recur.
+    short = "Name | Value\n--- | ---"
+    long_header = (
+        "Deliverable | File name | Format | Coordinate reference system\n--- | --- | --- | ---"
+    )
+    body = "Bathymetric grid | `grid.tif` | GeoTIFF | ETRS89 / UTM zone 30N with OD heights"
+    pipeless = candidate_view(
+        ("p1/a.md", [f"{short}\nGrid | 1", f"{long_header}\n{body}"]),
+        ("p2/b.md", [f"{short}\nLines | 2", f"{long_header}\n{body}"]),
+    )
+    assert texts(pipeless, ("doc_001", "doc_002")) == [short, long_header]
+
+
+def test_a_unit_keeps_the_inner_bytes_of_its_holder_section() -> None:
+    # Two trailing spaces before a newline are a Markdown hard line break.
+    broken = (
+        "Quillfen Geomatics Ltd  \nRegistered surveyors under the house quality manual since 2009."
+    )
+    view = candidate_view(("p1/a.md", [f"Intro.\n\n{broken}  \n"]), ("p2/b.md", [broken]))
+
+    (candidate,) = standing_candidates(view, ("doc_001", "doc_002"))
+
+    assert candidate.text == broken
+    assert candidate.text in view.markdown(candidate.citations[0])
+
+
+def test_candidates_group_duplicates_in_canonical_order_whatever_the_input_order() -> None:
+    emphasised = DISCLAIMER.replace("seabed", "**seabed**")
+    docs = [
+        ("p1/a.md", ["# Scope\n\nThe p1 harbour.", emphasised]),
+        ("p2/b.md", [f"{DISCLAIMER}\n\n{HEADER}"]),
+        ("p3/c.md", [f"{HEADER}\n| Grid | x | y |", f"Intro.\n\n{DISCLAIMER}"]),
+    ]
+    expected = (
+        StandingCandidate(
+            "candidate_01", emphasised, ("doc_001_sec_002", "doc_002_sec_001", "doc_003_sec_002")
+        ),
+        StandingCandidate("candidate_02", HEADER, ("doc_002_sec_001", "doc_003_sec_001")),
+    )
+
+    results = {
+        standing_candidates(candidate_view(*docs), order)
+        for order in itertools.permutations(("doc_001", "doc_002", "doc_003"))
+    }
+
+    assert results == {expected}
+    # One exemplar cannot show recurrence.
+    assert standing_candidates(candidate_view(*docs), ("doc_002",)) == ()
+
+
+def test_the_blueprint_request_says_why_it_lists_no_candidates() -> None:
+    def request(*exemplars: str) -> str:
+        dtype = DeliverableType("memo", "A memo.", exemplars, ())
+        return WriteBlueprint(dtype, (), (), (), (), 0, (), "0" * 64).text()
+
+    assert "(none: this type has one exemplar document" in request("doc_001")
+    assert "(none: no block of this type's exemplars recurs" in request("doc_001", "doc_002")
+
+
+def test_candidates_beyond_the_cap_keep_those_in_the_most_documents_and_the_request_says_so() -> (
+    None
+):
+    assert induction.MAX_STANDING_CANDIDATES == 60
+    # Sixty-one distinct sentences recur between doc_001 and doc_002; the last two also recur
+    # in doc_003, so they outrank the rest, and the tie among the others keeps canonical order.
+    sentences = [
+        f"Standing clause number {n} of the house terms binds every survey we carry out."
+        for n in range(1, 62)
+    ]
+    view = candidate_view(
+        ("p1/a.md", sentences), ("p2/b.md", sentences), ("p3/c.md", sentences[-2:])
+    )
+    exemplars = ("doc_001", "doc_002", "doc_003")
+    found = standing_candidates(view, exemplars)
+
+    offered = induction.offered_candidates(view, found)
+
+    assert len(found) == 61
+    assert [c.candidate_id for c in offered] == [
+        f"candidate_{n:02d}" for n in (*range(1, 59), 60, 61)
+    ]
+    dtype = DeliverableType("terms", "Terms.", exemplars, ())
+    cut = WriteBlueprint(dtype, (), (), (), offered, len(found), (), "0" * 64).text()
+    assert "(this list was cut from 61 candidates to the 60 that recur in the most" in cut
+    whole = WriteBlueprint(dtype, (), (), (), found[:60], 60, (), "0" * 64).text()
+    assert "was cut" not in whole
+
+
+def selecting(*selections: tuple[str, str]) -> BlueprintDraft:
+    return BlueprintDraft(
+        description="A brief.",
+        outline=[
+            BlueprintSectionDraft(heading="Audience", purpose="Who.", citations=["doc_002_sec_002"])
+        ],
+        conventions=[],
+        pitfalls=[],
+        standing_passages=[
+            StandingPassageSelection(candidate_id=i, label=label) for i, label in selections
+        ],
+    )
+
+
+def test_unknown_or_repeated_standing_passage_selections_are_rerun_then_rejected(
+    tmp_path: Path,
+) -> None:
+    bad = selecting(
+        ("candidate_09", "Made up"),
+        ("candidate_02", "A"),
+        ("candidate_02", "B"),
+        ("candidate_01", "  "),
+    )
+    good = selecting(("candidate_02", "Disclosure"))
+    gateway = FakeGateway(blueprint_script=[bad, good])
+
+    corpus = compile_files(tmp_path / "rerun", MARKETING_CORPUS, gateway)
+
+    first, rerun = gateway.of_type(WriteBlueprint)[:2]
+    assert first.feedback is None and rerun.feedback is not None
+    assert "'candidate_09' is not a listed candidate_id" in rerun.feedback
+    assert "'candidate_02' is selected twice" in rerun.feedback
+    assert "'candidate_01' has a blank label" in rerun.feedback
+    (passage,) = corpus.blueprints[0].standing_passages
+    assert passage.label == "Disclosure"
+    assert passage.text == HOUSE_DISCLOSURE.split("\n\n")[1].strip()
+    stubborn = FakeGateway(blueprint_script=[bad, bad])
+    with pytest.raises(RejectedOutputError, match="'candidate_09' is not a listed candidate_id"):
+        compile_files(tmp_path / "stubborn", MARKETING_CORPUS, stubborn)
 
 
 def test_a_notes_only_corpus_gets_a_guide_without_citation_tokens(tmp_path: Path) -> None:

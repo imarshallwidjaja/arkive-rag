@@ -239,12 +239,20 @@ class GuidanceDraft(_Frozen):
     citations: list[str]
 
 
+class StandingPassageSelection(_Frozen):
+    """One standing passage candidate the agent keeps, by ID, with its label. The text and
+    citations come from the candidate, never from the agent."""
+
+    candidate_id: str
+    label: str
+
+
 class BlueprintDraft(_Frozen):
     description: str
-    exemplar_doc_ids: list[str]
     outline: list[BlueprintSectionDraft]
     conventions: list[GuidanceDraft]
     pitfalls: list[GuidanceDraft]
+    standing_passages: list[StandingPassageSelection]
 
 
 class GuideDraft(_Frozen):
@@ -379,8 +387,20 @@ class BlueprintGuidance(_Frozen):
     citations: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
+class StandingPassage(_Frozen):
+    """A block of exemplar text, such as a method background, a reference entry or a
+    disclaimer, that recurs in another exemplar document and that the blueprint agent selected
+    as standing house content. `text` is exactly as it appears in the section `citations[0]`;
+    every other citation is a section of another exemplar document where it recurs."""
+
+    label: str
+    text: str
+    citations: Annotated[tuple[str, ...], Field(min_length=2)]
+
+
 class Blueprint(_Frozen):
-    """How the corpus writes one recurring deliverable type, without project-specific values."""
+    """How the corpus writes one recurring deliverable type. Outline, conventions and pitfalls
+    carry no project-specific values; standing passages are the only verbatim source text."""
 
     deliverable_type: str
     description: str
@@ -389,6 +409,7 @@ class Blueprint(_Frozen):
     outline: Annotated[tuple[BlueprintSection, ...], Field(min_length=1)]
     conventions: tuple[BlueprintGuidance, ...]
     pitfalls: tuple[BlueprintGuidance, ...]
+    standing_passages: tuple[StandingPassage, ...]
 
 
 class BuildReport(_Frozen):
@@ -514,13 +535,22 @@ class TopicSummary(_Frozen):
     glossary_terms: int
 
 
+class BlueprintSummary(_Frozen):
+    deliverable_type: str
+    description: str
+    exemplar_count: int
+
+
 class TopicGuide(_Frozen):
+    """The orientation view of a topic. Blueprints appear as summaries; `get_blueprint`
+    returns one in full."""
+
     topic: str
     title: str
     guide_markdown: str
     curator_notes: list[CuratorNote]
     facets: list[Facet]
-    blueprints: list[Blueprint]
+    blueprints: list[BlueprintSummary]
     glossary_terms: list[str]
 
 

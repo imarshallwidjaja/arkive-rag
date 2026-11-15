@@ -47,6 +47,7 @@ from arkive_rag.models import (
     OrganisationDraft,
     ReadSection,
     RejectedOutputError,
+    StandingPassage,
     TermObservation,
     fold_facet_label,
     fold_for_quote,
@@ -54,8 +55,7 @@ from arkive_rag.models import (
 )
 
 MAX_FACETS = 6
-# Every recurring deliverable type costs one blueprint agent run, and `get_topic_guide` returns
-# every blueprint in full.
+# Every recurring deliverable type costs one blueprint agent run.
 MAX_DELIVERABLE_TYPES = 8
 # A content-bound value is assigned, and a definition or blueprint statement kept, when the
 # decision model's probability reaches this threshold. A refusal never assigns or confirms.
@@ -474,6 +474,12 @@ def check_organisation(
                 rejections.append(
                     f"deliverable type {dtype.name!r}: unknown document ID {doc_id!r}"
                 )
+        # A feedback document must not supply exemplar text such as a standing passage.
+        for doc_id in sorted(set(dtype.exemplar_doc_ids) & set(dtype.feedback_doc_ids)):
+            rejections.append(
+                f"deliverable type {dtype.name!r}: {doc_id!r} is both an exemplar and a"
+                " feedback document; give each document one role"
+            )
         types.append(
             DeliverableType(
                 name=dtype.name,
@@ -673,8 +679,9 @@ class WriteGlossary:
         return f"{text}\n\n{self.feedback}" if self.feedback else text
 
 
-def _contains_form(folded_text: str, form: str) -> bool:
-    return re.search(rf"(?<!\w){re.escape(form)}(?!\w)", folded_text) is not None
+def _find_form(folded_text: str, form: str) -> re.Match[str] | None:
+    """The first whole-word occurrence of `form` in `folded_text`; both are folded."""
+    return re.search(rf"(?<!\w){re.escape(form)}(?!\w)", folded_text)
 
 
 def canonical_aliases(term: str, forms: Sequence[str]) -> tuple[str, ...]:
@@ -745,7 +752,7 @@ def term_clusters(view: CorpusView) -> list[TermCluster]:
             if sid in sections:
                 continue
             for form in forms:
-                match = re.search(rf"(?<!\w){re.escape(form)}(?!\w)", folded)
+                match = _find_form(folded, form)
                 if match:
                     start = max(0, match.start() - OCCURRENCE_RADIUS)
                     end = min(len(folded), match.end() + OCCURRENCE_RADIUS)
@@ -799,7 +806,7 @@ def check_glossary(
             for citation in sense.citations:
                 if citation not in view.sections:
                     rejections.append(f"{entry.term!r}: {citation!r} is not a citable section ID")
-                elif not any(_contains_form(view.folded_sections[citation], f) for f in forms):
+                elif not any(_find_form(view.folded_sections[citation], f) for f in forms):
                     rejections.append(
                         f"{citation} contains neither {entry.term!r} nor an alias the entry"
                         " gives; cite sections where the term occurs, or add the form used"
@@ -905,17 +912,26 @@ They are leads, not evidence: read the section a lead names and use it only if
 the source shows it, citing the sections that do.
 
 - description: what this deliverable is for and who reads it.
-- exemplar_doc_ids: the documents you based the blueprint on.
 - outline: the sections a new deliverable of this type should have, in order,
   each with its purpose and the section IDs of exemplar sections that show it.
 - conventions: house rules for structure, tables, units, naming, caveats,
   disclaimers and tone, each citing the section IDs that show it.
 - pitfalls: what reviewers asked authors to fix, each citing the feedback or
   exemplar section IDs that show it.
+- standing_passages: the request lists standing passage candidates: blocks of
+  exemplar text (paragraphs, list items, table header rows) that recur in
+  another exemplar document. Select each candidate that is standing house
+  content: organisation or tool background, method references, reference
+  entries, acknowledgements, disclaimers, disclosures, standard table headers
+  and standing caveats. Leave out every candidate that is specific to one
+  project, client, place, period or result. For each one you select, give its
+  candidate_id exactly as listed and a short label. Never write passage text.
+  Give an empty list when no candidate is standing house content or when the
+  request lists none.
 
-State structure and conventions generically: no project-specific values, names,
-places or dates. Cite only section IDs the tools returned (for example
-doc_002_sec_004).
+State the outline, conventions and pitfalls generically: no project-specific
+values, names, places or dates. Cite only section IDs the tools returned (for
+example doc_002_sec_004).
 """
 
 
@@ -1046,6 +1062,244 @@ def craft_leads(view: CorpusView, doc_ids: Sequence[str]) -> tuple[CraftLead, ..
     return tuple(sorted(leads))
 
 
+# Standing passage candidates. Code finds the blocks of a type's exemplar text that recur in
+# another exemplar document; the blueprint agent only selects and labels them, so a stored
+# passage is exemplar text by construction.
+
+# Shorter prose is a phrase, not a passage worth reproducing.
+STANDING_MIN_WORDS = 8
+# A table header row is a unit once it fixes this many columns.
+STANDING_MIN_TABLE_COLUMNS = 2
+# Recurrence compares word 4-grams: long enough that shared vocabulary alone does not match.
+STANDING_SHINGLE_WORDS = 4
+# Share of a unit's 4-grams a section of another document must hold. Standing blocks measured
+# 0.8 to 1.0 between projects, so light edits such as a changed year still count as recurrence.
+STANDING_RECURRENCE_CONTAINMENT = 0.8
+
+_WORD = re.compile(r"\w+")
+_MARKDOWN_HEADING_LINE = re.compile(r"#{1,6}\s")
+_LIST_ITEM = re.compile(r"\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
+_FENCE_LINE = re.compile(r"\s*(`{3,}|~{3,})")
+_TABLE_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
+# How the compiler opens a visual transcript; a transcript is a description, not house text.
+_VISUAL_PREFIX = "> **[Visual"
+
+
+@dataclass(frozen=True)
+class StandingUnit:
+    """One block of a section's Markdown: a paragraph or list item (`header` false), or a
+    table's header row with its separator row (`header` true). `text` is exactly as in the
+    section, without surrounding whitespace."""
+
+    text: str
+    header: bool
+
+
+def _table_cells(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def _is_table_separator(row: str) -> bool:
+    return "|" in row and all(
+        _TABLE_SEPARATOR_CELL.fullmatch(c.replace(" ", "")) for c in _table_cells(row)
+    )
+
+
+def standing_units(markdown: str) -> list[StandingUnit]:
+    """The units of one section in order. A blank line, heading or fenced block ends a unit;
+    a list marker starts one, and an unmarked line right after a list item continues it.
+    A table starts at a line opening with `|`, or at a line holding `|` right above a
+    separator row (a table without outer pipes); it continues through every line holding
+    `|`. Headings, fenced blocks, visual transcripts and table body rows are not units; a
+    table without a separator row has no header unit. A block quote that is not a visual
+    transcript is a paragraph. A unit's text keeps its inner bytes, such as the trailing
+    spaces of a hard line break."""
+    units: list[StandingUnit] = []
+    kind: str | None = None
+    lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal kind
+        text = "\n".join(lines).strip()
+        if kind in ("paragraph", "item") or (
+            kind == "quote" and not text.startswith(_VISUAL_PREFIX)
+        ):
+            units.append(StandingUnit(text, header=False))
+        elif kind == "table" and len(lines) >= 2 and _is_table_separator(lines[1]):
+            units.append(StandingUnit("\n".join(lines[:2]).strip(), header=True))
+        kind = None
+        lines.clear()
+
+    fence: str | None = None
+    all_lines = markdown.splitlines()
+    for i, line in enumerate(all_lines):
+        stripped = line.strip()
+        if fence is not None:
+            if stripped.startswith(fence) and not stripped.strip(fence[0]):
+                fence = None
+            continue
+        if opening := _FENCE_LINE.match(line):
+            flush()
+            fence = opening[1]
+            continue
+        if not stripped or _MARKDOWN_HEADING_LINE.match(stripped):
+            flush()
+            continue
+        if _LIST_ITEM.match(line):
+            flush()
+            kind = "item"
+        elif kind == "table" and "|" in stripped:
+            pass
+        elif stripped.startswith("|") or (
+            "|" in stripped and i + 1 < len(all_lines) and _is_table_separator(all_lines[i + 1])
+        ):
+            flush()
+            kind = "table"
+        elif stripped.startswith(">"):
+            if kind != "quote":
+                flush()
+                kind = "quote"
+        elif kind not in ("paragraph", "item"):
+            flush()
+            kind = "paragraph"
+        lines.append(line)
+    flush()
+    return units
+
+
+def _shingles(folded: str) -> frozenset[tuple[str, ...]]:
+    words = _WORD.findall(folded)
+    n = STANDING_SHINGLE_WORDS
+    return frozenset(tuple(words[i : i + n]) for i in range(len(words) - n + 1))
+
+
+def _containment(part: frozenset[tuple[str, ...]], whole: frozenset[tuple[str, ...]]) -> float:
+    """Share of `part`'s 4-grams that `whole` holds; `part` is never empty for a unit."""
+    return len(part & whole) / len(part)
+
+
+def _top_folder(rel_path: str) -> str:
+    """The first path component, or "" for a document at the corpus root."""
+    return rel_path.split("/")[0] if "/" in rel_path else ""
+
+
+@dataclass(frozen=True)
+class _PlacedUnit:
+    doc: CorpusDocument
+    section_id: str
+    unit: StandingUnit
+    # `fold_for_quote` of the text, or of the header row alone for a table header.
+    folded: str
+    grams: frozenset[tuple[str, ...]]
+
+    def says_the_same_as(self, other: _PlacedUnit) -> bool:
+        if self.unit.header or other.unit.header:
+            return self.unit.header == other.unit.header and self.folded == other.folded
+        return self.folded == other.folded or (
+            _containment(self.grams, other.grams) >= STANDING_RECURRENCE_CONTAINMENT
+            and _containment(other.grams, self.grams) >= STANDING_RECURRENCE_CONTAINMENT
+        )
+
+
+@dataclass(frozen=True)
+class StandingCandidate:
+    """A recurring block of exemplar text offered to the blueprint agent. `text` is exactly as
+    in `citations[0]`, the first holder in canonical order; the other citations are the
+    sections of other exemplar documents where it recurs, in canonical order."""
+
+    candidate_id: str
+    text: str
+    citations: tuple[str, ...]
+
+
+def standing_candidates(
+    view: CorpusView, exemplar_doc_ids: Sequence[str]
+) -> tuple[StandingCandidate, ...]:
+    """The standing passage candidates of a deliverable type's exemplars.
+
+    A unit (`standing_units`) is eligible with at least `STANDING_MIN_WORDS` words, or as a
+    table header row of at least `STANDING_MIN_TABLE_COLUMNS` columns. It recurs in a section
+    of another exemplar document that holds at least `STANDING_RECURRENCE_CONTAINMENT` of its
+    word 4-grams, or, for a table header, that has a table header with the same folded row.
+    When the exemplars span more than one top-level folder, that document must sit under
+    another top-level folder than the unit's own: the folder is the only sign of a different
+    project the code has. Recurring units that say the same thing (the same folded text, or
+    containment at the threshold both ways) are one candidate, represented by the first in
+    canonical order (document, section ordinal, position in the section).
+    """
+    docs = [view.document(d) for d in sorted(set(exemplar_doc_ids))]
+    spans_folders = len({_top_folder(d.rel_path) for d in docs}) > 1
+    sections = [
+        (doc, doc.section_id(s.ordinal))
+        for doc in docs
+        for s in sorted(doc.reading.sections, key=lambda s: s.ordinal)
+    ]
+    section_grams = {sid: _shingles(view.folded_sections[sid]) for _, sid in sections}
+    placed: list[_PlacedUnit] = []
+    for doc, sid in sections:
+        for unit in standing_units(view.markdown(sid)):
+            if unit.header:
+                header = unit.text.splitlines()[0]
+                if len(_table_cells(header)) < STANDING_MIN_TABLE_COLUMNS:
+                    continue
+                folded = fold_for_quote(header)
+                if not folded:
+                    continue
+            else:
+                folded = fold_for_quote(unit.text)
+                if len(_WORD.findall(folded)) < STANDING_MIN_WORDS:
+                    continue
+            placed.append(_PlacedUnit(doc, sid, unit, folded, _shingles(folded)))
+    headers: dict[str, set[str]] = {}
+    for p in placed:
+        if p.unit.header:
+            headers.setdefault(p.section_id, set()).add(p.folded)
+
+    def recurrences(p: _PlacedUnit) -> tuple[str, ...]:
+        found: list[str] = []
+        for doc, sid in sections:
+            if doc.doc_id == p.doc.doc_id or (
+                spans_folders and _top_folder(doc.rel_path) == _top_folder(p.doc.rel_path)
+            ):
+                continue
+            if p.unit.header:
+                held = p.folded in headers.get(sid, ())
+            else:
+                held = _containment(p.grams, section_grams[sid]) >= STANDING_RECURRENCE_CONTAINMENT
+            if held:
+                found.append(sid)
+        return tuple(found)
+
+    groups: list[tuple[_PlacedUnit, tuple[str, ...]]] = []
+    for p in placed:
+        where = recurrences(p)
+        if where and not any(p.says_the_same_as(holder) for holder, _ in groups):
+            groups.append((p, where))
+    return tuple(
+        StandingCandidate(f"candidate_{n:02d}", holder.unit.text, (holder.section_id, *where))
+        for n, (holder, where) in enumerate(groups, start=1)
+    )
+
+
+# The blueprint request carries every offered candidate in full, so the list is capped to keep
+# the request bounded however many exemplars a type has.
+MAX_STANDING_CANDIDATES = 60
+
+
+def offered_candidates(
+    view: CorpusView, candidates: Sequence[StandingCandidate]
+) -> tuple[StandingCandidate, ...]:
+    """At most `MAX_STANDING_CANDIDATES` of `candidates` (in canonical order): those that recur
+    in the most exemplar documents, ties in canonical order. The kept candidates stay in
+    canonical order and keep their IDs."""
+
+    def documents(c: StandingCandidate) -> int:
+        return len({view.sections[sid][0].doc_id for sid in c.citations})
+
+    ranked = sorted(range(len(candidates)), key=lambda i: (-documents(candidates[i]), i))
+    return tuple(candidates[i] for i in sorted(ranked[:MAX_STANDING_CANDIDATES]))
+
+
 @dataclass(frozen=True)
 class WriteBlueprint:
     operation: ClassVar[str] = "write_blueprint"
@@ -1057,6 +1311,9 @@ class WriteBlueprint:
     exemplar_outlines: tuple[str, ...]
     feedback_documents: tuple[str, ...]
     craft_leads: tuple[CraftLead, ...]
+    standing_candidates: tuple[StandingCandidate, ...]
+    # How many candidates `standing_candidates` found before `offered_candidates` cut them.
+    standing_candidates_found: int
     tools: tuple[Tool, ...]
     source_digest: str
     feedback: str | None = None
@@ -1068,25 +1325,48 @@ class WriteBlueprint:
         leads = "\n".join(
             f"- [{lead.section_id}] {lead.aspect}: {lead.statement}" for lead in self.craft_leads
         )
+        if self.standing_candidates:
+            candidates = "\n\n".join(
+                f"[{c.candidate_id}] found in {', '.join(c.citations)}\n{c.text}"
+                for c in self.standing_candidates
+            )
+            offered = len(self.standing_candidates)
+            if offered < self.standing_candidates_found:
+                candidates = (
+                    f"(this list was cut from {self.standing_candidates_found} candidates to"
+                    f" the {offered} that recur in the most exemplar documents)\n\n{candidates}"
+                )
+        elif len(dtype.exemplar_doc_ids) == 1:
+            candidates = (
+                "(none: this type has one exemplar document, so no text can recur in another;"
+                " return an empty standing_passages list)"
+            )
+        else:
+            candidates = (
+                "(none: no block of this type's exemplars recurs in another exemplar document;"
+                " return an empty standing_passages list)"
+            )
         text = (
             f"DELIVERABLE TYPE: {dtype.name}\nDESCRIPTION: {dtype.description}\n\n"
             f"EXEMPLAR OUTLINES:\n{exemplars}\n\nFEEDBACK DOCUMENTS:\n{feedback_docs}\n\n"
-            f"CRAFT LEADS (verify each in its section before using it):\n{leads or '(none)'}"
+            f"CRAFT LEADS (verify each in its section before using it):\n{leads or '(none)'}\n\n"
+            f"STANDING PASSAGE CANDIDATES (select by candidate_id; the first section listed"
+            f" holds the text as shown):\n{candidates}"
         )
         return f"{text}\n\n{self.feedback}" if self.feedback else text
 
 
 def check_blueprint(
-    draft: BlueprintDraft, dtype: DeliverableType, view: CorpusView
+    draft: BlueprintDraft,
+    dtype: DeliverableType,
+    candidates: Sequence[StandingCandidate],
+    view: CorpusView,
 ) -> Checked[Blueprint]:
+    """Structure, citations and the standing passage selection. Selected passages take their
+    text and citations from the candidates, in candidate order."""
     rejections: list[str] = []
     if not draft.outline:
         rejections.append("the outline is empty")
-    if not draft.exemplar_doc_ids:
-        rejections.append("no exemplar document IDs")
-    for doc_id in draft.exemplar_doc_ids:
-        if doc_id not in view.citable_ids:
-            rejections.append(f"exemplar {doc_id!r} is not a citable document ID")
     cited = [("outline", s.heading, s.citations) for s in draft.outline]
     cited += [("convention", g.statement, g.citations) for g in draft.conventions]
     cited += [("pitfall", g.statement, g.citations) for g in draft.pitfalls]
@@ -1096,6 +1376,18 @@ def check_blueprint(
         for citation in citations:
             if citation not in view.sections:
                 rejections.append(f"{kind} {label!r}: {citation!r} is not a citable section ID")
+    by_id = {c.candidate_id: c for c in candidates}
+    labels: dict[str, str] = {}
+    for selection in draft.standing_passages:
+        if selection.candidate_id not in by_id:
+            rejections.append(
+                f"standing passage {selection.candidate_id!r} is not a listed candidate_id"
+            )
+        elif selection.candidate_id in labels:
+            rejections.append(f"standing passage {selection.candidate_id!r} is selected twice")
+        elif not selection.label.strip():
+            rejections.append(f"standing passage {selection.candidate_id!r} has a blank label")
+        labels.setdefault(selection.candidate_id, selection.label.strip())
     if rejections:
         return Checked.reject(rejections)
 
@@ -1109,7 +1401,7 @@ def check_blueprint(
         Blueprint(
             deliverable_type=dtype.name,
             description=draft.description,
-            exemplar_doc_ids=tuple(dict.fromkeys(draft.exemplar_doc_ids)),
+            exemplar_doc_ids=dtype.exemplar_doc_ids,
             feedback_doc_ids=dtype.feedback_doc_ids,
             outline=tuple(
                 BlueprintSection(
@@ -1121,6 +1413,11 @@ def check_blueprint(
             ),
             conventions=guidance(draft.conventions),
             pitfalls=guidance(draft.pitfalls),
+            standing_passages=tuple(
+                StandingPassage(label=labels[c.candidate_id], text=c.text, citations=c.citations)
+                for c in candidates
+                if c.candidate_id in labels
+            ),
         )
     )
 
@@ -1153,14 +1450,24 @@ def write_blueprint(
         f"{d}: {view.document(d).reading.card.title}" for d in dtype.feedback_doc_ids
     )
     leads = craft_leads(view, (*dtype.exemplar_doc_ids, *dtype.feedback_doc_ids))
+    found = standing_candidates(view, dtype.exemplar_doc_ids)
+    candidates = offered_candidates(view, found)
     blueprint = generate_checked(
         f"blueprint for {dtype.name!r}",
         lambda feedback: gateway.run_agent(
             WriteBlueprint(
-                dtype, outlines, feedback_docs, leads, tools.tools, tools.digest, feedback
+                dtype,
+                outlines,
+                feedback_docs,
+                leads,
+                candidates,
+                len(found),
+                tools.tools,
+                tools.digest,
+                feedback,
             )
         ),
-        lambda draft: check_blueprint(draft, dtype, view),
+        lambda draft: check_blueprint(draft, dtype, candidates, view),
     )
     dropped = refusals = 0
 

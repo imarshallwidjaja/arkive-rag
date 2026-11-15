@@ -39,3 +39,10 @@ One flight day in late March 2026 and 6 working days of processing.
 ## 6. Fee
 
 The fixed fee is GBP 21,700, excluding VAT.
+
+## 7. Standard terms
+
+Quillfen Geomatics carries out every survey under its Survey Quality Manual
+QG-QM-04. Survey results describe the seabed or ground surface on the survey
+dates only; they are not a design, dredging or volume certificate for any later
+date.

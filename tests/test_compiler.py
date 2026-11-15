@@ -792,7 +792,6 @@ MEMO_TYPE = DeliverableTypeDraft(
 )
 MEMO_BLUEPRINT = BlueprintDraft(
     description="A survey memo.",
-    exemplar_doc_ids=["doc_001"],
     outline=[
         BlueprintSectionDraft(heading="Results", purpose="Findings.", citations=["doc_001_sec_001"])
     ],
@@ -800,6 +799,7 @@ MEMO_BLUEPRINT = BlueprintDraft(
         GuidanceDraft(statement="State areas in hectares.", citations=["doc_001_sec_001"])
     ],
     pitfalls=[],
+    standing_passages=[],
 )
 _TOKEN = re.compile(r"\[doc_\d+:doc_\d+_sec_\d+\]")
 

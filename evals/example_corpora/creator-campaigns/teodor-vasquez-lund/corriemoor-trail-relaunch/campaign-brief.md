@@ -34,3 +34,9 @@ them on in store.
 
 - Mention the 2-year sole guarantee in every spot
 - No comparison with other brands
+
+## Disclosure
+
+Every creator post made under this brief is labelled "Paid partnership" in its
+first line or in its first three seconds of video. Hollin & Pike Creative keeps
+each signed creator agreement on file for two years after the flight ends.

@@ -33,3 +33,9 @@ action): find the carton in the chilled aisle.
 
 - Co-op logo in the last two seconds of every video
 - No claims about health benefits
+
+## Disclosure
+
+Every creator post made under this brief is labelled "Paid partnership" in its
+first line or in its first three seconds of video. Hollin & Pike Creative keeps
+each signed creator agreement on file for two years after the flight ends.

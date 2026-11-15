@@ -78,9 +78,9 @@
     },
     {
       "scenario_id": "draft-from-blueprint",
-      "description": "Drafts a campaign brief starting from the topic guide's blueprint, using only the facts given.",
-      "prompt": "In the creator-campaigns topic, draft a short campaign brief for a new client, Pellow Bakery: spring 2027, budget GBP 9,000, channel email newsletter. Start from the topic guide's blueprint for campaign briefs, and use no project facts other than mine.",
-      "required_tools": ["get_topic_guide"],
+      "description": "Drafts a campaign brief from the full blueprint, which only get_blueprint returns, reproducing one of its standing passages and using only the project facts given.",
+      "prompt": "In the creator-campaigns topic, draft a short campaign brief for a new client, Pellow Bakery: spring 2027, budget GBP 9,000, channel email newsletter. Follow the topic's blueprint for campaign briefs, and use no project facts other than mine.",
+      "required_tools": ["get_blueprint"],
       "topics_queried": ["creator-campaigns"],
       "answer_groups": [
         ["Pellow"],
@@ -89,7 +89,8 @@
         ["call to action", "CTA"],
         ["measure", "KPI"],
         ["mandator"]
-      ]
+      ],
+      "answer_reproduces_standing_passage_of": "creator-campaigns"
     },
     {
       "scenario_id": "cross-topic-question",

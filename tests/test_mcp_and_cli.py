@@ -93,11 +93,12 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
             ("grep", {"topic": "soils", "pattern": "330.9"}),
             ("lookup_glossary", {"topic": marine}),
             ("lookup_glossary", {"topic": marine, "query": "lowest astronomical"}),
+            ("get_blueprint", {"topic": marine, "deliverable_type": "Survey Memorandum"}),
         ],
         FakeGateway().embed_query,
     )
     topics, guide, memos, outline, hits, matches, section, page, soils, soils_grep = results[:10]
-    terms, lat = results[10:]
+    terms, lat, memo_blueprint = results[10:]
 
     assert [(t["topic"], t["document_count"]) for t in data(topics)] == [
         ("bathymetry", 4),
@@ -110,10 +111,24 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
         ["p101-harbour-lidar", "p102-estuary-multibeam", "p103-reef-sonar"],
     )
     assert "[doc_00" in data(guide)["guide_markdown"]
-    assert [b["deliverable_type"] for b in data(guide)["blueprints"]] == [
-        "proposal",
-        "survey memorandum",
+    # The guide carries blueprint summaries; get_blueprint returns one in full.
+    assert data(guide)["blueprints"] == [
+        {
+            "deliverable_type": "proposal",
+            "description": "How the collection writes a proposal.",
+            "exemplar_count": 1,
+        },
+        {
+            "deliverable_type": "survey memorandum",
+            "description": "How the collection writes a survey memorandum.",
+            "exemplar_count": 1,
+        },
     ]
+    blueprint = data(memo_blueprint)
+    assert blueprint["deliverable_type"] == "survey memorandum"
+    assert blueprint["outline"] and blueprint["conventions"]
+    # A single exemplar shows no recurrence, so the memorandum has no standing passages.
+    assert blueprint["standing_passages"] == []
     assert data(guide)["glossary_terms"] == ["LAT"]
     assert data(guide)["curator_notes"][0]["scope_path"] == "p103-reef-sonar/AGENTS.md"
     assert [d["rel_path"] for d in data(memos)] == [
@@ -152,10 +167,12 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
             ("view_page", {"topic": "bathymetry", "doc_id": "doc_001", "page_number": 9}),
             ("grep", {"topic": "bathymetry", "pattern": "x", "filters": {"stage": "memo"}}),
             ("lookup_glossary", {"topic": "bathymetry", "query": " "}),
+            ("get_blueprint", {"topic": "bathymetry", "deliverable_type": "press release"}),
         ],
         None,
     )
-    search, grep, section, page, bad_topic, bad_project, bad_page, bad_facet, blank = results
+    search, grep, section, page, bad_topic, bad_project, bad_page, bad_facet, blank = results[:9]
+    (bad_type,) = results[9:]
 
     assert "OPENAI_API_KEY" in error_text(search) and "grep" in error_text(search)
     assert len(data(grep)) == 1
@@ -166,6 +183,7 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
     assert error_text(bad_page).endswith("doc_001 has no page 9; it has pages 1-2")
     assert error_text(bad_facet).endswith("unknown facet 'stage'; valid facets: project, client")
     assert "glossary query must not be blank" in error_text(blank)
+    assert error_text(bad_type).endswith("valid types: proposal, survey memorandum")
 
 
 def test_catalog_rejects_two_snapshots_with_the_same_topic(

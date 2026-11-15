@@ -34,3 +34,9 @@ action): book the night crossing.
 
 - Show the ferry at night in the first two seconds
 - Partner logo only on the joint post
+
+## Disclosure
+
+Every creator post made under this brief is labelled "Paid partnership" in its
+first line or in its first three seconds of video. Hollin & Pike Creative keeps
+each signed creator agreement on file for two years after the flight ends.

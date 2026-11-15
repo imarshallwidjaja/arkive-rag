@@ -32,3 +32,9 @@ for delivery before the holidays.
 
 - Show the 12-hour heat claim with its test reference KH-TR-118
 - Delivery cut-off date in every asset
+
+## Disclosure
+
+Every creator post made under this brief is labelled "Paid partnership" in its
+first line or in its first three seconds of video. Hollin & Pike Creative keeps
+each signed creator agreement on file for two years after the flight ends.

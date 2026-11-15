@@ -10,7 +10,8 @@
         "environment": {
           "OPENAI_API_KEY": "{env:OPENAI_API_KEY}"
         },
-        "codemode": false
+        "codemode": false,
+        "timeout": { "startup": 180000 }
       }
     }
   },

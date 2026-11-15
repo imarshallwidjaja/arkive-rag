@@ -46,3 +46,10 @@ Processing and reporting take 9 working days after demobilisation.
 
 The fixed fee is GBP 38,400, excluding VAT, with GBP 1,150 per extra survey day
 if weather stops work.
+
+## 7. Standard terms
+
+Quillfen Geomatics carries out every survey under its Survey Quality Manual
+QG-QM-04. Survey results describe the seabed or ground surface on the survey
+dates only; they are not a design, dredging or volume certificate for any later
+date.

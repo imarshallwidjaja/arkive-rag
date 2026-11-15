@@ -36,11 +36,12 @@ def _tool(
     arguments: dict[str, Any],
     status: str = "completed",
     files: tuple[str, ...] = (),
+    output: str = "{}",
 ) -> str:
     state: dict[str, Any] = {"status": status, "input": arguments}
     if status == "completed":
-        state["output"] = "{}"
-        content: list[dict[str, Any]] = [{"type": "text", "text": "{}"}]
+        state["output"] = output
+        content: list[dict[str, Any]] = [{"type": "text", "text": output}]
         content += [{"type": "file", "uri": "data:,", "mime": mime} for mime in files]
         state["metadata"] = {"content": content}
     else:
@@ -72,6 +73,97 @@ def test_shipped_scenario_file_covers_the_example_corpora_and_names_no_facet() -
     assert sorted(p.name for p in corpora.iterdir()) == sorted(scenario_file.topics)
     every_prompt = " ".join(s.prompt for s in scenario_file.scenarios)
     assert "document_role" not in every_prompt and "creator=" not in every_prompt
+    assert len(scenario_file.scenarios) == 10
+
+
+DISCLOSURE = (
+    'Every creator post made under this brief is labelled "Paid partnership" in its first'
+    " line or in its first three seconds of video."
+)
+
+
+def _blueprint_output(*passages: str) -> str:
+    return json.dumps(
+        {
+            "deliverable_type": "Campaign brief",
+            "standing_passages": [
+                {"label": "Disclosure", "text": t, "citations": ["doc_002_sec_007"]}
+                for t in passages
+            ],
+        }
+    )
+
+
+def test_shipped_drafting_scenario_needs_the_full_blueprint_and_a_standing_passage() -> None:
+    (draft,) = [
+        s
+        for s in ScenarioFile.load(runner.DEFAULT_SCENARIOS).scenarios
+        if s.scenario_id == "draft-from-blueprint"
+    ]
+    topic = {"topic": "creator-campaigns"}
+    request = topic | {"deliverable_type": "campaign brief"}
+    header = "| Metric | Target |\n| --- | --- |"
+
+    def brief(mandatories: str) -> str:
+        return _event(
+            "text",
+            type="text",
+            text="Campaign brief: Pellow Bakery, budget GBP 9,000. Objective: ... One CTA."
+            f" Measures: ... Mandatories: {mandatories}",
+        )
+
+    # Emphasis, quotes and case do not matter; a long passage needs only its first 12 words,
+    # so a fact the agent adapts later in the passage still counts.
+    reproduced = brief(
+        "*Every creator post made under this brief is labelled Paid Partnership* in the"
+        " newsletter header."
+    )
+    unreproduced = brief("say the post is sponsored.")
+    guide = _tool("arkive_get_topic_guide", topic)
+    blueprint = _tool("arkive_get_blueprint", request, output=_blueprint_output(DISCLOSURE))
+    with_header = _tool("arkive_get_blueprint", request, output=_blueprint_output(header))
+    bare = _tool("arkive_get_blueprint", request, output=_blueprint_output())
+    unknown = _tool("arkive_get_blueprint", topic | {"deliverable_type": "press kit"}, "error")
+
+    assert _failed(draft, parse_events([guide, blueprint, reproduced])) == []
+    assert _failed(draft, parse_events([with_header, brief("| metric | target |")])) == []
+    assert _failed(draft, parse_events([blueprint, unreproduced])) == [
+        "answer reproduces a standing passage"
+    ]
+    # A blueprint without standing passages fails a precondition of the snapshot, named as
+    # such, rather than the agent's reproduction check.
+    outcomes = evaluate(draft, parse_events([bare, reproduced]), 0, FACETS)
+    (missing,) = [o for o in outcomes if not o.passed]
+    assert missing.check == "precondition: blueprint has a standing passage"
+    assert "the served snapshot, not the agent, fails this scenario" in missing.detail
+    # The guide holds only blueprint summaries, so a draft from it alone misses the checks.
+    assert _failed(draft, parse_events([guide, reproduced])) == [
+        "called: get_blueprint",
+        "answer reproduces a standing passage",
+    ]
+    assert _failed(draft, parse_events([unknown, reproduced])) == [
+        "called: get_blueprint",
+        "topics queried",
+        "answer reproduces a standing passage",
+    ]
+    # Only a blueprint of the scenario's topic counts, and of those the last one fetched.
+    elsewhere = _tool(
+        "arkive_get_blueprint",
+        {"topic": "coastal-survey-projects", "deliverable_type": "proposal"},
+        output=_blueprint_output(DISCLOSURE),
+    )
+    other_type = _tool(
+        "arkive_get_blueprint",
+        topic | {"deliverable_type": "post-campaign review"},
+        output=_blueprint_output(header),
+    )
+    assert _failed(draft, parse_events([guide, elsewhere, reproduced])) == [
+        "answer reproduces a standing passage"
+    ]
+    assert _failed(draft, parse_events([blueprint, other_type, reproduced])) == [
+        "answer reproduces a standing passage"
+    ]
+    assert _failed(draft, parse_events([other_type, blueprint, reproduced])) == []
 
 
 def test_scenario_file_refuses_duplicates_unknown_tools_and_undeclared_topics() -> None:
@@ -91,6 +183,8 @@ def test_scenario_file_refuses_duplicates_unknown_tools_and_undeclared_topics() 
         load(case, case)
     with pytest.raises(ValidationError, match="undeclared topics"):
         load(case | {"topics_queried": ["campaigns"]})
+    with pytest.raises(ValidationError, match="undeclared topics"):
+        load(case | {"answer_reproduces_standing_passage_of": "campaigns"})
     with pytest.raises(ValidationError, match="required_tools"):
         load(case | {"required_tools": ["read"]})
     with pytest.raises(ValidationError, match="condition"):

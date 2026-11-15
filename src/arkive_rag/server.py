@@ -16,6 +16,7 @@ from mcp.types import ImageContent, TextContent
 from arkive_rag import __version__
 from arkive_rag.models import (
     ArkiveError,
+    Blueprint,
     DocumentInfo,
     DocumentOutline,
     GlossaryLookup,
@@ -32,29 +33,40 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 INSTRUCTIONS = """\
 Arkive serves curated reference collections ("topics"). Call list_topics first if the
-topic slug is unknown. Each topic has facets (ways to filter it, such as client, project,
-author or campaign); list_documents, search and grep accept `filters`, a mapping from facet
-name to one value or alias, and combine several facets with AND. Then follow the mode that
+topic slug is unknown; it lists each topic's facets and the deliverable types that have a
+blueprint. Facets are ways to filter a topic, such as client, project, author or
+campaign; list_documents, search and grep accept `filters`, a mapping from facet name to
+one value or alias, and combine several facets with AND. Then follow the mode that
 matches the user's request:
 
 1. Answering questions about the corpus:
    - Use search for semantic or keyword queries and grep for exact strings, numbers or
-     filenames. Read get_topic_guide when scope or missing material matters, and call
-     lookup_glossary when a term, acronym or abbreviation is unclear. Use read_section for
-     full context and view_page only when a chart, map, table layout or visual detail
-     matters.
+     filenames. get_topic_guide helps when the collection's scope, its curator notes or
+     missing material matter. Call lookup_glossary when a term, acronym or abbreviation
+     is unclear. Use read_section for full context and view_page only when a chart, map,
+     table layout or visual detail matters.
    - Cite every fact from the corpus by doc_id, section_id and page numbers.
 
 2. Drafting a new deliverable from the user's own inputs:
-   - Call get_topic_guide and start from the blueprint for the deliverable type: its
-     outline, conventions and reviewer pitfalls. Read the blueprint's feedback documents,
-     then call get_document_outline and read_section on its exemplars to learn structure,
-     standard tables, caveats, references and disclaimers. Use lookup_glossary for the
-     collection's terminology.
-   - Output a clean, standalone deliverable grounded strictly in the user's inputs: NEVER
-     include internal Arkive doc_id/section_id citations, references to exemplar or
-     feedback documents, or any name, date, address or figure that does not appear in the
-     user's inputs.
+   - Call get_blueprint for the deliverable type and follow its outline, conventions
+     and reviewer pitfalls.
+   - For each section whose layout matters, read one of its cited exemplar sections
+     with read_section and mirror its heading levels and table column headers, not its
+     project-specific headings.
+   - Every fact about the user's project (its client and other parties, people, places,
+     dates, quantities, budgets, targets, findings, identifiers, file names) comes only
+     from the user's inputs. This rule takes precedence over the next one.
+   - The blueprint's standing passages are the collection's own house text. Reproduce
+     them with their wording, without commentary about where they come from, and keep
+     their organisation names, method references and attributions as written. Adapt or
+     leave out only the part of a passage that belongs to one particular project (its
+     client, site, dates, quantities or results), using the user's inputs. Names,
+     references and attributions from the corpus may be reused only when they appear in
+     a standing passage.
+   - Where the user's inputs enumerate items (files, deliverables, parameters,
+     results), list every item in full, never as patterns or "etc.".
+   - Write a standalone deliverable: no Arkive doc_id or section_id, and no mention of
+     the exemplar or feedback documents.
 """
 
 
@@ -121,10 +133,23 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
 
     @server.tool()
     def get_topic_guide(topic: str) -> TopicGuide:
-        """Cited overview of a topic, its curator notes, facet definitions, deliverable
-        blueprints and glossary terms. Read this before searching or drafting."""
+        """Cited overview of a topic: its scope, curator notes, facet definitions, glossary
+        terms and a summary of each deliverable blueprint (type, description, number of
+        exemplars). get_blueprint returns a blueprint in full."""
         with _as_tool_errors():
             return catalog.get(topic).guide()
+
+    @server.tool()
+    def get_blueprint(topic: str, deliverable_type: str) -> Blueprint:
+        """The full writing blueprint for one deliverable type: section outline with cited
+        exemplar sections, conventions, reviewer pitfalls, exemplar and feedback documents,
+        and standing passages: the collection's house text, which recurs in another exemplar
+        document, exactly as it appears in its first cited section. When drafting, keep a
+        passage's organisation names, method references and attributions as written, and
+        adapt only the part that belongs to one particular project. The type is matched
+        ignoring case and surrounding spaces."""
+        with _as_tool_errors():
+            return catalog.get(topic).blueprint(deliverable_type)
 
     @server.tool()
     def list_documents(topic: str, filters: dict[str, str] | None = None) -> list[DocumentInfo]:
@@ -168,9 +193,11 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def read_section(topic: str, section_id: str) -> SectionReadView:
         """Full Markdown of one section, with the IDs of its neighbouring sections.
 
-        When drafting a new deliverable, reuse structure, framing, caveats and standard
-        boilerplate; never copy another document's names, dates, addresses or figures, and
-        never cite internal doc_id/section_id in a standalone deliverable.
+        When drafting a new deliverable, mirror an exemplar section's layout (heading levels,
+        table column headers). Reuse wording, names, references and attributions only from
+        the blueprint's standing passages, which are house text kept as written apart from
+        their project-specific parts; take every fact about the user's project from the
+        user's inputs, and never cite doc_id or section_id in the deliverable.
         """
         with _as_tool_errors():
             return catalog.get(topic).read_section(section_id)

@@ -546,6 +546,7 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
         [
             "list_topics",
             "get_topic_guide",
+            "get_blueprint",
             "list_documents",
             "get_document_outline",
             "search",

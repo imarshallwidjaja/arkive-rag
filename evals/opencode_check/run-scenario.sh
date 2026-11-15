@@ -5,7 +5,10 @@
 # servers to connect, so a server that needs a few seconds to start (arkive-rag opens every
 # snapshot and its embedding matrix) is missing from the model's tool list. This script starts
 # a private `opencode serve`, waits until the `arkive` server reports connected, and only then
-# runs the prompt against that server. Exit 3: the MCP server did not connect within 120 s.
+# runs the prompt against that server. On a loaded machine the server can take tens of seconds
+# to start, and OpenCode never retries a server that missed its startup timeout, so
+# opencode.json sets that timeout to 180 s and this script waits up to 240 s, which also
+# covers `opencode serve` starting. Exit 3: the MCP server failed or did not connect in time.
 #
 # The container runs as the invoking host user, which has no account or home in the image,
 # so HOME and the working directory live under /tmp.
@@ -30,15 +33,20 @@ mcp_list() {
     timeout -s KILL 10 opencode mcp list --server "$server"
 }
 
-deadline=$(($(date +%s) + 120))
-until mcp_list 2>/dev/null | grep -q 'arkive *connected'; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-        echo "arkive MCP server did not connect:" >&2
-        mcp_list >&2 || true
-        tail -n 20 /tmp/opencode-serve.log >&2
-        exit 3
-    fi
-    sleep 1
+started=$(date +%s)
+deadline=$((started + 240))
+while :; do
+    status=$(mcp_list 2>/dev/null | grep 'arkive ' || true)
+    case $status in
+    *connected*) break ;;
+    *failed*) problem="failed after $(($(date +%s) - started)) s" ;;
+    *) [ "$(date +%s)" -lt "$deadline" ] && { sleep 1; continue; }
+       problem="did not connect within 240 s" ;;
+    esac
+    echo "arkive MCP server $problem:" >&2
+    mcp_list >&2 || true
+    tail -n 20 /tmp/opencode-serve.log >&2
+    exit 3
 done
 
 # `--` ends the options, so a prompt that begins with a dash stays the message.

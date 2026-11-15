@@ -49,6 +49,7 @@ from arkive_rag.models import (
     OrganisationDraft,
     PageExtraction,
     SenseDraft,
+    StandingPassageSelection,
     StatedAttribute,
     TermDraft,
     fold_for_quote,
@@ -101,7 +102,9 @@ class FakeGateway:
     above. Organisation makes one path-bound facet from the top-level folders (named by a
     `Folders: <name>` line in a root curator note, else `project`), one content-bound facet per
     attribute with two or more values, and one deliverable type per observed type. The
-    blueprint agent calls the tools it is given. `judge` answers 0.9 when every double-quoted
+    blueprint agent calls the tools it is given and selects every standing passage candidate
+    of its request except `Key: value` lines (such as a `Convention:` line), labelled with
+    the heading of the candidate's first section. `judge` answers 0.9 when every double-quoted
     span of a predicate occurs in the evidence, else 0.1.
 
     Each `*_script` queues responses consumed before the deterministic answer. Every request
@@ -310,9 +313,18 @@ class FakeGateway:
         first = _call(tools["outline"], doc_id=dtype.exemplar_doc_ids[0])
         conventions = lines(dtype.exemplar_doc_ids, "Convention")
         pitfalls = lines(dtype.feedback_doc_ids, "Reviewer")
+        selected = [
+            StandingPassageSelection(
+                candidate_id=c.candidate_id,
+                label=generic_heading(
+                    _call(tools["read_section"], section_id=c.citations[0])["heading_path"]
+                ),
+            )
+            for c in request.standing_candidates
+            if not _KEY_LINE.fullmatch(c.text)
+        ]
         return BlueprintDraft(
             description=f"How the collection writes a {dtype.name}.",
-            exemplar_doc_ids=list(dtype.exemplar_doc_ids),
             outline=[
                 BlueprintSectionDraft(
                     heading=generic_heading(s["heading_path"]),
@@ -323,6 +335,7 @@ class FakeGateway:
             ],
             conventions=conventions,
             pitfalls=pitfalls,
+            standing_passages=selected,
         )
 
     def judge(self, operation: str, evidence: str, predicates: Sequence[str]) -> list[float | None]:
@@ -650,6 +663,12 @@ BATHYMETRY_CORPUS = {
     ),
 }
 
+# A standing section every campaign brief ends with, whatever the campaign.
+HOUSE_DISCLOSURE = (
+    "## Disclosure\n\nEvery sponsored post carries the label *Paid partnership* in its first"
+    " line, and the studio keeps each signed creator agreement for two years.\n"
+)
+
 # A campaign library organised by campaign folder, with authors and channels stated in the
 # documents: a different organisation from the project folders above.
 MARKETING_CORPUS = {
@@ -662,14 +681,16 @@ MARKETING_CORPUS = {
         "Author: Dana Reyes\n\n## Audience\n\nLapsed members. **Churn** is the share of"
         " members who stop buying within a year.\n\n## Messaging\n\n"
         "Convention: Lead with the customer benefit before the product name.\n\n"
-        "**CTA** (call to action) is the button that closes every email.\n"
+        "**CTA** (call to action) is the button that closes every email.\n\n"
+        f"{HOUSE_DISCLOSURE}"
     ),
     "spring-launch/brief.md": (
         "# Spring Launch Brief\n\nDeliverable: campaign brief\nChannel: Social\n"
         "Author: Dana Reyes\n\n## Audience\n\nFirst-time buyers aged 25 to 34.\n\n"
         "## Messaging\n\nConvention: Lead with the customer benefit before the product name."
         "\n\n**CTA** (call to action) means the single step a reader should take next.\n\n"
-        "Write every line for the **ICP**.\n"
+        "Write every line for the **ICP**.\n\n"
+        f"{HOUSE_DISCLOSURE}"
     ),
     "spring-launch/review.md": (
         "# Spring Brief Review\n\nDeliverable: review notes\nChannel: Social\n"
