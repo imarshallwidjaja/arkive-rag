@@ -47,8 +47,10 @@ must be different files outside the corpus directory.
   outranks the model's inference. It is also compiled as a document
   (`is_curator_note`, chunk kind `guidance`), so status questions such as
   "where is the reef case study?" match the note in both `search` and `grep`.
-  A curator note is not citable: no glossary entry, blueprint or guide
-  citation may point at it, and the blueprint tools cannot read it. A
+  Induction cannot cite a curator note: no glossary entry, blueprint or guide
+  citation may point at it, and the blueprint tools cannot read it. An agent
+  answering a question from a note cites its `doc_id` and `section_id` like
+  any other document's. A
   path-bound facet value still covers a note in its folder, so a project
   filter also finds that project's note.
 - Documents are numbered in sorted path order: `doc_001`, sections
@@ -397,8 +399,9 @@ order. Adding a file requests the reading of that file only; induction and
 the embeddings are requested again because the corpus changed. A request with
 identical inputs can use a cached response, including in a subset build; its
 inputs cover everything the request can see. Blueprint agent requests also key
-on a digest of every section their tools can read, so runs over different
-corpora are not reused. The first valid entry stored under a key is canonical: when two build
+on a digest of every section their tools can read, so a cached run is reused
+only when the request text and all of that source text are unchanged. The
+first valid entry stored under a key is canonical: when two build
 threads miss the same key at once, the second writer returns the first
 writer's value. An entry that no longer decodes or validates is a miss and is
 replaced. A new cache file is created with mode `0600`.
@@ -623,7 +626,8 @@ turns, tool calls and the query embeddings that returned a vector
 (`search_embed_calls`). `--max-cost` sets one spend limit, a positive finite
 number of USD, over every model call of the evaluation. Once the estimate
 reaches the limit, the next provider attempt stops the evaluation with an
-error, the usage line and a non-zero exit, and writes no report. If the last
+error, the usage line and a non-zero exit, and writes no report; a report an
+earlier run left in `--out` stays as it was. If the last
 request takes the estimate past the limit, the evaluation finishes normally.
 `--trace` turns on hosted Agents SDK tracing, and `results.json` (`usage`) and
 `report.md` (Usage) record calls, tokens and the estimated cost per operation.

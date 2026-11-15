@@ -56,11 +56,13 @@ validation rules. `search` and `grep` take repeated `--filter FACET=VALUE`
 (a canonical value or an alias; several facets combine with AND), and the MCP
 tools `list_documents`, `search` and `grep` take the same `filters` mapping.
 An `AGENTS.md` anywhere in the corpus is a curator note: it guides induction,
-appears in the topic guide and is searchable, but is never cited. With
-`--cache`, rebuilding an unchanged corpus makes no provider calls. Snapshots
-use schema `3.0`. Rebuild older snapshots from their corpus. An earlier build
-of schema `3.0` may have blueprint rows without standing passages; those rows
-are refused as malformed at open and the snapshot must also be rebuilt.
+appears in the topic guide and is searchable. The guide, glossary and
+blueprints never cite it; an agent answering a question from a note cites it
+like any other document. With `--cache`, rebuilding an unchanged corpus makes
+no provider calls. Snapshots use schema `3.0`. Rebuild older snapshots from
+their corpus. An earlier build of schema `3.0` may have blueprint rows without
+standing passages; those rows are refused as malformed at open and the
+snapshot must also be rebuilt.
 
 The MCP server has ten tools. `get_topic_guide` returns the guide, curator
 notes, facets, glossary terms and a summary of each blueprint;
@@ -111,7 +113,8 @@ retrieval filters and the holdout guards of every layer it will run. An
 agent run with status `provider_error`, `incomplete`, `empty_answer` or
 `max_turns` is recorded without credit and evaluation continues. A failure
 that stops the evaluation, such as a spend limit blocking the next attempt or
-an unexpected tool failure, prints usage, exits non-zero and writes no report.
+an unexpected tool failure, prints usage, exits non-zero and writes no report;
+a report that an earlier run left in `--out` stays as it was.
 Invalid input is rejected before model calls and output creation.
 `--out` is required. Outputs quote corpus facts, so choose a private directory
 outside this repository; the runner refuses an `--out` or `--cache` that

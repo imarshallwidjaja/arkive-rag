@@ -43,6 +43,7 @@ from evals.agents import (
     select_holdout_sources,
     with_server_instructions,
 )
+from evals.opencode_check.scenarios import ARKIVE_TOOLS
 from evals.run import _layer2_report, make_private_directory, write_private_text
 from evals.run import app as eval_app
 from evals.schema import (
@@ -542,20 +543,10 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
     names, grep, page, missing, server_instructions = anyio.run(run)
     assert server_instructions == INSTRUCTIONS
     assert with_server_instructions("Answer.", "  ") == "Answer."
-    assert names == sorted(
-        [
-            "list_topics",
-            "get_topic_guide",
-            "get_blueprint",
-            "list_documents",
-            "get_document_outline",
-            "search",
-            "grep",
-            "read_section",
-            "view_page",
-            "lookup_glossary",
-        ]
-    )
+    # The OpenCode check keeps its own closed list of Arkive tools; it must name exactly the
+    # tools the server registers, or the check rejects a valid call as a non-Arkive tool.
+    assert names == sorted(ARKIVE_TOOLS)
+    assert len(names) == 10
     assert isinstance(grep, str) and "330.9" in grep
     assert isinstance(page, ToolReply) and page.images[0].mime_type == "image/webp"
     assert isinstance(missing, str) and missing.startswith("ERROR:")
