@@ -45,14 +45,16 @@ matches the user's request:
      missing material matter. Call lookup_glossary when a term, acronym or abbreviation
      is unclear. Use read_section for full context and view_page only when a chart, map,
      table layout or visual detail matters.
-   - Cite every fact from the corpus by doc_id, section_id and page numbers.
+   - Cite every fact from the corpus by doc_id and section_id, with page numbers where
+     the source has rendered pages. Markdown sources have no pages.
 
 2. Drafting a new deliverable from the user's own inputs:
    - Call get_blueprint for the deliverable type and follow its outline, conventions
      and reviewer pitfalls.
    - For each section whose layout matters, read one of its cited exemplar sections
-     with read_section and mirror its heading levels and table column headers, not its
-     project-specific headings.
+     with read_section and mirror its heading levels and generic table column headers.
+     Do not reuse project-specific headings or facts. Reuse other wording only from
+     standing passages.
    - Every fact about the user's project (its client and other parties, people, places,
      dates, quantities, budgets, targets, findings, identifiers, file names) comes only
      from the user's inputs. This rule takes precedence over the next one.
@@ -193,9 +195,10 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def read_section(topic: str, section_id: str) -> SectionReadView:
         """Full Markdown of one section, with the IDs of its neighbouring sections.
 
-        When drafting a new deliverable, mirror an exemplar section's layout (heading levels,
-        table column headers). Reuse wording, names, references and attributions only from
-        the blueprint's standing passages, which are house text kept as written apart from
+        When drafting a new deliverable, mirror an exemplar section's heading levels and
+        generic table column headers, but not its project-specific headings or facts. Reuse
+        other wording, names, references and attributions only from the blueprint's standing
+        passages, which are house text kept as written apart from
         their project-specific parts; take every fact about the user's project from the
         user's inputs, and never cite doc_id or section_id in the deliverable.
         """
@@ -220,10 +223,10 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
 
     @server.tool()
     def lookup_glossary(topic: str, query: str | None = None) -> GlossaryLookup:
-        """The topic's glossary. Without `query`, every term with whether the corpus defines
-        it. With `query`, the full entries whose term or alias contains it: each sense has a
-        definition and section citations, and a null definition means the corpus uses the
-        term there without defining it."""
+        """The topic's glossary. Without `query`, every term with whether a sense has a
+        definition. With `query`, the full entries whose term or alias contains it: each sense has
+        section citations. A null definition means no definition was established from its
+        cited evidence; it does not prove the corpus never defines the term."""
         with _as_tool_errors():
             return catalog.get(topic).lookup_glossary(query)
 

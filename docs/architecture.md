@@ -82,9 +82,10 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    transcripts for charts, maps and figures. The image decides what the page
    says, which repairs broken glyph encodings in the text layer; headings keep
    their visible section numbers. The previous page's tail lets the model set
-   the continuation flags below, so page N's request depends on page N-1's
-   transcript: a changed page also changes the cache keys, and so the
-   transcription, of every later page of its document.
+   the continuation flags below. Page N receives the last 1,200 characters of
+   page N-1's transcribed blocks, excluding visual transcripts. A changed page
+   causes the following page to be re-transcribed only if that tail changes;
+   propagation stops when a page's tail is unchanged.
 3. **Check fidelity.** Running headers, footers and page numbers are removed
    before anchors are collected: a top or bottom line repeated exactly on
    three or more pages, or repeated apart from a leading or trailing number
@@ -113,11 +114,12 @@ moved. Each PDF, Word and PowerPoint file follows one path:
 5. **Chunk pieces.** `section_pieces` packs paragraphs and callouts into prose
    pieces of up to 1,800 characters, splitting an oversized paragraph at
    sentence ends. A table up to 2,400 characters is one `table` piece; a larger
-   table is split on row boundaries into pieces of up to 2,000 characters, each
-   repeating the header and separator rows. Each visual transcript is its own
-   `visual` piece. No piece exceeds 6,000 characters: an oversized sentence,
-   table row or visual is wrapped at line breaks or spaces, and table pieces
-   keep the header. A piece has its own page span and no ID or breadcrumb yet.
+   table is split on row boundaries with a normal packing target of 2,000
+   characters, repeating the header and separator rows. A very large header
+   can make a table piece exceed that target. Each visual transcript is its own
+   `visual` piece. No piece exceeds 6,000 characters: a final split wraps
+   oversized content at line breaks or spaces and does not repeat a table
+   header on later fragments. A piece has its own page span and no ID or breadcrumb yet.
 6. **Observe.** The document's sections are packed in order into batches of
    at most 24,000 characters (a larger section is split at line breaks or
    spaces into pieces within that size, each keeping the section's ordinal), and
@@ -212,7 +214,8 @@ not confirm.
    are stripped, one per folded form and sorted. Then `check_definitions`
    asks the Decisions API whether the cited sections establish each
    definition; below 0.5 or refused, the definition becomes `null` and is
-   counted.
+   counted. `unsupported_definitions` counts proposed definitions demoted by
+   this check, not senses the generator already left null.
 4. **Blueprints** (`write_blueprint`, medium effort, one Agents SDK run of
    at most 12 turns per recurring deliverable type). The agent reads the
    citable documents through three read-only tools, `outline`,
@@ -276,7 +279,9 @@ not confirm.
    and how many it lists. A type with one
    exemplar, or with no recurring unit, has no candidates, and the request
    says which. A stored passage takes its text and citations from the
-   candidate, in candidate order, so it is exemplar text by construction.
+   candidate, in candidate order, so it is exemplar text by construction. When
+   holders' wording differs within the recurrence threshold, the stored text
+   uses the first holder in canonical document order.
 
    What recurrence proves is limited. The code checks that the text of one
    exemplar section recurs in another exemplar document, under a different
@@ -360,9 +365,10 @@ at 1,536 dimensions. The CLI has no model options.
 - A structured response that stops at `max_output_tokens` (starting at
   16,384) is retried once with double the budget. Agent turns allow 16,384
   output tokens.
-- Every other failure, a refusal, a body that is not JSON, missing or
-  malformed usage, or output that fails schema validation raises
-  `ProviderError`, on every call type. A `judge` probability that is not a
+- A refusal in a structured or agent response raises `ProviderError`; a
+  Decisions refusal returns `None` for that question. Other failures, a body
+  that is not JSON, missing or malformed usage, or output that fails schema
+  validation raise `ProviderError`. A `judge` probability that is not a
   finite number within 0..1 is malformed too.
 - Embeddings are requested in batches of up to 128 inputs and 100,000
   characters. Response rows must carry each index exactly once and are
@@ -388,10 +394,11 @@ A rebuild of an unchanged corpus with the same cache makes no provider
 requests: every collection that reaches a prompt or a cache key is in a
 canonical sorted order, and concurrent results are gathered in submission
 order. Adding a file requests the reading of that file only; induction and
-the embeddings are requested again because the corpus changed. A build of a
-subset of a corpus never reuses the full corpus's induction results, because
-each induction request carries the cards, IDs or source digest of the
-documents it covers. The first valid entry stored under a key is canonical: when two build
+the embeddings are requested again because the corpus changed. A request with
+identical inputs can use a cached response, including in a subset build; its
+inputs cover everything the request can see. Blueprint agent requests also key
+on a digest of every section their tools can read, so runs over different
+corpora are not reused. The first valid entry stored under a key is canonical: when two build
 threads miss the same key at once, the second writer returns the first
 writer's value. An entry that no longer decodes or validates is a miss and is
 replaced. A new cache file is created with mode `0600`.
@@ -403,7 +410,8 @@ prices in `llm.PRICES` (`gpt-6.1-sol`, `gpt-6-luna` on Decisions, and
 `build` prints the totals. With `--max-cost`, no provider call starts once the
 estimate has reached the limit: it raises `BudgetExceededError`, a
 `ProviderError`, and `build` exits with an error after printing the totals.
-Calls already in flight can take the total past the limit. A spend limit with a
+Calls already in flight can take the total past the limit. If the last request
+takes the estimate past the limit, the build finishes normally. A spend limit with a
 model that has no price is refused when the gateway is constructed.
 
 ## Snapshot file
@@ -440,7 +448,10 @@ so it is the content address of the corpus a snapshot was built from
 `TopicSnapshot.open` uses a read-only SQLite URI with the path
 percent-encoded, so names containing `%`, `?` or `#` open the right file. It
 refuses any schema version other than `3.0`, naming the file's version and the
-one it reads; a `2.0` snapshot is rebuilt from its corpus. Every
+one it reads; a `2.0` snapshot is rebuilt from its corpus. Schema `3.0` alone
+does not establish compatibility: a snapshot from an earlier build of this
+version whose blueprint rows lack standing passages is refused at open as a
+malformed blueprint row and must be rebuilt from its corpus. Every
 `corpus_meta` key and every table is required, and `open` runs `PRAGMA
 foreign_key_check`, so a dangling facet assignment or alias is refused. Each
 facet value must have its canonical alias row. A snapshot is a build output
@@ -610,8 +621,10 @@ inside an MCP server tool reaches the model as a tool error, as any MCP host
 would see it, and does not stop the evaluation. Each run reports its tokens,
 turns, tool calls and the query embeddings that returned a vector
 (`search_embed_calls`). `--max-cost` sets one spend limit, a positive finite
-number of USD, over every model call of the evaluation; reaching it is not a run outcome but stops the evaluation
-with an error, the usage line and a non-zero exit, and writes no report.
+number of USD, over every model call of the evaluation. Once the estimate
+reaches the limit, the next provider attempt stops the evaluation with an
+error, the usage line and a non-zero exit, and writes no report. If the last
+request takes the estimate past the limit, the evaluation finishes normally.
 `--trace` turns on hosted Agents SDK tracing, and `results.json` (`usage`) and
 `report.md` (Usage) record calls, tokens and the estimated cost per operation.
 
@@ -633,7 +646,14 @@ is a fictional pack; real packs stay in the private store.
 | --- | --- | --- |
 | 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of BM25-only, dense-only and hybrid RRF ranking over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks all three arms from one query embedding per case. |
 | 2 | `agents.py` | An agent conversation answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the ten Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
-| 3 | `agents.py` | One deliverable is held out. Before any file is copied or any model is called, the reference document (`reference_doc_id`) must be a delivered document, not a curator note, and carry a `held_out_markers` entry in its path, and every file under `included_paths` (selected through `discover_corpus`, so symlinks are refused) must have no marker in its path, not share the reference's top-level folder (or, for a reference at the corpus root, not sit at the root) and not have the reference's bytes. Markers match case- and dash-insensitively (`fold_text`). Pack validation refuses an included path that is not written plainly (`./`, an empty part or a trailing `/`). The holdout snapshot is compiled from those bytes alone, in a worker thread (its blueprint agent runs start their own event loop) with the full snapshot's embedding model and dimensions (reusing `--cache`), so its facets, glossary, blueprints and guide are induced without the held-out material; it is checked again and only then published as `<out>/holdout.arkive.db`. The cache cannot serve the full corpus's induction results to the holdout build, because each induction request covers the documents it was built from. Three arms draft the deliverable from the task's `run_notes` and `memo_instructions`: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts get the task's rubric checks and a blinded side-by-side judge against the reference. |
+| 3 | `agents.py` | Builds a holdout snapshot and compares three draft arms against a reference deliverable; the procedure and guards are below. |
+
+For layer 3:
+
+1. Select a delivered reference document, not a curator note, with a `held_out_markers` entry in its path. Select files through `included_paths`; pack validation requires plain paths and `discover_corpus` refuses symlinks.
+2. Before copying files or calling a model, the guards reject selected files whose path contains a marker, whose top-level folder matches the reference's (or which are at the corpus root when the reference is there), or whose bytes match the reference. Markers match case- and dash-insensitively. The guards do not scan content: the curator must exclude changed copies and other documents that restate held-out facts.
+3. Compile the selected bytes alone into a holdout snapshot, using the full snapshot's embedding model and dimensions and optionally `--cache`. Check the snapshot again before publishing it as `<out>/holdout.arkive.db`. Cache reuse follows the request-input rules above.
+4. Draft from `run_notes` and `memo_instructions` with three arms: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts receive rubric checks and a blinded side-by-side judgment against the reference.
 
 The evaluation harness compiles the holdout snapshot through `compile_corpus`
 itself, the one real OpenAI build outside `arkive-rag build`. Blinded drafts and
@@ -695,8 +715,9 @@ non-interactively, on several topics at once. It needs Docker and
   without waiting for local MCP servers, so `arkive`, which needs several
   seconds to open its snapshots, is missing from the tool list.
   `run-scenario.sh` therefore starts a private `opencode serve`, waits until
-  `opencode mcp list` reports `arkive` connected (240 s at most, each listing
-  bounded to 10 s; exit 3 when the deadline passes or the server is reported
+  `opencode mcp list` reports `arkive` connected (a 240 s polling deadline,
+  with each listing bounded to 10 s; one listing and a diagnostic listing can
+  extend beyond the deadline; exit 3 when it passes or the server is reported
   failed) and then runs the prompt with `opencode
   run --server ... --format json --auto -- PROMPT`, so a prompt that starts
   with a dash is still the message.
@@ -784,14 +805,15 @@ All commands run from a checkout root. Keep the environment and tool caches
 outside the checkout, for example:
 
 ```sh
-export UV_PROJECT_ENVIRONMENT=/tmp/arkive-venv MYPY_CACHE_DIR=/tmp/arkive-mypy \
-  RUFF_CACHE_DIR=/tmp/arkive-ruff PYTHONDONTWRITEBYTECODE=1
+export SCRATCH="$(mktemp -d /tmp/arkive-checkout.XXXXXX)"
+export UV_PROJECT_ENVIRONMENT="$SCRATCH/venv" MYPY_CACHE_DIR="$SCRATCH/mypy" \
+  RUFF_CACHE_DIR="$SCRATCH/ruff" PYTHONDONTWRITEBYTECODE=1
 uv sync --locked
 uv run --locked ruff check src tests evals
 uv run --locked ruff format --check src tests evals
 uv run --locked mypy
-uv run --locked pytest -o cache_dir=/tmp/arkive-pytest --basetemp=/tmp/arkive-pytest-tmp
-uv build --out-dir /tmp/arkive-dist
+uv run --locked pytest -o cache_dir="$SCRATCH/pytest-cache" --basetemp="$SCRATCH/pytest-tmp"
+uv build --out-dir "$SCRATCH/dist"
 ```
 
 The test suite makes no network calls. It needs LibreOffice (`soffice`) for the

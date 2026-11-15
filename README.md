@@ -39,36 +39,28 @@ directory. A corpus may not contain symlinks.
 records them with the reasoning effort of each operation. It prints the
 provider calls, tokens and estimated cost of the build, and a build report
 of what it dropped or pruned without failing.
-With `--max-cost 5` (a positive finite number of USD), no provider call starts once the estimated spend has
-reached USD 5, and the build stops with an error. Calls already in flight can
-take the total past the limit, and the estimate ignores the long-context
+With `--max-cost 5` (a positive finite number of USD), the next provider attempt
+is blocked once estimated spend reaches USD 5. The build then stops with an
+error; if its last request takes the estimate past the limit, it finishes normally.
+Calls already in flight can take the total past the limit, and the estimate ignores the long-context
 surcharge. `--trace` sends traces of agent runs to the OpenAI dashboard (off by
 default); it fails if `OPENAI_AGENTS_DISABLE_TRACING` is set to `1` or `true`
 (in any letter case).
 
-The build reads every document, then induces from the whole corpus up to six
-facets to filter by (path-bound when the folders already encode them, such as
-projects or campaigns, otherwise judged per document, such as client or
-author), a cited glossary, and a blueprint for each recurring deliverable type
-(at most eight). A blueprint holds a section outline, conventions and reviewer
-pitfalls stated generically, and standing passages: house text such as a
-method background, a reference entry or a disclaimer. Code finds the
-candidates: a paragraph, list item or table header row of one exemplar section
-that recurs in another exemplar document (at least 0.8 of its word 4-grams, or
-the same table header row), under a different top-level folder when the
-exemplars span several folders. The blueprint agent only selects and labels
-candidates, so a stored passage is exemplar text exactly as written. Code
-cannot know that two folders are different projects, or that a recurring
-sentence holds no project facts; the agent is told to leave out candidates
-specific to one project, client, place, period or result.
-`inspect` prints them. `search` and `grep` take repeated `--filter FACET=VALUE`
+The build reads the corpus and produces filter facets, a cited glossary and
+blueprints for recurring deliverable types. A blueprint includes an outline,
+conventions, reviewer pitfalls and standing passages of house text. `inspect`
+prints the facet names and values, glossary and blueprints. See the
+[build pipeline](docs/architecture.md#build-pipeline) for the induction and
+validation rules. `search` and `grep` take repeated `--filter FACET=VALUE`
 (a canonical value or an alias; several facets combine with AND), and the MCP
 tools `list_documents`, `search` and `grep` take the same `filters` mapping.
 An `AGENTS.md` anywhere in the corpus is a curator note: it guides induction,
 appears in the topic guide and is searchable, but is never cited. With
 `--cache`, rebuilding an unchanged corpus makes no provider calls. Snapshots
-use schema `3.0`; a snapshot from an earlier version is rebuilt from its
-corpus.
+use schema `3.0`. Rebuild older snapshots from their corpus. An earlier build
+of schema `3.0` may have blueprint rows without standing passages; those rows
+are refused as malformed at open and the snapshot must also be rebuilt.
 
 The MCP server has ten tools. `get_topic_guide` returns the guide, curator
 notes, facets, glossary terms and a summary of each blueprint;
@@ -116,8 +108,11 @@ and 3 need `--corpus`, whose files must still match the snapshot's
 of the run are written to `results.json` and `report.md`. Before it creates
 any output or calls any model, the runner checks the pack, the snapshot, the
 retrieval filters and the holdout guards of every layer it will run. An
-evaluation that reaches the spend limit, or fails after calling models, prints
-its usage, stops with an error and writes no report.
+agent run with status `provider_error`, `incomplete`, `empty_answer` or
+`max_turns` is recorded without credit and evaluation continues. A failure
+that stops the evaluation, such as a spend limit blocking the next attempt or
+an unexpected tool failure, prints usage, exits non-zero and writes no report.
+Invalid input is rejected before model calls and output creation.
 `--out` is required. Outputs quote corpus facts, so choose a private directory
 outside this repository; the runner refuses an `--out` or `--cache` that
 overlaps the pack, snapshot or corpus, and writes owner-only files.

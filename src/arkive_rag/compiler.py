@@ -914,8 +914,8 @@ def _transcribe_pages(
             prev_context=prev_context,
         )
         results.append((number, extraction))
-        # Page N's request carries page N-1's transcript tail, which the continuation flags
-        # need; a changed page therefore also changes the cache keys of the pages after it.
+        # Continuation flags use the preceding page's block tail. Changes propagate to the
+        # following page only if this tail changes, and stop when a later tail is unchanged.
         prev_context = "\n\n".join(b.markdown for b in extraction.blocks)[-PREV_CONTEXT_CHARS:]
     return results
 
