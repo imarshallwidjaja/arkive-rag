@@ -43,7 +43,7 @@ from evals.agents import (
     select_holdout_sources,
     with_server_instructions,
 )
-from evals.run import _layer2_report, write_private_text
+from evals.run import _layer2_report, make_private_directory, write_private_text
 from evals.run import app as eval_app
 from evals.schema import (
     EvalPack,
@@ -454,6 +454,22 @@ def test_eval_outputs_are_private_files(tmp_path: Path) -> None:
     target.chmod(0o644)
     write_private_text(target, "new")
     assert target.read_text() == "new" and stat.S_IMODE(target.stat().st_mode) == 0o600
+    # A link at the destination is refused, not followed and truncated.
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    link = tmp_path / "results.json"
+    link.symlink_to(victim)
+    with pytest.raises(ValueError, match="symlink"):
+        write_private_text(link, "new")
+    assert victim.read_text() == "keep"
+    # Output directories must be real directories, not links to one.
+    make_private_directory(tmp_path / "events")
+    assert stat.S_IMODE((tmp_path / "events").stat().st_mode) == 0o700
+    make_private_directory(tmp_path / "events")
+    (tmp_path / "linked").symlink_to(tmp_path / "events", target_is_directory=True)
+    for not_a_directory in (tmp_path / "linked", victim):
+        with pytest.raises(ValueError, match="not a real directory"):
+            make_private_directory(not_a_directory)
 
 
 def test_blind_assignment_is_a_seeded_permutation() -> None:

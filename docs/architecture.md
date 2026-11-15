@@ -548,6 +548,124 @@ covers pack validation, scoring, the rubric, the holdout guards, the run-status
 contract, the layer 3 flow, the runner's input checks and the tool adapters
 offline, using the example pack and a scripted OpenAI HTTP transport.
 
+### Example corpora
+
+`evals/example_corpora/` holds two small fictional corpora, so anyone can build
+real snapshots without private documents. They are organised in different
+ways, and induction gives them different facet schemas:
+
+- `coastal-survey-projects`: one folder per survey project, each holding a
+  proposal, a technical memorandum and reviewer feedback, with a curator note
+  that records a missing review. `q102-technical-memorandum.pdf` has a bar
+  chart whose per-bench volumes appear only in the image.
+- `creator-campaigns`: one folder per creator, then one per campaign, holding
+  campaign briefs and post-campaign reviews, with a casual root `AGENTS.md`.
+  `harbourline-launch-deck.pptx`, the results deck sent after the campaign's
+  flight, has a chart whose weekly reach values appear only in the image.
+
+Both repeat deliverable types, reviewer feedback, defined and undefined
+acronyms, one acronym with two meanings, tool names, stated attributes,
+exact numbers and filenames. They are built with the ordinary `arkive-rag
+build` command; the snapshots are not tracked.
+
+### OpenCode check
+
+`python -m evals.opencode_check SNAPSHOT... --out DIR [--model
+provider/model] [--scenarios FILE] [--only ID] [--timeout S]` checks that a real
+MCP client, OpenCode, can discover and use the Arkive tools with a real model,
+non-interactively, on several topics at once. It needs Docker and
+`OPENAI_API_KEY`, and it is not part of `pytest`.
+
+- **Image.** `evals/opencode_check/Dockerfile` starts from the official
+  `ghcr.io/anomalyco/opencode:2.3.0` image, pinned by digest. Its `opencode`
+  binary is linked against musl, so the image stays on that Alpine base and
+  adds Alpine's Python 3.14. The runner builds the context in a temporary
+  directory: the arkive-rag wheel built from the checkout (`uv build`), the
+  runtime requirements exported from `uv.lock` with hashes (`uv export`), and
+  the files beside the Dockerfile. The image is tagged
+  `arkive-opencode-check:<content hash>` and built only when that tag is
+  missing. It holds no key, snapshot or corpus.
+- **Client configuration.** `opencode.json` becomes the system configuration
+  `/etc/opencode/opencode.json`, which outranks global and project files. It
+  declares one local stdio MCP server, `arkive`, that runs `arkive-rag serve`
+  on every snapshot under `/snapshots`, with `codemode: false` so the tools sit
+  on the model's native tool list as `arkive_<tool>`. Its permissions deny
+  every action and then allow `arkive_*`.
+- **Startup.** `opencode run --standalone` sends the first model request
+  without waiting for local MCP servers, so `arkive`, which needs several
+  seconds to open its snapshots, is missing from the tool list.
+  `run-scenario.sh` therefore starts a private `opencode serve`, waits until
+  `opencode mcp list` reports `arkive` connected (120 s at most, each listing
+  bounded to 10 s, exit 3 otherwise) and then runs the prompt with `opencode
+  run --server ... --format json --auto -- PROMPT`, so a prompt that starts
+  with a dash is still the message.
+- **Isolation.** Each scenario runs in a fresh container, as the invoking
+  user's UID and GID (`--user`), so the owner-only snapshot files stay
+  readable for any host UID; the runner refuses to run as root.
+  `run-scenario.sh` keeps HOME and the working directory under `/tmp`, so
+  neither depends on an image account. The snapshots are mounted read-only and
+  no other host path is mounted; all capabilities are dropped, with
+  `no-new-privileges`. OpenCode's permission list denies every tool outside
+  the `arkive` server. The containers use Docker's default network, so network
+  egress is not restricted. The check has been run with a rootful Docker
+  daemon; rootless Docker is untested. `OPENAI_API_KEY` is passed by name
+  (`--env OPENAI_API_KEY`), so its value never appears in a command line, and
+  reaches both the model requests and the `search` tool's query embeddings.
+  The runner refuses an empty key, and replaces the key's value in the event
+  stream and stderr before parsing them, so no file it writes holds the key.
+  Each container is named `arkive-opencode-check-<run id>-<scenario id>`, with
+  a random run ID, so concurrent runs do not collide. It is force-removed
+  (`docker rm --force`) when its scenario ends, times out (`--timeout`, 600 s
+  by default), fails or is interrupted; a removal that fails is printed and
+  makes the exit status 1.
+- **Scenarios.** `scenarios.json` (`format` `arkive-opencode-scenarios/1`,
+  validated by `ScenarioFile` in `scenarios.py`) is tied to the example
+  corpora. A scenario has a prompt, the Arkive tools that must complete at
+  least once, argument expectations (`non_empty`: some completed call passed
+  a non-empty argument such as `filters`; `invalid_filter_recovery`: a call
+  whose `filters` set a facet to the scenario's invalid value ended in a tool
+  error, and a later call to the same tool on the same topic, setting that
+  facet to another value, completed), the topics its calls must query, answer
+  phrase groups matched as in eval packs, an optional requirement that the
+  answer names every facet of its topics (read from the served snapshots,
+  because facets are induced per build), and an optional page (`page_image`:
+  topic, `doc_id`, `page_number`) whose `view_page` call must return an image.
+  Document IDs follow sorted path order, so they are stable across builds of
+  one corpus. Every scenario also requires that the run ended with an answer
+  and no error event, and that no tool outside the `arkive` server was called. The shipped scenarios cover
+  topic and facet discovery, three glossary lookups (a defined term, a term
+  the corpus never defines and a term with two meanings), a filtered listing
+  with a facet the agent finds itself, recovery from an invalid filter value,
+  an exact number found with `grep`, a chart value read through `view_page`,
+  a draft that starts from a blueprint, and a question that needs both topics.
+- **Results.** The runner parses the newline-delimited JSON events
+  (`tool_use`, `text`, `step_finish`, `error`); the final answer is the text
+  written after the last tool call. It writes `results.json` (per scenario:
+  tool calls with arguments, status and output, the final answer, each check's
+  outcome, the tokens and OpenCode's cost estimate from `step_finish` events,
+  the exit code), `report.md` and the raw event stream of each scenario under
+  `events/`, all owner-only (`write_private_text` in `evals/run.py`, which
+  refuses a symlink at the destination; `events/` must be a real directory).
+  OpenCode can omit the last step's `step_finish`, so token and cost totals
+  are lower bounds, and the `search` tool's query embeddings are not in them. The exit status is 1 when any scenario fails or
+  cannot run. Before building an image or starting a container, the runner
+  refuses an invalid scenario file, an `--out` that overlaps the scenario file
+  or a snapshot (the rule `evals.run` applies to its inputs), a snapshot that
+  does not open, two snapshots of one topic, a scenario topic no snapshot
+  serves, an unknown `--only` ID, a missing or empty key, a root caller, and a
+  symlink where an output file or `events/` would be written.
+
+OpenCode 2.3.0 receives `view_page`'s image as a file part of the tool result
+(`image/webp`), and the scenario checks that the `view_page` call for the chart's
+page returned it. The chart value is also in
+the page's visual summary, which `view_page` returns as text, so a correct
+answer alone does not prove that the model read the image.
+
+The README states what a pass proves. `tests/test_opencode_check.py` covers the
+scenario file, event parsing, every kind of check failure, the container
+command, the runner's input refusals, output links, key redaction and container
+removal (including an interrupt) offline, with a fake Docker and no key.
+
 ## Verification
 
 All commands run from a checkout root. Keep the environment and tool caches

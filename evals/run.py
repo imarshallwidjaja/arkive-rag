@@ -4,6 +4,7 @@ results.json and report.md."""
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import json
 import math
@@ -48,11 +49,37 @@ def _jsonable(value: Any) -> Any:
 
 
 def write_private_text(path: Path, text: str) -> None:
-    """Write `text` to `path` readable by the owner only, also when `path` already exists."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Write `text` to `path` readable by the owner only, also when `path` already exists.
+    Refuses (ValueError) a symlink at `path` instead of writing through it."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"{path} is a symlink; refusing to write through it") from exc
+        raise
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         os.fchmod(handle.fileno(), 0o600)
         handle.write(text)
+
+
+def make_private_directory(path: Path) -> None:
+    """Create the directory `path`, owner-only, unless it exists. Refuses (ValueError)
+    anything at `path` other than a real directory, such as a symlink to one."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(f"{path} is not a real directory; refusing to write into it") from None
+
+
+def refuse_overlapping_paths(written: dict[str, Path], inputs: dict[str, Path]) -> None:
+    """Refuse a written path that is, contains or lies inside an input path."""
+    for written_name, written_path in written.items():
+        for name, input_path in inputs.items():
+            if _overlaps(written_path.resolve(), input_path.resolve()):
+                raise typer.BadParameter(
+                    f"{written_name} {written_path} overlaps {name} {input_path}"
+                )
 
 
 def _embedder(model: str, dimensions: int, meter: UsageMeter) -> CountingEmbedder:
@@ -270,7 +297,7 @@ def main(
                 if build_cache:
                     build_cache.close()
             blind_dir = out / "blind-drafts"
-            blind_dir.mkdir(mode=0o700, exist_ok=True)
+            make_private_directory(blind_dir)
             for label, text in cast(dict[str, str], layer3_result["blind_drafts"]).items():
                 write_private_text(blind_dir / f"{label}.md", text)
             write_private_text(
@@ -342,10 +369,7 @@ def _check_inputs(
     if corpus is not None:
         inputs["--corpus"] = corpus
     writable = {"--out": out} | ({"--cache": cache} if cache is not None else {})
-    for written, written_path in writable.items():
-        for name, input_path in inputs.items():
-            if _overlaps(written_path.resolve(), input_path.resolve()):
-                raise typer.BadParameter(f"{written} {written_path} overlaps {name} {input_path}")
+    refuse_overlapping_paths(writable, inputs)
     try:
         with TopicSnapshot.open(snapshot) as snap:
             fingerprint = snap.corpus_fingerprint

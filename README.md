@@ -105,6 +105,44 @@ overlaps the pack, snapshot or corpus, and writes owner-only files.
 (`arkive-eval-pack/2`); a retrieval case's `filters` use the facet names and
 values `inspect` prints for the snapshot.
 
+## Example corpora and the OpenCode check
+
+`evals/example_corpora/` holds two small fictional corpora organised in
+different ways: `coastal-survey-projects` (survey projects with proposals,
+technical memoranda and reviewer feedback) and `creator-campaigns` (creators
+and their campaigns with briefs, reviews and a launch deck). Build them like
+any other corpus, with the snapshots outside the repository:
+
+```sh
+for c in coastal-survey-projects creator-campaigns; do
+  uv run --locked arkive-rag build evals/example_corpora/$c \
+    -o /tmp/arkive-examples/$c.arkive.db --cache /tmp/arkive-examples/$c.cache.db --max-cost 1.5
+done
+```
+
+The OpenCode check runs the scenarios in `evals/opencode_check/scenarios.json`
+against those snapshots inside OpenCode 2.3.0, one fresh Docker container per
+scenario, with only the Arkive MCP tools allowed. It needs Docker and
+`OPENAI_API_KEY`, which the containers receive through their environment. Each
+container runs as your UID and GID with the snapshots mounted read-only and no
+other host path. Network egress from the containers is not restricted. It has
+been run with a rootful Docker daemon; rootless Docker is untested.
+
+```sh
+uv run --locked python -m evals.opencode_check \
+  /tmp/arkive-examples/coastal-survey-projects.arkive.db \
+  /tmp/arkive-examples/creator-campaigns.arkive.db --out /tmp/arkive-opencode-check
+```
+
+`--model` picks the OpenCode model (default `openai/gpt-6.1-sol`) and `--only`
+runs one scenario. The runner builds the image when needed and writes
+`results.json`, `report.md` and each scenario's event stream to `--out`, with
+the key's value redacted. `--out` must not overlap a snapshot or the scenario
+file; the results quote corpus text, so keep them out of the repository. It
+exits with status 1 when any scenario fails. A pass shows that this OpenCode
+version with this model can discover and use the Arkive tools on two topics at
+once; it is not a conformance proof for every MCP client.
+
 - [Product goal and end-to-end system walkthrough](docs/walkthrough.md)
 - [Architecture, pipeline, evaluation and verification](docs/architecture.md)
 

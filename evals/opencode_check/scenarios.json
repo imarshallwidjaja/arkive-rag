@@ -1,0 +1,102 @@
+{
+  "format": "arkive-opencode-scenarios/1",
+  "description": "OpenCode answers questions over the two example corpora in evals/example_corpora with only the Arkive MCP tools. Facet names are induced per build, so no scenario names one.",
+  "topics": ["coastal-survey-projects", "creator-campaigns"],
+  "scenarios": [
+    {
+      "scenario_id": "topic-and-facet-discovery",
+      "description": "Discovers both topics and every facet of each without being told their names.",
+      "prompt": "List the Arkive topics. For each topic, name every facet I can filter by, exactly as the tools spell it, with its allowed values.",
+      "required_tools": ["list_topics"],
+      "answer_groups": [["coastal-survey-projects"], ["creator-campaigns"]],
+      "answer_names_facets": true
+    },
+    {
+      "scenario_id": "glossary-defined-term",
+      "description": "Looks up an acronym the corpus defines.",
+      "prompt": "In the coastal-survey-projects topic, what does MBES stand for? Use the glossary and cite the section.",
+      "required_tools": ["lookup_glossary"],
+      "topics_queried": ["coastal-survey-projects"],
+      "answer_groups": [["multibeam echosounder", "multibeam echo sounder", "multi-beam echosounder"]]
+    },
+    {
+      "scenario_id": "glossary-undefined-term",
+      "description": "Looks up an acronym the corpus uses but never defines, and says so instead of guessing.",
+      "prompt": "In the creator-campaigns topic, what does FQV mean? Use the glossary. If the documents never define it, say so plainly rather than guessing.",
+      "required_tools": ["lookup_glossary"],
+      "topics_queried": ["creator-campaigns"],
+      "answer_groups": [
+        ["FQV"],
+        ["not defined", "never defined", "does not define", "doesn't define", "do not define", "don't define", "no definition", "isn't defined", "is undefined", "not spelled out", "never spelled out", "never expanded", "not expanded", "does not explain", "doesn't explain"]
+      ]
+    },
+    {
+      "scenario_id": "glossary-two-senses",
+      "description": "Looks up an acronym with two meanings and reports both.",
+      "prompt": "In the coastal-survey-projects topic, what does PCR mean? Use the glossary and give every meaning the documents use it for.",
+      "required_tools": ["lookup_glossary"],
+      "topics_queried": ["coastal-survey-projects"],
+      "answer_groups": [["point cloud registration"], ["project change request"]]
+    },
+    {
+      "scenario_id": "filtered-listing-discovered-facet",
+      "description": "Finds the facet and value for a creator through list_topics and filters by it.",
+      "prompt": "In the creator-campaigns topic, which campaigns did the creator Teodor Vasquez-Lund work on? Find the facet and value for him with list_topics, then filter list_documents with it.",
+      "required_tools": ["list_topics", "list_documents"],
+      "argument_expectations": [
+        {"condition": "non_empty", "tools": ["list_documents", "search", "grep"], "argument": "filters"}
+      ],
+      "topics_queried": ["creator-campaigns"],
+      "answer_groups": [["Corriemoor"], ["Kettlecraft"]]
+    },
+    {
+      "scenario_id": "invalid-filter-recovery",
+      "description": "Sends a filter value that does not exist, reads the tool error, and retries with a valid value.",
+      "prompt": "In the coastal-survey-projects topic: call list_topics and pick one facet of that topic. Call list_documents with that facet set to the value \"zz-no-such-value\". Read the error, then call list_documents again with a valid value of the same facet and list the doc_ids it returns.",
+      "required_tools": ["list_topics"],
+      "argument_expectations": [
+        {"condition": "invalid_filter_recovery", "tools": ["list_documents"], "invalid_value": "zz-no-such-value"}
+      ],
+      "topics_queried": ["coastal-survey-projects"],
+      "answer_groups": [["doc_0"]]
+    },
+    {
+      "scenario_id": "grep-exact-number",
+      "description": "Finds an exact count by its filename with grep and cites document and section.",
+      "prompt": "In the coastal-survey-projects topic, how many cleaned soundings does brenlow_soundings.csv hold? Find it with grep and cite the doc_id and section_id.",
+      "required_tools": ["grep"],
+      "topics_queried": ["coastal-survey-projects"],
+      "answer_groups": [["1,284,330"], ["doc_003"], ["doc_003_sec_006"]]
+    },
+    {
+      "scenario_id": "chart-value-view-page",
+      "description": "Reads a value printed only in a chart of a rendered PDF page through view_page, which returns the page image.",
+      "prompt": "In the coastal-survey-projects topic, the Q102 technical memorandum (doc_006) has a bar chart of rock removed per bench. Look at page 1 with view_page and tell me the volume for Bench 3, citing the doc_id and page.",
+      "page_image": {"topic": "coastal-survey-projects", "doc_id": "doc_006", "page_number": 1},
+      "topics_queried": ["coastal-survey-projects"],
+      "answer_groups": [["41,700"], ["doc_006"]]
+    },
+    {
+      "scenario_id": "draft-from-blueprint",
+      "description": "Drafts a campaign brief starting from the topic guide's blueprint, using only the facts given.",
+      "prompt": "In the creator-campaigns topic, draft a short campaign brief for a new client, Pellow Bakery: spring 2027, budget GBP 9,000, channel email newsletter. Start from the topic guide's blueprint for campaign briefs, and use no project facts other than mine.",
+      "required_tools": ["get_topic_guide"],
+      "topics_queried": ["creator-campaigns"],
+      "answer_groups": [
+        ["Pellow"],
+        ["9,000"],
+        ["objective"],
+        ["call to action", "CTA"],
+        ["measure", "KPI"],
+        ["mandator"]
+      ]
+    },
+    {
+      "scenario_id": "cross-topic-question",
+      "description": "Answers one question that needs a fact from each topic.",
+      "prompt": "Using both Arkive topics: what is the fixed fee in the Q101 Brenlow Estuary proposal, and what is the budget of the Glowmilk Spring 2026 campaign? Cite the doc_id and section_id of each.",
+      "topics_queried": ["coastal-survey-projects", "creator-campaigns"],
+      "answer_groups": [["38,400"], ["18,500"]]
+    }
+  ]
+}

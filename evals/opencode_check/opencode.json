@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "update": "disable",
+  "snapshots": false,
+  "mcp": {
+    "servers": {
+      "arkive": {
+        "type": "local",
+        "command": ["sh", "-c", "exec arkive-rag serve /snapshots/*.arkive.db"],
+        "environment": {
+          "OPENAI_API_KEY": "{env:OPENAI_API_KEY}"
+        },
+        "codemode": false
+      }
+    }
+  },
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "deny" },
+    { "action": "arkive_*", "resource": "*", "effect": "allow" }
+  ]
+}
