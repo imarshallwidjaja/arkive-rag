@@ -14,14 +14,11 @@ import typer
 
 from arkive_rag.compiler import compile_corpus
 from arkive_rag.llm import (
-    DEFAULT_EMBEDDING_DIMENSIONS,
-    DEFAULT_EMBEDDING_MODEL,
-    DEFAULT_PAGE_MODEL,
-    DEFAULT_SYNTHESIS_MODEL,
     QUERY_DEADLINE_SECONDS,
     QUERY_REQUEST_TIMEOUT_SECONDS,
     BuildCache,
     OpenAIGateway,
+    UsageMeter,
     load_dotenv_if_present,
 )
 from arkive_rag.models import ArkiveError
@@ -60,25 +57,28 @@ def build(
     ] = None,
     title: Annotated[str | None, typer.Option(help="Human title; default is the topic.")] = None,
     cache: Annotated[Path | None, typer.Option(help="SQLite cache of provider responses.")] = None,
-    page_model: str = DEFAULT_PAGE_MODEL,
-    synthesis_model: str = DEFAULT_SYNTHESIS_MODEL,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-    embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
     max_concurrency: Annotated[int, typer.Option(min=1)] = 4,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(
+            help="Start no provider call once the estimated spend has reached this many USD;"
+            " calls in flight can pass it, and the estimate ignores the long-context surcharge."
+        ),
+    ] = None,
+    trace: Annotated[
+        bool, typer.Option(help="Send Agents SDK traces of agent runs to the OpenAI dashboard.")
+    ] = False,
 ) -> None:
     """Compile CORPUS_DIR into a snapshot file."""
     slug = topic or _slug(corpus_dir.resolve().name)
+    if max_cost is not None and not max_cost > 0:
+        raise typer.BadParameter("--max-cost must be positive")
+    meter = UsageMeter(max_cost)
     with _domain_errors():
         check_build_paths(corpus_dir, output, *([cache] if cache else []))
         build_cache = BuildCache(cache) if cache else None
         try:
-            gateway = OpenAIGateway(
-                page_model=page_model,
-                synthesis_model=synthesis_model,
-                embedding_model=embedding_model,
-                embedding_dimensions=embedding_dimensions,
-                cache=build_cache,
-            )
+            gateway = OpenAIGateway(cache=build_cache, meter=meter, trace=trace)
             corpus = compile_corpus(
                 corpus_dir,
                 gateway,
@@ -89,6 +89,8 @@ def build(
         finally:
             if build_cache:
                 build_cache.close()
+            # Printed on failure too: a stopped build has still spent what it spent.
+            typer.echo(meter.summary_line())
         write_snapshot(corpus, output)
     chunk_count = len(corpus.all_chunks())
     typer.echo(f"wrote {output}: {len(corpus.documents)} documents, {chunk_count} chunks")

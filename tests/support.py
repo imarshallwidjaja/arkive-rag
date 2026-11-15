@@ -2,30 +2,42 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import zipfile
 import zlib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from xml.sax.saxutils import escape
 
+import httpx2
 import numpy as np
+import openai
 from numpy.typing import NDArray
+from pydantic import BaseModel
 
-from arkive_rag.compiler import compile_corpus, parse_markdown_blocks
+from arkive_rag.compiler import (
+    CorpusSynthesis,
+    DocumentCatalogue,
+    PageTranscription,
+    compile_corpus,
+    parse_markdown_blocks,
+)
+from arkive_rag.llm import AgentRequest, OpenAIGateway, StructuredRequest
 from arkive_rag.models import (
     CorpusSynthesisExtraction,
     DocumentMetaExtraction,
     LifecycleStage,
-    PageBlock,
     PageExtraction,
 )
 from arkive_rag.snapshot import write_snapshot
 
 _SECTION_TOKEN = re.compile(r"\[doc_\d+:doc_\d+_sec_\d+\]")
+TEST_BASE_URL = "https://api.openai.test/v1"
+SCRIPTED_EMBEDDING_DIMENSIONS = 8
 
 
 def hash_embedding(text: str, dimensions: int) -> NDArray[np.float32]:
@@ -41,9 +53,11 @@ def hash_embedding(text: str, dimensions: int) -> NDArray[np.float32]:
 
 
 class FakeGateway:
-    """A `LanguageGateway` that echoes the native text layer as Markdown blocks.
+    """A `LanguageGateway` that answers each compiler request type deterministically.
 
-    `page_script` and `synthesis_script` queue scripted responses consumed in order.
+    Transcription echoes the native text layer as Markdown blocks. `page_script` and
+    `synthesis_script` queue scripted responses consumed in order. Every request is kept in
+    `requests`, and its operation name in `calls`.
     """
 
     embedding_model = "fake-hash-embedding"
@@ -57,30 +71,48 @@ class FakeGateway:
     ) -> None:
         self.page_script = list(page_script)
         self.synthesis_script = list(synthesis_script)
+        self.requests: list[object] = []
         self.calls: list[str] = []
-        self.transcribe_calls: list[tuple[bool, tuple[str, ...]]] = []
-        self.synthesis_feedback: list[str | None] = []
 
-    def transcribe_page(
-        self,
-        native_text: str,
-        webp_bytes: bytes,
-        prev_context: str | None,
-        required_tokens: tuple[str, ...] = (),
-        *,
-        use_strong_model: bool = False,
-    ) -> PageExtraction:
-        assert webp_bytes[:4] == b"RIFF", "pages must be rendered as WebP"
-        self.calls.append("transcribe_page")
-        self.transcribe_calls.append((use_strong_model, required_tokens))
-        if self.page_script:
-            return self.page_script.pop(0)
-        return parse_markdown_blocks(native_text)
+    @property
+    def transcribe_calls(self) -> list[tuple[str, tuple[str, ...]]]:
+        return [
+            (r.effort, r.missing_values) for r in self.requests if isinstance(r, PageTranscription)
+        ]
 
-    def extract_document_meta(
-        self, rel_path: str, project_id: str, outline_and_excerpt: str
-    ) -> DocumentMetaExtraction:
-        self.calls.append("extract_document_meta")
+    @property
+    def synthesis_feedback(self) -> list[str | None]:
+        return [r.citation_feedback for r in self.requests if isinstance(r, CorpusSynthesis)]
+
+    def describe(self) -> dict[str, str]:
+        return {"embedding_model": self.embedding_model}
+
+    def run[T: BaseModel](self, request: StructuredRequest[T]) -> T:
+        self.requests.append(request)
+        self.calls.append(request.operation)
+        return cast(T, self.answer(request))
+
+    def answer(self, request: object) -> BaseModel:
+        match request:
+            case PageTranscription(native_text=native_text, image_webp=webp):
+                assert webp[:4] == b"RIFF", "pages must be rendered as WebP"
+                if self.page_script:
+                    return self.page_script.pop(0)
+                return parse_markdown_blocks(native_text)
+            case DocumentCatalogue(rel_path=rel_path, project_id=project_id):
+                return self.catalogue(rel_path, project_id)
+            case CorpusSynthesis(topic=topic, catalog_text=catalog):
+                if self.synthesis_script:
+                    markdown = self.synthesis_script.pop(0)
+                else:
+                    citations = _SECTION_TOKEN.findall(catalog)[:2]
+                    markdown = (
+                        f"# {topic}\n\nThe corpus covers several projects {' '.join(citations)}."
+                    )
+                return CorpusSynthesisExtraction(synthesis_markdown=markdown)
+        raise AssertionError(f"unexpected request {request!r}")
+
+    def catalogue(self, rel_path: str, project_id: str) -> DocumentMetaExtraction:
         name = rel_path.lower()
         stage: LifecycleStage = (
             "proposal" if "proposal" in name else "memorandum" if "memo" in name else "reference"
@@ -91,19 +123,11 @@ class FakeGateway:
             title=title, client=client, stage=stage, doc_date=None, summary=f"About {title}."
         )
 
-    def synthesize_corpus(
-        self,
-        topic: str,
-        curator_notes_text: str,
-        catalog_text: str,
-        invalid_citations_feedback: str | None = None,
-    ) -> str:
-        self.calls.append("synthesize_corpus")
-        self.synthesis_feedback.append(invalid_citations_feedback)
-        if self.synthesis_script:
-            return self.synthesis_script.pop(0)
-        citations = _SECTION_TOKEN.findall(catalog_text)[:2]
-        return f"# {topic}\n\nThe corpus covers several projects {' '.join(citations)}."
+    def run_agent[T: BaseModel](self, request: AgentRequest[T]) -> T:
+        raise AssertionError(f"the compiler makes no agent requests: {request.operation}")
+
+    def judge(self, operation: str, evidence: str, predicates: Sequence[str]) -> list[float | None]:
+        raise AssertionError(f"the compiler makes no judge requests: {operation}")
 
     def embed_texts(self, texts: Sequence[str]) -> NDArray[np.float32]:
         self.calls.append("embed_texts")
@@ -114,27 +138,82 @@ class FakeGateway:
         return hash_embedding(query, self.embedding_dimensions)
 
 
-def raw_response(
-    output: object, status: str = "completed", reason: str | None = None
-) -> SimpleNamespace:
-    """Mimics `LegacyAPIResponse`: JSON `text` and a `parse()` that validates the output.
-
-    `output=None` models output text that is not valid JSON (for example, truncated), so
-    `parse()` raises the `ValidationError` the SDK would.
-    """
-    details = {"reason": reason} if reason else None
-    text = json.dumps({"status": status, "incomplete_details": details})
-
-    def parse() -> SimpleNamespace:
-        if output is None:
-            PageExtraction.model_validate_json('{"blocks": [')
-        return SimpleNamespace(output_parsed=output)
-
-    return SimpleNamespace(text=text, parse=parse)
+# Scripted OpenAI HTTP API: the pinned SDK clients with their real request and response
+# handling, served by a local transport.
 
 
-def _default_output(schema: type) -> object:
-    if schema is DocumentMetaExtraction:
+def usage(input_tokens: int = 100, output_tokens: int = 10, cached: int = 0) -> dict[str, Any]:
+    return {
+        "input_tokens": input_tokens,
+        "input_tokens_details": {"cached_tokens": cached},
+        "output_tokens": output_tokens,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def message(text: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+
+def function_call(call_id: str, name: str, arguments: str) -> dict[str, Any]:
+    return {
+        "type": "function_call",
+        "id": f"fc_{call_id}",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": "completed",
+    }
+
+
+def response_body(
+    output: Sequence[dict[str, Any]],
+    status: str = "completed",
+    reason: str | None = None,
+    tokens: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A Responses API body; `tokens=None` gives the default usage of 100 in / 10 out."""
+    return {
+        "id": "resp_1",
+        "object": "response",
+        "created_at": 0,
+        "model": "gpt-6.1-sol",
+        "status": status,
+        "incomplete_details": {"reason": reason} if reason else None,
+        "output": list(output),
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": tokens if tokens is not None else usage(),
+    }
+
+
+def structured_body(output: BaseModel, **kwargs: Any) -> dict[str, Any]:
+    return response_body([message(output.model_dump_json())], **kwargs)
+
+
+def decision_body(answers: Sequence[float | None], input_tokens: int = 50) -> dict[str, Any]:
+    return {
+        "answers": [
+            {"type": "refusal", "name": None}
+            if p is None
+            else {"type": "predicate", "name": None, "probability": p}
+            for p in answers
+        ],
+        "model": "gpt-6-luna",
+        "usage": usage(input_tokens, 1),
+    }
+
+
+def _default_structured(schema_name: str) -> BaseModel:
+    if schema_name == "DocumentMetaExtraction":
         return DocumentMetaExtraction(
             title="Memo",
             client="Northwind Marine",
@@ -142,51 +221,103 @@ def _default_output(schema: type) -> object:
             doc_date="2025-10",
             summary="Bathymetry memo.",
         )
-    if schema is CorpusSynthesisExtraction:
+    if schema_name == "CorpusSynthesisExtraction":
         return CorpusSynthesisExtraction(synthesis_markdown="Overview [doc_001:doc_001_sec_001].")
-    paragraph = PageBlock(
-        kind="paragraph",
-        heading_level=0,
-        continues_from_previous_page=False,
-        merges_into_previous_row=False,
-        markdown="Page text",
-    )
-    return PageExtraction(blocks=[paragraph], visuals=[])
+    raise AssertionError(f"no default response for schema {schema_name!r}; script one")
 
 
-class FakeOpenAIClient:
-    """Stands in for `openai.OpenAI`: records requests and replays scripted outcomes.
+@dataclass
+class Exchange:
+    path: str
+    body: dict[str, Any]
+    read_timeout: float | None
 
-    A scripted outcome is a response object to return or an exception to raise; once the
-    script is exhausted every request succeeds with a fixed valid output.
+
+Outcome = dict[str, Any] | httpx2.Response | Exception
+
+
+class ScriptedOpenAI:
+    """Serves `/responses`, `/decisions` and `/embeddings` to real SDK clients from scripts.
+
+    A scripted outcome is a JSON body (status 200), an `httpx2.Response`, or a transport
+    exception to raise (`httpx2.ConnectError` reaches the SDK as `APIConnectionError`). When
+    a path's script is empty, catalogue and synthesis requests get a valid default, decisions
+    answer 0.75 to every question and embeddings return positive vectors.
     """
 
-    def __init__(self, script: Sequence[object] = (), dimensions: int = 8) -> None:
-        self.script = list(script)
-        self.dimensions = dimensions
-        self.parse_calls: list[dict[str, Any]] = []
-        self.embedding_calls: list[list[str]] = []
-        self.responses = SimpleNamespace(with_raw_response=SimpleNamespace(parse=self._parse))
-        self.embeddings = SimpleNamespace(create=self._embed)
+    def __init__(self) -> None:
+        self.scripts: dict[str, list[Outcome]] = {
+            "/responses": [],
+            "/decisions": [],
+            "/embeddings": [],
+        }
+        self.exchanges: list[Exchange] = []
+
+    def script(self, path: str, *outcomes: Outcome) -> None:
+        self.scripts[path] += outcomes
+
+    def requests(self, path: str) -> list[dict[str, Any]]:
+        return [e.body for e in self.exchanges if e.path == path]
 
     @property
-    def call_count(self) -> int:
-        return len(self.parse_calls) + len(self.embedding_calls)
+    def request_count(self) -> int:
+        return len(self.exchanges)
 
-    def _parse(self, **kwargs: Any) -> Any:
-        self.parse_calls.append(kwargs)
-        outcome = self.script.pop(0) if self.script else None
-        if isinstance(outcome, BaseException):
+    def _handle(self, request: httpx2.Request) -> httpx2.Response:
+        path = request.url.path.removeprefix("/v1")
+        body = json.loads(request.content)
+        timeout = request.extensions.get("timeout", {}).get("read")
+        self.exchanges.append(Exchange(path, body, timeout))
+        script = self.scripts[path]
+        outcome = script.pop(0) if script else self._default(path, body)
+        if isinstance(outcome, Exception):
             raise outcome
-        return outcome or raw_response(_default_output(kwargs["text_format"]))
+        if isinstance(outcome, httpx2.Response):
+            return outcome
+        return httpx2.Response(200, json=outcome)
 
-    def _embed(self, *, model: str, input: list[str], dimensions: int, timeout: float) -> Any:
-        self.embedding_calls.append(input)
+    def _default(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        if path == "/responses":
+            return structured_body(_default_structured(body["text"]["format"]["name"]))
+        if path == "/decisions":
+            return decision_body([0.75] * len(body["questions"]))
         rows = [
-            SimpleNamespace(index=i, embedding=[float(i + 1)] * dimensions)
-            for i in reversed(range(len(input)))
+            {
+                "object": "embedding",
+                "index": i,
+                "embedding": base64.b64encode(
+                    np.full(SCRIPTED_EMBEDDING_DIMENSIONS, i + 1, dtype=np.float32).tobytes()
+                ).decode(),
+            }
+            for i in reversed(range(len(body["input"])))
         ]
-        return SimpleNamespace(data=rows)
+        tokens = {"prompt_tokens": len(body["input"]), "total_tokens": len(body["input"])}
+        return {"object": "list", "data": rows, "model": body["model"], "usage": tokens}
+
+    def client(self) -> openai.OpenAI:
+        return openai.OpenAI(
+            api_key="test-key",
+            base_url=TEST_BASE_URL,
+            max_retries=0,
+            http_client=httpx2.Client(transport=httpx2.MockTransport(self._handle)),
+        )
+
+    def async_client(self) -> openai.AsyncOpenAI:
+        return openai.AsyncOpenAI(
+            api_key="test-key",
+            base_url=TEST_BASE_URL,
+            max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(self._handle)),
+        )
+
+    def gateway(self, **kwargs: Any) -> OpenAIGateway:
+        options: dict[str, Any] = {
+            "embedding_dimensions": SCRIPTED_EMBEDDING_DIMENSIONS,
+            "retry_delays": (0.0, 0.0, 0.0, 0.0),
+        }
+        return OpenAIGateway(
+            client=self.client(), async_client_factory=self.async_client, **(options | kwargs)
+        )
 
 
 def write_pdf(path: Path, pages: Sequence[Sequence[str]]) -> Path:

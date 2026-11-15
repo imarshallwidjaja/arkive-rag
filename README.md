@@ -33,6 +33,15 @@ and every tool except `search` works.
 The snapshot and `--cache` files must be different files outside the corpus
 directory. A corpus may not contain symlinks.
 
+`build` uses `gpt-6.1-sol` and `text-embedding-3-large`; the models are fixed
+in code. It prints the provider calls, tokens and estimated cost of the build.
+With `--max-cost 5`, no provider call starts once the estimated spend has
+reached USD 5, and the build stops with an error. Calls already in flight can
+take the total past the limit, and the estimate ignores the long-context
+surcharge. `--trace` sends traces of agent runs to the OpenAI dashboard (off by
+default); it fails if `OPENAI_AGENTS_DISABLE_TRACING` is set to `1` or `true`
+(in any letter case).
+
 Each top-level folder in the corpus is a project. An `AGENTS.md` anywhere in the
 corpus is a curator note: it appears in the topic guide and is searchable.
 
@@ -67,6 +76,9 @@ uv run --locked python -m evals.run --pack path/to/bathymetry.eval.json \
 `--layer` is `all` (every layer the pack defines), `1`, `2` or `3`. Layers 2
 and 3 need `--corpus`, whose files must still match the snapshot's
 `corpus_fingerprint`; `--cache` reuses a build cache for the holdout snapshot.
+`--max-cost` and `--trace` work as in `build`, and the usage and estimated cost
+of the run are written to `results.json` and `report.md`. An evaluation that
+reaches the spend limit stops with an error and writes no report.
 `--out` is required. Outputs quote corpus facts, so choose a private directory
 outside this repository; the runner refuses an `--out` or `--cache` that
 overlaps the pack, snapshot or corpus, and writes owner-only files.

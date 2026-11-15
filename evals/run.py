@@ -18,13 +18,15 @@ from arkive_rag.compiler import discover_corpus, read_source
 from arkive_rag.llm import (
     QUERY_DEADLINE_SECONDS,
     QUERY_REQUEST_TIMEOUT_SECONDS,
+    BuildCache,
     OpenAIGateway,
+    UsageMeter,
     load_dotenv_if_present,
 )
 from arkive_rag.models import ArkiveError, corpus_fingerprint
 from arkive_rag.snapshot import TopicSnapshot
 from evals.ablation import ARMS, RankSummary, run_layer1
-from evals.agents import CountingEmbedder, eval_client, run_layer2_qa, run_layer3_holdout_memo
+from evals.agents import CountingEmbedder, run_layer2_qa, run_layer3_holdout_memo
 from evals.schema import EvalPack, RubricCheck
 
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
@@ -46,17 +48,37 @@ def write_private_text(path: Path, text: str) -> None:
         handle.write(text)
 
 
-def _embedder(snapshot_path: Path) -> CountingEmbedder:
-    """Query embedder in the snapshot's own embedding space."""
-    with TopicSnapshot.open(snapshot_path) as snapshot:
-        model, dimensions = snapshot.embedding_model, snapshot.embedding_dimensions
+def _embedder(model: str, dimensions: int, meter: UsageMeter) -> CountingEmbedder:
+    """Query embedder in the snapshot's embedding space."""
     gateway = OpenAIGateway(
         embedding_model=model,
         embedding_dimensions=dimensions,
+        meter=meter,
         request_timeout=QUERY_REQUEST_TIMEOUT_SECONDS,
         operation_deadline=QUERY_DEADLINE_SECONDS,
     )
     return CountingEmbedder(gateway.embed_query)
+
+
+def _usage_report(summary: dict[str, Any]) -> list[str]:
+    limit = summary["max_cost_usd"]
+    lines = [
+        "## Usage",
+        "",
+        f"Estimated cost ${summary['estimated_cost_usd']:.4f} at Standard list prices"
+        f" (spend limit: {'none' if limit is None else f'${limit:g}'}); the estimate ignores the"
+        " long-context surcharge.",
+        "",
+        "| Operation | Model | Calls | Input tokens | Cached input | Output tokens | Est. USD |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in summary["rows"]:
+        cost = "unpriced" if row["estimated_usd"] is None else f"{row['estimated_usd']:.4f}"
+        lines.append(
+            f"| {row['operation']} | {row['model']} | {row['calls']} | {row['input_tokens']}"
+            f" | {row['cached_input_tokens']} | {row['output_tokens']} | {cost} |"
+        )
+    return [*lines, ""]
 
 
 def _pct(value: float) -> str:
@@ -173,50 +195,87 @@ def main(
     ] = None,
     layer: Annotated[Literal["all", "1", "2", "3"], typer.Option()] = "all",
     cache: Annotated[Path | None, typer.Option(help="Build cache reused by the holdout")] = None,
+    max_cost: Annotated[
+        float | None,
+        typer.Option(
+            help="Start no provider call once the estimated spend has reached this many USD;"
+            " calls in flight can pass it, and the estimate ignores the long-context surcharge"
+        ),
+    ] = None,
+    trace: Annotated[
+        bool, typer.Option(help="Send Agents SDK traces of agent runs to the OpenAI dashboard")
+    ] = False,
 ) -> None:
     """Run the eval pack's layers against a snapshot and its corpus (needs OPENAI_API_KEY)."""
+    if max_cost is not None and not max_cost > 0:
+        raise typer.BadParameter("--max-cost must be positive")
     eval_pack = EvalPack.load(pack)
     layers = _check_inputs(eval_pack, layer, pack, snapshot, corpus, out, cache)
     load_dotenv_if_present(Path.cwd() / ".env")
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
-    embed = _embedder(snapshot)
-    client = eval_client()
+    # One meter: the spend limit and the usage report cover every model call of the run.
+    meter = UsageMeter(max_cost)
+    with TopicSnapshot.open(snapshot) as snap:
+        embedding_model, embedding_dimensions = snap.embedding_model, snap.embedding_dimensions
     results: dict[str, Any] = {}
     report = ["# Arkive evaluation report", "", f"Pack: `{eval_pack.name}`", ""]
     report += [f"Snapshot: `{snapshot}`", ""]
-    if "1" in layers:
-        results["layer1"] = run_layer1(snapshot, embed, eval_pack.retrieval_cases)
-        report += _layer1_report(results["layer1"])
-    if "2" in layers:
-        assert corpus is not None
-        results["layer2"] = anyio.run(
-            run_layer2_qa, client, snapshot, corpus, embed, eval_pack.qa_cases
-        )
-        report += _layer2_report(results["layer2"])
-    if "3" in layers:
-        task, corpus_dir = eval_pack.holdout_memo, corpus
-        assert task is not None and corpus_dir is not None
-
-        async def layer3() -> dict[str, object]:
-            return await run_layer3_holdout_memo(
-                client,
-                full_snapshot_path=snapshot,
-                corpus_dir=corpus_dir,
-                cache_path=cache,
-                embedder=embed,
-                output_dir=out,
-                task=task,
+    try:
+        embed = _embedder(embedding_model, embedding_dimensions, meter)
+        gateway = OpenAIGateway(meter=meter, trace=trace)
+        if "1" in layers:
+            results["layer1"] = run_layer1(snapshot, embed, eval_pack.retrieval_cases)
+            report += _layer1_report(results["layer1"])
+        if "2" in layers:
+            assert corpus is not None
+            results["layer2"] = anyio.run(
+                run_layer2_qa, gateway, snapshot, corpus, embed, eval_pack.qa_cases
             )
+            report += _layer2_report(results["layer2"])
+        if "3" in layers:
+            task, corpus_dir = eval_pack.holdout_memo, corpus
+            assert task is not None and corpus_dir is not None
+            build_cache = BuildCache(cache) if cache else None
 
-        results["layer3"] = layer3_result = anyio.run(layer3)
-        blind_dir = out / "blind-drafts"
-        blind_dir.mkdir(mode=0o700, exist_ok=True)
-        for label, text in cast(dict[str, str], layer3_result["blind_drafts"]).items():
-            write_private_text(blind_dir / f"{label}.md", text)
-        write_private_text(
-            blind_dir / "blind_key.json", json.dumps(layer3_result["blind_key"], indent=2)
-        )
-        report += _layer3_report(layer3_result, task.rubric)
+            async def layer3() -> dict[str, object]:
+                return await run_layer3_holdout_memo(
+                    gateway,
+                    holdout_gateway=OpenAIGateway(
+                        cache=build_cache,
+                        meter=meter,
+                        trace=trace,
+                        embedding_model=embedding_model,
+                        embedding_dimensions=embedding_dimensions,
+                    ),
+                    full_snapshot_path=snapshot,
+                    corpus_dir=corpus_dir,
+                    embedder=embed,
+                    output_dir=out,
+                    task=task,
+                )
+
+            try:
+                results["layer3"] = layer3_result = anyio.run(layer3)
+            finally:
+                if build_cache:
+                    build_cache.close()
+            blind_dir = out / "blind-drafts"
+            blind_dir.mkdir(mode=0o700, exist_ok=True)
+            for label, text in cast(dict[str, str], layer3_result["blind_drafts"]).items():
+                write_private_text(blind_dir / f"{label}.md", text)
+            write_private_text(
+                blind_dir / "blind_key.json", json.dumps(layer3_result["blind_key"], indent=2)
+            )
+            report += _layer3_report(layer3_result, task.rubric)
+    except ArkiveError as exc:
+        # A stopped evaluation (the spend limit, or a failure outside any agent run) writes
+        # no report, but still states what it spent.
+        typer.echo(meter.summary_line())
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(meter.summary_line())
+    results["usage"] = meter.summary()
+    report += _usage_report(results["usage"])
     write_private_text(
         out / "results.json", json.dumps(results, indent=2, default=_jsonable, ensure_ascii=False)
     )

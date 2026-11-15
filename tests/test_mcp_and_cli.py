@@ -15,12 +15,19 @@ from mcp import Client, StdioServerParameters
 from mcp.types import CallToolResult, ImageContent, TextContent
 from typer.testing import CliRunner
 
-from arkive_rag import __version__
+from arkive_rag import __version__, cli
 from arkive_rag.cli import app
-from arkive_rag.models import ArkiveError
+from arkive_rag.models import ArkiveError, DocumentMetaExtraction
 from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
-from tests.support import BATHYMETRY_CORPUS, FakeGateway, compile_snapshot
+from tests.support import (
+    BATHYMETRY_CORPUS,
+    FakeGateway,
+    ScriptedOpenAI,
+    compile_snapshot,
+    structured_body,
+    usage,
+)
 
 PDF_PAGES = [
     ["# Rainfall", "Nine Year Median = 330.9 mm"],
@@ -247,7 +254,38 @@ def test_cli_build_rejects_outputs_in_the_corpus_before_any_work(
     shared = tmp_path / "t.db"
     same = runner.invoke(app, ["build", str(corpus), "-o", str(shared), "--cache", str(shared)])
 
+    free = runner.invoke(app, ["build", str(corpus), "-o", str(shared), "--max-cost", "0"])
+    keyless = runner.invoke(app, ["build", str(corpus), "-o", str(shared), "--max-cost", "1"])
+
     assert inside.exit_code == 1 and "inside the corpus directory" in inside.stderr
     assert same.exit_code == 1 and "must be different files" in same.stderr
+    assert free.exit_code == 2 and "--max-cost must be positive" in free.output
+    # A build that stops still reports what it spent.
+    assert keyless.exit_code == 1 and "OPENAI_API_KEY" in keyless.stderr
+    assert "usage: 0 provider calls" in keyless.stdout
     assert sorted(p.name for p in tmp_path.iterdir()) == ["corpus"]
     assert sorted(p.name for p in (corpus / "p1").iterdir()) == ["memo.md"]
+
+
+def test_cli_build_that_reaches_the_spend_limit_exits_with_its_usage_and_no_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus = tmp_path / "corpus"
+    (corpus / "p1").mkdir(parents=True)
+    (corpus / "p1" / "memo.md").write_text("# Memo\n\nSeagrass at 59,494 ha.")
+    api = ScriptedOpenAI()
+    # Cataloguing the one document costs $0.30, so the synthesis call that follows is refused.
+    meta = DocumentMetaExtraction(
+        title="Memo", client="Contoso Ports", stage="memorandum", doc_date=None, summary="Seagrass."
+    )
+    api.script("/responses", structured_body(meta, tokens=usage(100_000, 10_000)))
+    monkeypatch.setattr(cli, "OpenAIGateway", api.gateway)
+    output = tmp_path / "t.arkive.db"
+
+    result = CliRunner().invoke(app, ["build", str(corpus), "-o", str(output), "--max-cost", "0.3"])
+
+    assert result.exit_code == 1, result.output
+    assert "reached the $0.3 limit" in result.stderr
+    assert "usage: 1 provider calls" in result.stdout and "estimated $0.3000" in result.stdout
+    assert api.request_count == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["corpus"]

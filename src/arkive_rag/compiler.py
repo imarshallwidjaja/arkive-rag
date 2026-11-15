@@ -1,8 +1,9 @@
 """Compile a corpus directory into a `CompiledCorpus`.
 
 Every page of every PDF, Word and PowerPoint file goes through one pipeline:
-render to WebP, transcribe with the page model, check the transcript against the
-native text layer, then stitch pages into sections and chunks.
+render to WebP, transcribe with the generation model, check the transcript against
+the native text layer, then stitch pages into sections and chunks. The request types
+below own every prompt, output schema and reasoning effort the compiler sends.
 """
 
 from __future__ import annotations
@@ -20,18 +21,19 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 import pypdfium2 as pdfium
 from PIL import Image
 
-from arkive_rag.llm import LanguageGateway
+from arkive_rag.llm import Effort, LanguageGateway
 from arkive_rag.models import (
     Chunk,
     ChunkKind,
     CompiledCorpus,
     CompiledDocument,
     ConversionError,
+    CorpusSynthesisExtraction,
     CuratorNote,
     DocumentMetaExtraction,
     InvalidCitationError,
@@ -88,6 +90,123 @@ _SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 _MARKDOWN_HEADING = re.compile(r"(#{1,6})\s+(\S.*)")
 _FENCE = re.compile(r"(`{3,}|~{3,})")
+
+
+# Provider requests.
+
+PAGE_INSTRUCTIONS = """\
+You transcribe one rendered document page into structured Markdown blocks.
+The page image is the authority for layout and for the characters a reader sees.
+Use the native text layer to verify numbers, units, filenames and identifiers.
+Some PDFs encode font glyphs wrongly in the text layer, for example \u019f or =
+in place of "ti" (ENVes\u019fgator, Sen=nel-2) or a dropped ligature (aper):
+repair those from the image. Never otherwise change the author's wording,
+spelling or typos.
+
+Rules:
+- Emit blocks in reading order. kind is heading, paragraph, table or callout.
+- heading_level is 1-4 for headings (1 = document title or top-level section)
+  and 0 for every other kind. Heading markdown is the heading text without
+  leading # marks and keeps any visible section number, for example
+  "3.3. Wet and Dry Years Analysis".
+- Tables are GitHub Markdown tables with a header row and a | --- | separator row.
+  Never summarise a table: transcribe every row and cell.
+- Set continues_from_previous_page when the first block on this page continues
+  a paragraph or table that the previous page ended mid-way. A continued table
+  may omit or repeat its header row. Set merges_into_previous_row when the first
+  continued table row is the remainder of a row cut by the page break.
+- Omit running headers, running footers and page numbers.
+- For every chart, map, diagram, photo or figure add a visual: label is its
+  caption or a short title; transcript states what it shows, every axis label,
+  legend entry, annotation and printed value.
+- Copy every number, unit and filename exactly as printed. Never invent content.
+"""
+
+META_INSTRUCTIONS = """\
+You catalogue one consulting document. From its path, project folder, outline
+and opening text give: the document title, the client organisation, the
+lifecycle stage (proposal, memorandum, feedback, summary, case_study, guidance
+or reference), the document date as printed (null if absent) and a factual
+two-to-four sentence summary naming its subject, methods and key results.
+"""
+
+SYNTHESIS_INSTRUCTIONS = """\
+You write the orientation guide for a knowledge base that AI agents will search.
+Using only the catalog and curator notes, describe in Markdown: the projects,
+clients and how they relate; what each document type covers; recurring methods,
+datasets and results; and caveats or gaps the curator notes record.
+Cite every factual claim with the exact section citation tokens from the
+catalog, written as [doc_XXX:doc_XXX_sec_YYY]. Use no other citation form.
+"""
+
+
+@dataclass(frozen=True)
+class PageTranscription:
+    """Transcribe one rendered page. `missing_values` names anchors an earlier attempt lost."""
+
+    operation: ClassVar[str] = "transcribe_page"
+    output: ClassVar[type[PageExtraction]] = PageExtraction
+    instructions: ClassVar[str] = PAGE_INSTRUCTIONS
+    native_text: str
+    image_webp: bytes
+    prev_context: str | None
+    effort: Effort
+    missing_values: tuple[str, ...] = ()
+
+    def text(self) -> str:
+        text = f"NATIVE TEXT LAYER:\n{self.native_text or '(none: the page has no text layer)'}\n"
+        if self.prev_context:
+            text += f"\nEND OF PREVIOUS PAGE TRANSCRIPT:\n{self.prev_context}\n"
+        if self.missing_values:
+            text += (
+                "\nA previous transcription dropped these values. Each appears on the page;"
+                f" transcribe them exactly where they occur: {', '.join(self.missing_values)}\n"
+            )
+        return text
+
+
+@dataclass(frozen=True)
+class DocumentCatalogue:
+    """Title, client, lifecycle stage, date and summary of one non-curator document."""
+
+    operation: ClassVar[str] = "document_meta"
+    output: ClassVar[type[DocumentMetaExtraction]] = DocumentMetaExtraction
+    effort: ClassVar[Effort] = "low"
+    instructions: ClassVar[str] = META_INSTRUCTIONS
+    image_webp: ClassVar[None] = None
+    rel_path: str
+    project_id: str
+    outline_and_excerpt: str
+
+    def text(self) -> str:
+        return (
+            f"PATH: {self.rel_path}\nPROJECT FOLDER: {self.project_id}\n\n"
+            f"{self.outline_and_excerpt}"
+        )
+
+
+@dataclass(frozen=True)
+class CorpusSynthesis:
+    """The cited topic guide. `citation_feedback` lists a rejected draft's invalid citations."""
+
+    operation: ClassVar[str] = "synthesize_corpus"
+    output: ClassVar[type[CorpusSynthesisExtraction]] = CorpusSynthesisExtraction
+    effort: ClassVar[Effort] = "medium"
+    instructions: ClassVar[str] = SYNTHESIS_INSTRUCTIONS
+    image_webp: ClassVar[None] = None
+    topic: str
+    curator_notes_text: str
+    catalog_text: str
+    citation_feedback: str | None = None
+
+    def text(self) -> str:
+        text = (
+            f"TOPIC: {self.topic}\n\nCURATOR NOTES:\n{self.curator_notes_text}"
+            f"\n\nCATALOG:\n{self.catalog_text}"
+        )
+        if self.citation_feedback:
+            text += f"\n\nYOUR PREVIOUS DRAFT HAD INVALID CITATIONS:\n{self.citation_feedback}"
+        return text
 
 
 @dataclass(frozen=True)
@@ -349,6 +468,26 @@ def _fidelity_ok(
     return total == 0 or (total - len(missing)) / total >= threshold
 
 
+@dataclass(frozen=True)
+class FidelityAttempt:
+    """One row of the fidelity gate: the effort a transcription runs at and the recall it needs.
+
+    `few_anchor_threshold` applies to pages with one or two anchors.
+    """
+
+    effort: Effort
+    threshold: float
+    few_anchor_threshold: float
+
+
+# The first attempt runs at low effort; the retry runs at high effort and names the values the
+# first attempt lost. A missing filename fails either attempt.
+FIDELITY_ATTEMPTS = (
+    FidelityAttempt(effort="low", threshold=0.95, few_anchor_threshold=1.0),
+    FidelityAttempt(effort="high", threshold=0.85, few_anchor_threshold=0.85),
+)
+
+
 def transcribe_with_fidelity(
     gateway: LanguageGateway,
     *,
@@ -361,20 +500,24 @@ def transcribe_with_fidelity(
 ) -> PageExtraction:
     filenames, numbers = fidelity_anchors(body_text)
     total = len(filenames) + len(numbers)
-    first_threshold = 0.95 if total >= 3 else 1.0
-    extraction = gateway.transcribe_page(native_text, webp_bytes, prev_context)
-    missing = missing_anchors(page_number, extraction, filenames, numbers)
-    if _fidelity_ok(missing, filenames, total, first_threshold):
-        return extraction
-    extraction = gateway.transcribe_page(
-        native_text, webp_bytes, prev_context, tuple(missing), use_strong_model=True
-    )
-    missing = missing_anchors(page_number, extraction, filenames, numbers)
-    if not _fidelity_ok(missing, filenames, total, 0.85):
-        raise TranscriptionFidelityError(
-            f"{rel_path} page {page_number}: transcript is missing {', '.join(missing)}"
+    missing: list[str] = []
+    for attempt in FIDELITY_ATTEMPTS:
+        extraction = gateway.run(
+            PageTranscription(
+                native_text=native_text,
+                image_webp=webp_bytes,
+                prev_context=prev_context,
+                effort=attempt.effort,
+                missing_values=tuple(missing),
+            )
         )
-    return extraction
+        missing = missing_anchors(page_number, extraction, filenames, numbers)
+        threshold = attempt.threshold if total >= 3 else attempt.few_anchor_threshold
+        if _fidelity_ok(missing, filenames, total, threshold):
+            return extraction
+    raise TranscriptionFidelityError(
+        f"{rel_path} page {page_number}: transcript is missing {', '.join(missing)}"
+    )
 
 
 # Section assembly.
@@ -833,8 +976,12 @@ def compile_document(
             f"- {s.heading_path} (pp. {s.page_start}-{s.page_end})" for s in sections
         )
         excerpt = "\n\n".join(s.markdown for s in sections)[:6000]
-        meta = gateway.extract_document_meta(
-            source.rel_path, source.project_id, f"OUTLINE:\n{outline}\n\nOPENING TEXT:\n{excerpt}"
+        meta = gateway.run(
+            DocumentCatalogue(
+                rel_path=source.rel_path,
+                project_id=source.project_id,
+                outline_and_excerpt=f"OUTLINE:\n{outline}\n\nOPENING TEXT:\n{excerpt}",
+            )
         )
     ctx = ChunkContext(doc_id, source.project_id, meta.client, meta.stage, meta.title, prose_kind)
     return CompiledDocument(
@@ -897,14 +1044,16 @@ def synthesize_with_citations(
 ) -> str:
     notes_text = "\n\n".join(f"### {n.scope_path}\n{n.content}" for n in notes) or "(none)"
     catalog = _catalog_text(documents)
-    markdown = gateway.synthesize_corpus(topic, notes_text, catalog)
+    request = CorpusSynthesis(topic, notes_text, catalog)
+    markdown = gateway.run(request).synthesis_markdown
     bad = invalid_citations(markdown, documents)
     if not bad:
         return markdown
     feedback = f"Invalid: {', '.join(bad)}. Cite only these section tokens:\n" + "\n".join(
         f"[{d.doc_id}:{s.section_id}]" for d in _citable(documents) for s in d.sections
     )
-    markdown = gateway.synthesize_corpus(topic, notes_text, catalog, feedback)
+    retry = CorpusSynthesis(topic, notes_text, catalog, citation_feedback=feedback)
+    markdown = gateway.run(retry).synthesis_markdown
     bad = invalid_citations(markdown, documents)
     if bad:
         raise InvalidCitationError(

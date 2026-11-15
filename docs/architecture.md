@@ -10,15 +10,16 @@ snapshot calls OpenAI models. Reading one needs no network, except that the
 | Module | Owns |
 | --- | --- |
 | `models.py` | Domain types, OpenAI structured-output schemas, and the `ArkiveError` hierarchy. |
-| `llm.py` | `LanguageGateway` protocol, `OpenAIGateway` (all provider calls and their retry policy), `BuildCache`, and `.env` loading. |
-| `compiler.py` | Corpus discovery, rendering, the transcription fidelity gate, section stitching, chunking, cited synthesis, and embedding. Produces a `CompiledCorpus`. |
+| `llm.py` | The request protocols (`StructuredRequest`, `AgentRequest`), the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Agents SDK runs, Decisions, embeddings, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
+| `compiler.py` | Corpus discovery, rendering, the transcription fidelity gate, section stitching, chunking, cited synthesis, and embedding. Its request types (`PageTranscription`, `DocumentCatalogue`, `CorpusSynthesis`) own every prompt, output schema and reasoning effort it sends. Produces a `CompiledCorpus`. |
 | `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (hybrid search, grep, sections, pages). |
 | `server.py` | `TopicCatalog` (open snapshots keyed by topic) and the eight MCP tools. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
 
 Dependencies point one way: `cli` → `server`, `compiler`, `snapshot` → `llm`,
 `models`. The compiler receives a `LanguageGateway`, so tests drive it with a
-deterministic fake and no network.
+deterministic fake and no network. Only `llm.py` imports the OpenAI SDK and the
+OpenAI Agents SDK (`openai-agents`); `compiler.py` and `evals/` do not.
 
 ## Corpus layout
 
@@ -55,7 +56,7 @@ file follows one path:
    scale 2.0 to WebP (quality 85), and its full Unicode native text layer is
    extracted. libpdfium is not thread-safe, so every pdfium call runs under one
    process-wide lock; WebP encoding runs outside it.
-2. **Transcribe.** The page model (`gpt-5.4-mini` by default) receives the page
+2. **Transcribe.** `gpt-6.1-sol` at low reasoning effort receives the page
    image, the native text, and the tail of the previous page's transcript. It
    returns blocks (`heading`, `paragraph`, `table`, `callout`) and visual
    transcripts for charts, maps and figures. The image decides what the page
@@ -69,12 +70,14 @@ file follows one path:
    anchors are GIS/data filenames (`.tif`, `.tiff`, `.shp`, `.nc`, `.gpkg`,
    `.csv`), signed formatted numbers such as `-330.9` or `59,494`, and integers
    of three or more digits. They are checked against the exact text the page
-   contributes to its sections. If a filename is missing from the
-   transcript, or recall is below 0.95 (1.0 when the page has one or two
-   anchors), the page is transcribed once more with the synthesis model and the
-   missing values are named in the request. After that retry, a missing
-   filename or recall below 0.85 raises `TranscriptionFidelityError` naming the
-   file, page and missing values.
+   contributes to its sections. `FIDELITY_ATTEMPTS` holds the two attempts. If
+   a filename is missing from the first (low effort) transcript, or recall is
+   below 0.95 (1.0 when the page has one or two anchors), the page is
+   transcribed once more at high effort and the missing values are named in
+   the request. After that retry, a missing filename or recall below 0.85
+   raises `TranscriptionFidelityError` naming the file, page and missing
+   values. Because each request carries the previous page's transcript tail, a
+   changed page also changes the cache keys of the later pages of its document.
 4. **Stitch sections.** `assemble_sections` keeps a heading stack (levels 1-4;
    a heading with level 0 counts as level 2) and starts a section at every
    heading; text before the first heading is `Overview`. A table block keeps
@@ -85,8 +88,8 @@ file follows one path:
    rows, and when `merges_into_previous_row` is set, its first row is merged
    cell by cell into the row cut by the page break. Visual transcripts become
    quoted `[Visual — Page N: label]` blocks in the section.
-5. **Catalogue.** The page model returns the document's title, client,
-   lifecycle stage, date and summary. Curator notes skip this call.
+5. **Catalogue.** `gpt-6.1-sol` at low effort returns the document's title,
+   client, lifecycle stage, date and summary. Curator notes skip this call.
 6. **Chunk.** `build_chunks` packs paragraphs and callouts into prose chunks of
    up to 1,800 characters, splitting an oversized paragraph at sentence ends. A
    table up to 2,400 characters is one `table` chunk; a larger table is split on
@@ -101,7 +104,7 @@ Markdown files skip steps 1-3: `parse_markdown_blocks` splits them
 deterministically, keeping a fenced code block as one literal paragraph, and
 they have no page images for `view_page`.
 
-After all documents compile, the synthesis model (`gpt-5.4`) writes the topic
+After all documents compile, `gpt-6.1-sol` at medium effort writes the topic
 guide from the catalogue and curator notes. Every bracketed `[doc...]` token
 must have the exact form `[doc_XXX:doc_XXX_sec_YYY]` and resolve to a section
 of a catalogued (non-curator) document, and at least one valid citation is
@@ -112,30 +115,85 @@ retry lists the invalid and valid IDs; a second failure raises
 
 ## Provider calls
 
-`OpenAIGateway` is the single owner of retry policy; the SDK client runs with
-`max_retries=0`.
+`OpenAIGateway` is the only provider caller for builds and the evaluation
+harness, and the single owner of retry policy; the SDK clients run with
+`max_retries=0`. Domain code describes each call with a request object that
+owns its prompt, output schema and reasoning effort; the gateway owns
+transport. Model IDs are constants in `llm.py`: `DEFAULT_MODEL`
+(`gpt-6.1-sol`), `DECISION_MODEL` (`gpt-6-luna`) and `text-embedding-3-large`
+at 1,536 dimensions. The CLI has no model options.
 
+- `run` sends one structured `responses.parse` call with the request's
+  `reasoning.effort`.
+- `run_agent` runs a bounded OpenAI Agents SDK agent with read-only tools and
+  structured output on its own event loop with its own async client. Each
+  model turn is one provider operation under the retry policy below; the
+  Agents SDK's own retries stay off. Invalid tool input (`NotFoundError`,
+  `InvalidFilterError`, `ValueError` or `KeyError`) and a call to a tool name
+  the agent does not have go back to the model as text. Not finishing within
+  `max_turns`, a response that is not `completed`, or a provider or
+  spend-limit error raises `ProviderError`; any other tool exception,
+  including `SnapshotIntegrityError` and a `ProviderError` from a tool, ends
+  the run and propagates. Tools use non-strict JSON schemas.
+- `judge` asks the Decisions API (`POST /v1/decisions`) one `predicate`
+  question per statement over shared evidence and returns one probability
+  per predicate in order, `None` where the model refused that question. No
+  predicates means no request; more than 400 are split across requests.
+- `converse` is the free-text agent conversation the evaluation harness uses
+  (see Evaluation). It runs on the caller's event loop and is never cached.
+- Hosted Agents SDK tracing is off unless the caller passes `trace=True`
+  (`--trace`). The trace export key is passed with each run, not set on the
+  SDK's process-wide exporter. `trace=True` while
+  `OPENAI_AGENTS_DISABLE_TRACING` disables tracing fails when the gateway is
+  constructed.
 - Rate-limit, connection, timeout and server errors are retried, up to five
   attempts per operation, waiting 2, 5, 12 and 25 s or the provider's
-  `Retry-After`. All attempts share one deadline (600 s for builds, 60 s for
-  query embedding in `search` and `serve`), and each request's timeout (180 s,
-  or 30 s for queries) is capped by the time left. A wait that would pass the
-  deadline raises `ProviderError` at once.
-- A response that stops at `max_output_tokens` (starting at 16,384) is retried
-  once with double the budget.
-- Every other failure, a refusal, a body that is not JSON, or output that
-  fails schema validation raises `ProviderError`.
+  `Retry-After` (a value that is not a finite number is ignored). All attempts
+  share one deadline (600 s for builds, 60 s for query embedding in `search`
+  and `serve`), and each request's timeout (180 s, or 30 s for queries) is
+  capped by the time left. A wait that would pass the deadline raises
+  `ProviderError` at once, and no attempt starts after it. An agent turn's
+  whole attempt, not only each socket read, ends at the deadline. The spend
+  limit is checked before every attempt.
+- A structured response that stops at `max_output_tokens` (starting at
+  16,384) is retried once with double the budget. Agent turns allow 16,384
+  output tokens.
+- Every other failure, a refusal, a body that is not JSON, missing or
+  malformed usage, or output that fails schema validation raises
+  `ProviderError`, on every call type. A `judge` probability that is not a
+  finite number within 0..1 is malformed too.
 - Embeddings are requested in batches of up to 128 inputs and 100,000
   characters. Response rows must carry each index exactly once and are
   reordered by it; every row is L2-normalised. A wrong shape or a zero or
   non-finite vector raises `ProviderError`.
 
 `--cache <file>` enables `BuildCache`, a SQLite table of validated responses
-keyed by SHA-256 of operation, model, prompt, schema and input hash (the page
-image hash for transcription). A rebuild of an unchanged corpus with the same
-cache makes no provider requests. Changing a model, prompt or source page
-changes the key. An entry that no longer decodes or validates is a miss and is
+keyed by SHA-256 of the call's inputs:
+
+- `run`: operation, model, effort, instructions, text, output schema and the
+  image hash;
+- `run_agent`: the same plus `max_turns`, each tool's name, description and
+  parameter schema, and the request's `source_digest` (a hash of everything
+  the tools can read), so a result computed while the tools could read one
+  source set never answers a request over another;
+- `judge`: operation, decision model, evidence and predicates;
+- embeddings: model, dimensions and the batch's texts.
+
+A rebuild of an unchanged corpus with the same cache makes no provider
+requests. The first valid entry stored under a key is canonical: when two build
+threads miss the same key at once, the second writer returns the first
+writer's value. An entry that no longer decodes or validates is a miss and is
 replaced. A new cache file is created with mode `0600`.
+
+Every provider response adds its operation, model, input, cached-input and
+output tokens to a `UsageMeter`, which estimates USD from Standard-tier list
+prices in `llm.PRICES` (`gpt-6.1-sol`, `gpt-6-luna` on Decisions, and
+`text-embedding-3-large`; the long-context surcharge is not modelled).
+`build` prints the totals. With `--max-cost`, no provider call starts once the
+estimate has reached the limit: it raises `BudgetExceededError`, a
+`ProviderError`, and `build` exits with an error after printing the totals.
+Calls already in flight can take the total past the limit. A spend limit with a
+model that has no price is refused when the gateway is constructed.
 
 ## Snapshot file
 
@@ -249,15 +307,25 @@ the snapshot's `corpus_fingerprint` matches the pack's when the pack sets one,
 and that the fingerprint of the `--corpus` files (found by `discover_corpus`)
 equals the snapshot's.
 
-Eval agents and judges use one OpenAI client with SDK retries off
-(`max_retries=0`, 180 s per request). `retry_transient` in `llm.py`, the same
-policy `OpenAIGateway` uses, retries transient failures of each model call
-within a 300 s deadline. An agent run records its final status: only
-`completed` counts as an answer; `incomplete` (or another response status),
-`empty_answer`, `max_turns` and `provider_error` are reported and never
-credited. Invalid tool input goes back to the model as an error message; any
-other tool exception stops the evaluation. Each run reports its tokens, tool
-calls and query embeddings (`search_embed_calls`).
+Eval agents and judges go through `OpenAIGateway` at medium reasoning effort
+on `gpt-6.1-sol`: agents through `converse`, judges through `run`, under the
+gateway's retry policy and metering. An agent run records its final status:
+only `completed` counts as an answer; `incomplete` (or another response
+status), `empty_answer`, `max_turns` and `provider_error` (including a
+`ProviderError` raised by a tool) are reported and never credited. A query
+embedding that fails behind the MCP `search` tool also ends its run as
+`provider_error`: the MCP server hands the model a tool error, so the harness
+reads the failure from its query embedder after the conversation. Invalid
+input to a harness tool goes back to the model as an error message; any other
+exception from a harness tool stops the evaluation. An unexpected exception
+inside an MCP server tool reaches the model as a tool error, as any MCP host
+would see it, and does not stop the evaluation. Each run reports its tokens,
+turns, tool calls and the query embeddings that returned a vector
+(`search_embed_calls`). `--max-cost` sets one spend limit over every model call
+of the evaluation; reaching it is not a run outcome but stops the evaluation
+with an error, the usage line and a non-zero exit, and writes no report.
+`--trace` turns on hosted Agents SDK tracing, and `results.json` (`usage`) and
+`report.md` (Usage) record calls, tokens and the estimated cost per operation.
 
 An eval pack is a JSON file validated by `EvalPack` in `evals/schema.py`
 (`format` `arkive-eval-pack/1`). It holds `retrieval_cases`, `qa_cases` and an
@@ -273,15 +341,15 @@ is a fictional pack; real packs stay in the private store.
 | Layer | Module | Measures |
 | --- | --- | --- |
 | 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of BM25-only, dense-only and hybrid RRF ranking over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks all three arms from one query embedding per case. |
-| 2 | `agents.py` | A `gpt-5.4` tool loop answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the eight Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
-| 3 | `agents.py` | One deliverable is held out. Before any file is copied or any model is called, the reference document (`reference_doc_id`) must carry a `held_out_markers` entry in its project or path, and every file under `included_paths` (selected through `discover_corpus`, so symlinks are refused) must have no marker, not belong to the reference's project and not have the reference's bytes. The holdout snapshot is compiled from those bytes with the full snapshot's embedding model and dimensions (reusing `--cache`), checked again, and only then published as `<out>/holdout.arkive.db`. Three arms draft the deliverable from the task's `run_notes` and `memo_instructions`: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts get the task's rubric checks and a blinded side-by-side judge against the reference. |
+| 2 | `agents.py` | An agent conversation answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the eight Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
+| 3 | `agents.py` | One deliverable is held out. Before any file is copied or any model is called, the reference document (`reference_doc_id`) must carry a `held_out_markers` entry in its project or path, and every file under `included_paths` (selected through `discover_corpus`, so symlinks are refused) must have no marker, not belong to the reference's project and not have the reference's bytes. The holdout snapshot is compiled from those bytes in a worker thread with the full snapshot's embedding model and dimensions (reusing `--cache`), checked again, and only then published as `<out>/holdout.arkive.db`. Three arms draft the deliverable from the task's `run_notes` and `memo_instructions`: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts get the task's rubric checks and a blinded side-by-side judge against the reference. |
 
 The evaluation harness compiles the holdout snapshot through `compile_corpus`
 itself, the one real OpenAI build outside `arkive-rag build`. Blinded drafts and
 `blind_key.json` are written to `<out>/blind-drafts`. `tests/test_evals.py`
-covers pack validation, scoring, the rubric, the holdout guards, unfinished-run
-handling, the runner's input checks and the tool adapters offline, using the
-example pack.
+covers pack validation, scoring, the rubric, the holdout guards, the run-status
+contract, the layer 3 flow, the runner's input checks and the tool adapters
+offline, using the example pack and a scripted OpenAI HTTP transport.
 
 ## Verification
 

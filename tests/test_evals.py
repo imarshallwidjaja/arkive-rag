@@ -1,39 +1,42 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import anyio
+import httpx2
 import numpy as np
-import openai
 import pytest
 from numpy.typing import NDArray
-from openai.types.responses import ResponseFunctionToolCall
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
+from arkive_rag.llm import BudgetExceededError, Tool, ToolReply, ToolResult, UsageMeter
 from arkive_rag.models import DocumentInfo, ProviderError, UnsafePathError
 from arkive_rag.server import INSTRUCTIONS
 from arkive_rag.snapshot import TopicSnapshot
 from evals import agents
+from evals import run as eval_run
 from evals.ablation import first_satisfying_rank, run_layer1, summarize_ranks
 from evals.agents import (
     QA_INSTRUCTIONS,
+    AgentRun,
     CountingEmbedder,
+    MemoBlindComparison,
     RawCorpus,
-    ToolOutput,
     arkive_mcp_tools,
     assert_holdout_clean,
     blind_assignment,
     check_reference_held_out,
     compile_holdout_snapshot,
+    run_agent,
     run_layer2_qa,
-    run_tool_loop,
+    run_layer3_holdout_memo,
     score_memo_rubric,
     select_holdout_sources,
     with_server_instructions,
@@ -47,7 +50,18 @@ from evals.schema import (
     normalize_for_match,
     satisfies_groups,
 )
-from tests.support import BATHYMETRY_CORPUS, FakeGateway, compile_snapshot, write_pdf
+from tests.support import (
+    BATHYMETRY_CORPUS,
+    FakeGateway,
+    ScriptedOpenAI,
+    compile_snapshot,
+    function_call,
+    message,
+    response_body,
+    structured_body,
+    usage,
+    write_pdf,
+)
 
 EXAMPLE_PACK_PATH = Path(__file__).resolve().parents[1] / "evals" / "example_pack.eval.json"
 
@@ -385,30 +399,42 @@ def test_blind_assignment_is_a_seeded_permutation() -> None:
     assert sorted(key.values()) == arms
 
 
+def invoke(tools: list[Tool], name: str, **args: Any) -> ToolResult:
+    """Call a tool the way the gateway does: awaiting it when it is a coroutine function."""
+    (tool,) = [t for t in tools if t.name == name]
+
+    async def call() -> ToolResult:
+        result = tool.invoke(args)
+        return await result if inspect.isawaitable(result) else result
+
+    return anyio.run(call)
+
+
 def test_raw_corpus_tools_read_text_layers_and_page_images(tmp_path: Path) -> None:
     (tmp_path / "p1").mkdir()
     (tmp_path / "AGENTS.md").write_text("# Notes\nStill closing out.", encoding="utf-8")
     write_pdf(tmp_path / "p1" / "memo.pdf", [["Rainfall 330.9 mm"], ["Outputs depth_grid.tif"]])
-    raw = RawCorpus(tmp_path)
+    tools = RawCorpus(tmp_path).tools
 
-    def call(name: str, **args: Any) -> ToolOutput:
-        return anyio.run(raw.execute, name, args)
-
-    assert json.loads(cast(str, call("list_corpus_files"))) == [
+    assert json.loads(cast(str, invoke(tools, "list_corpus_files"))) == [
         {"rel_path": "AGENTS.md", "pages": 1},
         {"rel_path": "p1/memo.pdf", "pages": 2},
     ]
-    assert json.loads(cast(str, call("grep_raw_text", pattern="330.9"))) == [
+    assert json.loads(cast(str, invoke(tools, "grep_raw_text", pattern="330.9"))) == [
         {"rel_path": "p1/memo.pdf", "page": 1, "line": "Rainfall 330.9 mm"}
     ]
-    assert "--- page 2 ---\nOutputs depth_grid.tif" in cast(
-        str, call("read_raw_pages", rel_path="p1/memo.pdf", start_page=1, end_page=9)
-    )
-    image = call("view_raw_page_image", rel_path="p1/memo.pdf", page_number=2)
-    assert isinstance(image, list) and image[1]["type"] == "input_image"
-    assert cast(str, call("view_raw_page_image", rel_path="AGENTS.md", page_number=1)).startswith(
-        "ERROR"
-    )
+    pages = invoke(tools, "read_raw_pages", rel_path="p1/memo.pdf", start_page=1, end_page=9)
+    assert "--- page 2 ---\nOutputs depth_grid.tif" in cast(str, pages)
+    image = invoke(tools, "view_raw_page_image", rel_path="p1/memo.pdf", page_number=2)
+    assert isinstance(image, ToolReply) and image.images[0].mime_type == "image/webp"
+    assert image.images[0].data[8:12] == b"WEBP"
+    no_image = invoke(tools, "view_raw_page_image", rel_path="AGENTS.md", page_number=1)
+    assert cast(str, no_image).startswith("ERROR")
+    # Malformed arguments are invalid input, which the gateway returns to the model.
+    with pytest.raises(ValueError, match="start_page must be an integer page number, got None"):
+        invoke(tools, "read_raw_pages", rel_path="p1/memo.pdf", start_page=None, end_page=1)
+    with pytest.raises(ValueError, match="page_number"):
+        invoke(tools, "view_raw_page_image", rel_path="p1/memo.pdf", page_number="2")
 
 
 def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_path: Path) -> None:
@@ -416,23 +442,26 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
         tmp_path, BATHYMETRY_CORPUS, pdfs={"p101-harbour-lidar/chart.pdf": [["Figure 330.9"]]}
     )
 
-    async def run() -> tuple[list[str], ToolOutput, ToolOutput, ToolOutput, str]:
+    async def run() -> tuple[list[str], ToolResult, ToolResult, ToolResult, str]:
         async with arkive_mcp_tools(snapshot_path, FakeGateway().embed_query) as (
             tools,
-            execute,
             server_instructions,
         ):
-            grep = await execute("grep", {"topic": "bathymetry", "pattern": "330.9"})
-            page = await execute(
-                "view_page", {"topic": "bathymetry", "doc_id": "doc_001", "page_number": 1}
-            )
-            missing = await execute("read_section", {"topic": "bathymetry", "section_id": "nope"})
-            return [t["name"] for t in tools], grep, page, missing, server_instructions
+            by_name = {t.name: t for t in tools}
+
+            async def call(name: str, **args: Any) -> ToolResult:
+                result = by_name[name].invoke(args)
+                return await result if inspect.isawaitable(result) else result
+
+            grep = await call("grep", topic="bathymetry", pattern="330.9")
+            page = await call("view_page", topic="bathymetry", doc_id="doc_001", page_number=1)
+            missing = await call("read_section", topic="bathymetry", section_id="nope")
+            return sorted(by_name), grep, page, missing, server_instructions
 
     names, grep, page, missing, server_instructions = anyio.run(run)
     assert server_instructions == INSTRUCTIONS
     assert with_server_instructions("Answer.", "  ") == "Answer."
-    assert sorted(names) == sorted(
+    assert names == sorted(
         [
             "list_topics",
             "get_topic_guide",
@@ -445,129 +474,168 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
         ]
     )
     assert isinstance(grep, str) and "330.9" in grep
-    assert isinstance(page, list) and [item["type"] for item in page] == [
-        "input_text",
-        "input_image",
-    ]
+    assert isinstance(page, ToolReply) and page.images[0].mime_type == "image/webp"
     assert isinstance(missing, str) and missing.startswith("ERROR:")
 
 
-@dataclass
-class FakeResponses:
-    script: list[SimpleNamespace]
-    requests: list[dict[str, Any]] = field(default_factory=list)
-
-    def create(self, **kwargs: Any) -> SimpleNamespace:
-        self.requests.append(kwargs)
-        return self.script.pop(0)
+# Agent conversations: the run-status contract.
 
 
-def response(
-    rid: str, output: list[Any], text: str = "", status: str = "completed"
-) -> SimpleNamespace:
-    usage = SimpleNamespace(input_tokens=100, output_tokens=10)
-    return SimpleNamespace(id=rid, output=output, output_text=text, status=status, usage=usage)
-
-
-def tool_call(call_id: str, arguments: str) -> ResponseFunctionToolCall:
-    return ResponseFunctionToolCall(
-        type="function_call", call_id=call_id, name="echo", arguments=arguments
-    )
-
-
-def test_tool_loop_feeds_outputs_back_and_accounts_tokens_turns_and_errors() -> None:
-    responses = FakeResponses(
-        [
-            response("r1", [tool_call("c1", '{"value": 7}'), tool_call("c2", "not json")]),
-            response("r2", [], text="final answer"),
-        ]
-    )
-    client = cast(openai.OpenAI, SimpleNamespace(responses=responses))
-
-    embedder = CountingEmbedder(FakeGateway().embed_query)
-
-    async def execute(name: str, args: dict[str, Any]) -> ToolOutput:
-        embedder(str(args["value"]))
-        return f"{name}={args['value']}"
-
-    run = anyio.run(
-        lambda: run_tool_loop(
-            client,
-            instructions="i",
-            prompt="q",
-            tools=[],
-            execute=execute,
-            max_turns=4,
-            embedder=embedder,
-        )
-    )
-    assert (run.answer, run.status, run.turns, run.tool_calls) == (
-        "final answer",
-        "completed",
-        2,
-        2,
-    )
-    assert (run.input_tokens, run.output_tokens, run.search_embed_calls) == (200, 20, 1)
-    assert run.error is None
-    second = responses.requests[1]
-    assert second["previous_response_id"] == "r1"
-    assert second["input"][0] == {
-        "type": "function_call_output",
-        "call_id": "c1",
-        "output": "echo=7",
-    }
-    assert second["input"][1]["output"].startswith("ERROR: JSONDecodeError")
-
-    looping = FakeResponses([response(f"r{i}", [tool_call("c", '{"value": 1}')]) for i in range(2)])
-    capped = anyio.run(
-        lambda: run_tool_loop(
-            cast(openai.OpenAI, SimpleNamespace(responses=looping)),
-            instructions="i",
-            prompt="q",
-            tools=[],
-            execute=execute,
-            max_turns=2,
-            embedder=embedder,
-        )
-    )
-    assert (capped.answer, capped.status, capped.turns) == ("", "max_turns", 2)
-    assert capped.search_embed_calls == 2
-
-
-def loop(script: list[SimpleNamespace], execute: Any) -> Any:
-    client = cast(openai.OpenAI, SimpleNamespace(responses=FakeResponses(script)))
-    return anyio.run(
-        lambda: run_tool_loop(
-            client,
-            instructions="i",
-            prompt="q",
-            tools=[],
-            execute=execute,
-            max_turns=4,
-            embedder=CountingEmbedder(FakeGateway().embed_query),
-        )
-    )
-
-
-def test_tool_loop_reports_unfinished_runs_and_surfaces_non_input_failures() -> None:
-    executed: list[str] = []
-
-    async def execute(name: str, args: dict[str, Any]) -> ToolOutput:
-        executed.append(name)
+def echo_tool(embedder: CountingEmbedder) -> Tool:
+    async def echo(args: dict[str, Any]) -> str:
         if args.get("fail") == "provider":
             raise ProviderError("embedding service down")
         if args.get("fail") == "bug":
             raise RuntimeError("harness bug")
-        return "ok"
+        embedder(str(args["value"]))
+        return f"echo={args['value']}"
 
-    partial_call = response("r1", [tool_call("c1", "{}")], text="half a memo", status="incomplete")
-    run = loop([partial_call], execute)
-    assert (run.status, run.answer, executed) == ("incomplete", "half a memo", [])
-    assert loop([response("r1", [], text="  ")], execute).status == "empty_answer"
-    failed = loop([response("r1", [tool_call("c1", '{"fail": "provider"}')])], execute)
+    return Tool("echo", "Echo a value.", {"type": "object", "properties": {}}, echo)
+
+
+def converse(api: ScriptedOpenAI, max_turns: int = 4, **gateway: Any) -> AgentRun:
+    embedder = CountingEmbedder(FakeGateway().embed_query)
+    return anyio.run(
+        lambda: run_agent(
+            api.gateway(**gateway),
+            operation="qa_probe",
+            instructions="i",
+            prompt="q",
+            tools=[echo_tool(embedder)],
+            max_turns=max_turns,
+            embedder=embedder,
+        )
+    )
+
+
+def scripted(*bodies: dict[str, Any]) -> ScriptedOpenAI:
+    api = ScriptedOpenAI()
+    api.script("/responses", *bodies)
+    return api
+
+
+def test_conversation_feeds_outputs_back_and_accounts_tokens_turns_and_tools() -> None:
+    api = scripted(
+        response_body(
+            [function_call("c1", "echo", '{"value": 7}'), function_call("c2", "echo", "not json")]
+        ),
+        response_body([message("final answer")]),
+    )
+
+    run = converse(api)
+
+    assert (run.answer, run.status, run.turns, run.tool_calls, run.error) == (
+        "final answer",
+        "completed",
+        2,
+        2,
+        None,
+    )
+    assert (run.input_tokens, run.output_tokens, run.search_embed_calls) == (200, 20, 1)
+    first, second = api.requests("/responses")
+    assert (first["instructions"], first["reasoning"]) == ("i", {"effort": "medium"})
+    outputs = [i["output"] for i in second["input"] if i.get("type") == "function_call_output"]
+    assert outputs[0] == "echo=7" and outputs[1].startswith("ERROR: JSONDecodeError")
+
+    looping = [response_body([function_call(f"c{i}", "echo", '{"value": 1}')]) for i in range(2)]
+    capped = converse(scripted(*looping), max_turns=2)
+    assert (capped.answer, capped.status, capped.turns, capped.search_embed_calls) == (
+        "",
+        "max_turns",
+        2,
+        2,
+    )
+
+
+def test_conversation_reports_unfinished_runs_and_surfaces_non_input_failures() -> None:
+    partial = response_body([message("half a memo")], "incomplete", "max_output_tokens")
+    run = converse(scripted(partial))
+    assert (run.status, run.answer, run.tool_calls, run.input_tokens) == (
+        "incomplete",
+        "half a memo",
+        0,
+        100,
+    )
+    assert converse(scripted(response_body([message("  ")]))).status == "empty_answer"
+    failed = converse(
+        scripted(response_body([function_call("c1", "echo", '{"fail": "provider"}')]))
+    )
     assert failed.status == "provider_error" and "embedding service down" in (failed.error or "")
+    rejected = ScriptedOpenAI()
+    rejected.script("/responses", httpx2.Response(400, json={"error": {"message": "too long"}}))
+    turn_failed = converse(rejected)
+    assert (turn_failed.status, turn_failed.turns) == ("provider_error", 1)
+    assert "too long" in (turn_failed.error or "")
     with pytest.raises(RuntimeError, match="harness bug"):
-        loop([response("r1", [tool_call("c1", '{"fail": "bug"}')])], execute)
+        converse(scripted(response_body([function_call("c1", "echo", '{"fail": "bug"}')])))
+    # The spend limit is not a run outcome: it ends the evaluation.
+    costly = response_body(
+        [function_call("c1", "echo", '{"value": 1}')], tokens=usage(100_000, 10_000)
+    )
+    with pytest.raises(BudgetExceededError):
+        converse(scripted(costly), meter=UsageMeter(max_cost_usd=0.30))
+
+
+def mcp_search_run(
+    tmp_path: Path, embed: Any, queries: tuple[str, ...] = ("rainfall",)
+) -> tuple[AgentRun, ScriptedOpenAI]:
+    """One Arkive agent run whose model calls `search` once per query and then answers."""
+    snapshot_path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
+    embedder = CountingEmbedder(embed)
+    searches = [
+        function_call(f"c{i}", "search", json.dumps({"topic": "bathymetry", "query": query}))
+        for i, query in enumerate(queries)
+    ]
+    api = scripted(response_body(searches), response_body([message("The median is 330.9 mm.")]))
+
+    async def run() -> AgentRun:
+        async with arkive_mcp_tools(snapshot_path, embedder) as (tools, _):
+            return await run_agent(
+                api.gateway(),
+                operation="qa_arkive_mcp",
+                instructions="Answer.",
+                prompt="What is the median rainfall?",
+                tools=tools,
+                max_turns=4,
+                embedder=embedder,
+            )
+
+    return anyio.run(run), api
+
+
+def test_query_embedding_failures_behind_mcp_search_end_the_run_or_the_evaluation(
+    tmp_path: Path,
+) -> None:
+    def unavailable(query: str) -> NDArray[np.float32]:
+        raise ProviderError("embedding service down")
+
+    run, api = mcp_search_run(tmp_path / "down", unavailable)
+    # The model saw a tool error and answered anyway; the run is still not usable.
+    assert len(api.requests("/responses")) == 2
+    assert (run.status, run.search_embed_calls) == ("provider_error", 0)
+    assert "embedding service down" in (run.error or "")
+
+    working, _ = mcp_search_run(tmp_path / "up", FakeGateway().embed_query)
+    assert (working.status, working.search_embed_calls) == ("completed", 1)
+
+    def over_budget(query: str) -> NDArray[np.float32]:
+        raise BudgetExceededError("estimated spend reached the limit")
+
+    with pytest.raises(BudgetExceededError):
+        mcp_search_run(tmp_path / "budget", over_budget)
+
+    # A later failure that stops the evaluation outranks an earlier ordinary provider error.
+    for name, stop in (
+        ("down-then-budget", BudgetExceededError("estimated spend reached the limit")),
+        ("down-then-bug", RuntimeError("harness bug")),
+    ):
+        failures = iter([ProviderError("embedding service down"), stop])
+
+        def down_then_stop(query: str, failures: Any = failures) -> NDArray[np.float32]:
+            raise next(failures)
+
+        with pytest.raises(type(stop), match=str(stop)):
+            mcp_search_run(tmp_path / name, down_then_stop, ("rainfall", "lidar"))
 
 
 def test_layer2_does_not_judge_or_credit_unfinished_runs(
@@ -576,23 +644,104 @@ def test_layer2_does_not_judge_or_credit_unfinished_runs(
     snapshot_path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
     cases = example_pack.qa_cases
     runs = 2 * len(cases)
-    script = [response(f"r{i}", [], text="330.9 median", status="incomplete") for i in range(runs)]
-    # No `parse` attribute: any judge call would fail the test.
-    responses = FakeResponses(script)
-    client = cast(openai.OpenAI, SimpleNamespace(responses=responses))
+    api = ScriptedOpenAI()
+    api.script(
+        "/responses",
+        *[response_body([message("330.9 median")], "incomplete") for _ in range(runs)],
+    )
     embedder = CountingEmbedder(FakeGateway().embed_query)
     result = anyio.run(
-        run_layer2_qa, client, snapshot_path, tmp_path / "bathymetry-corpus", embedder, cases
+        run_layer2_qa, api.gateway(), snapshot_path, tmp_path / "bathymetry-corpus", embedder, cases
     )
+    # One request per run: no judge request was made for an unfinished run.
+    requests = api.requests("/responses")
+    assert len(requests) == runs and api.request_count == runs
     # Like an MCP host, only the Arkive arm sees the server's initialize instructions.
     mcp_instructions = f"{QA_INSTRUCTIONS}\n\nMCP SERVER INSTRUCTIONS:\n{INSTRUCTIONS.strip()}"
-    assert [r["instructions"] for r in responses.requests] == [
-        QA_INSTRUCTIONS,
-        mcp_instructions,
-    ] * len(cases)
+    assert [r["instructions"] for r in requests] == [QA_INSTRUCTIONS, mcp_instructions] * len(cases)
     rows = cast(list[dict[str, Any]], result["rows"])
     assert [r["status"] for r in rows] == ["incomplete"] * runs
     assert not any(r["phrase_coverage"] or r["groups_matched"] or r["judge"] for r in rows)
     report = "\n".join(_layer2_report(result))
     assert f"| raw_files | 0/{len(cases)} | 0/{len(cases)} | n/a |" in report
     assert "harbour_median_rainfall / arkive_mcp: incomplete" in report
+
+
+def test_layer3_compiles_the_holdout_off_the_event_loop_and_judges_completed_drafts(
+    tmp_path: Path, example_pack: EvalPack
+) -> None:
+    task = holdout_task(example_pack)
+    corpus = write_corpus(tmp_path / "corpus", HOLDOUT_FILES)
+    full = compile_snapshot(tmp_path, {k: cast(str, v) for k, v in HOLDOUT_FILES.items()})
+    with TopicSnapshot.open(full) as snapshot:
+        reference_id = next(
+            d.doc_id for d in snapshot.list_documents() if d.rel_path.startswith("p103")
+        )
+    task = task.model_copy(update={"reference_doc_id": reference_id})
+    out = tmp_path / "out"
+    out.mkdir()
+    verdict = MemoBlindComparison(candidates=[], ranking=["Candidate_1"])
+    api = ScriptedOpenAI()
+    api.script("/responses", *[response_body([message(f"draft {i}")]) for i in range(2)])
+    api.script("/responses", response_body([message("cut")], "incomplete"))
+    api.script("/responses", structured_body(verdict))
+    holdout_gateway = FakeGateway()
+
+    result = anyio.run(
+        lambda: run_layer3_holdout_memo(
+            api.gateway(),
+            holdout_gateway=holdout_gateway,
+            full_snapshot_path=full,
+            corpus_dir=corpus,
+            embedder=CountingEmbedder(FakeGateway().embed_query),
+            output_dir=out,
+            task=task,
+        )
+    )
+
+    assert holdout_gateway.calls and (out / "holdout.arkive.db").is_file()
+    arms = cast(dict[str, Any], result["arms"])
+    assert [a["run"].status for a in arms.values()] == ["completed", "completed", "incomplete"]
+    assert arms["arm_c_full_arkive_mcp"]["rubric"] is None
+    assert sorted(cast(dict[str, str], result["blind_key"]).values()) == [
+        "arm_a_zero_shot",
+        "arm_b_chunk_only_rag",
+    ]
+    assert result["blind_comparison"] == verdict
+    judge = api.requests("/responses")[-1]
+    assert judge["text"]["format"]["name"] == "MemoBlindComparison"
+    assert "draft 0" in judge["input"][0]["content"][0]["text"]
+
+
+def test_eval_runner_stops_with_usage_and_no_report_when_the_spend_limit_is_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
+    api = ScriptedOpenAI()
+    # The first QA turn costs $0.30 and asks for a tool, so the second turn hits the limit.
+    api.script(
+        "/responses",
+        response_body(
+            [function_call("c1", "list_corpus_files", "{}")], tokens=usage(100_000, 10_000)
+        ),
+    )
+
+    def scripted_gateway(**options: Any) -> Any:
+        # The fake snapshot's embedding model has no price; no query is embedded here.
+        options.pop("embedding_model", None)
+        options.pop("embedding_dimensions", None)
+        return api.gateway(**options)
+
+    monkeypatch.setattr(eval_run, "OpenAIGateway", scripted_gateway)
+    out = tmp_path / "out"
+    corpus = tmp_path / "bathymetry-corpus"
+    arguments = ["--pack", str(EXAMPLE_PACK_PATH), "--snapshot", str(snapshot_path)]
+    arguments += ["--out", str(out), "--corpus", str(corpus), "--layer", "2", "--max-cost", "0.3"]
+
+    result = CliRunner().invoke(eval_app, arguments)
+
+    assert result.exit_code == 1, result.output
+    assert "reached the $0.3 limit" in result.stderr
+    assert "usage: 1 provider calls" in result.stdout and "estimated $0.3000" in result.stdout
+    assert api.request_count == 1
+    assert list(out.iterdir()) == []

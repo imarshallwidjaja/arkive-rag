@@ -6,12 +6,11 @@ import subprocess
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import cast
 
-import openai
 import pytest
 
 from arkive_rag.compiler import (
+    FIDELITY_ATTEMPTS,
     MAX_CHUNK_CHARS,
     ChunkContext,
     SectionDraft,
@@ -31,7 +30,7 @@ from arkive_rag.compiler import (
     synthesize_with_citations,
     transcribe_with_fidelity,
 )
-from arkive_rag.llm import BuildCache, OpenAIGateway
+from arkive_rag.llm import BuildCache
 from arkive_rag.models import (
     CompiledDocument,
     ConversionError,
@@ -47,7 +46,7 @@ from arkive_rag.models import (
 )
 from tests.support import (
     FakeGateway,
-    FakeOpenAIClient,
+    ScriptedOpenAI,
     write_docx,
     write_flat_presentation,
     write_pdf,
@@ -151,7 +150,7 @@ def test_curator_notes_are_kept_and_compiled_as_searchable_guidance(tmp_path: Pa
     assert {c.kind for c in guidance.chunks} == {"guidance"}
     assert "case study has not been written" in guidance.chunks[0].content
     assert proposal.stage == "proposal"
-    assert gateway.calls.count("extract_document_meta") == 1
+    assert gateway.calls.count("document_meta") == 1
     assert corpus.embeddings.shape == (len(corpus.all_chunks()), FakeGateway.embedding_dimensions)
 
 
@@ -487,7 +486,7 @@ def test_missing_anchors_reject_a_dropped_filename_beside_a_kept_one() -> None:
         assert missing_anchors(1, dropped, filenames, numbers) == ["a.tif"]
 
 
-def test_fidelity_retry_with_strong_model_recovers_missing_numbers() -> None:
+def test_fidelity_retry_at_high_effort_names_and_recovers_missing_numbers() -> None:
     native = "Nine Year Median = 330.9 mm\nArea 59,494 ha\nThreshold 0.05"
     lossy = page(block("paragraph", "Nine Year Median rainfall. Area 59494 ha."))
     faithful = page(block("paragraph", "Nine Year Median = 330.9 mm. Area 59,494 ha. p 0.05"))
@@ -504,7 +503,30 @@ def test_fidelity_retry_with_strong_model_recovers_missing_numbers() -> None:
     )
 
     assert result == faithful
-    assert gateway.transcribe_calls == [(False, ()), (True, ("0.05", "330.9"))]
+    assert gateway.transcribe_calls == [("low", ()), ("high", ("0.05", "330.9"))]
+    assert [(a.effort, a.threshold, a.few_anchor_threshold) for a in FIDELITY_ATTEMPTS] == [
+        ("low", 0.95, 1.0),
+        ("high", 0.85, 0.85),
+    ]
+
+
+def test_fidelity_gate_accepts_the_first_attempt_at_its_own_threshold() -> None:
+    # 20 anchors, one dropped: 0.95 recall passes the first attempt's threshold.
+    native = " ".join(str(100 + i) for i in range(20))
+    lossy = page(block("paragraph", native.replace("119", "")))
+    gateway = FakeGateway(page_script=[lossy])
+
+    transcribe_with_fidelity(
+        gateway,
+        rel_path="memo.pdf",
+        page_number=1,
+        native_text=native,
+        body_text=native,
+        webp_bytes=b"RIFF....WEBP",
+        prev_context=None,
+    )
+
+    assert gateway.transcribe_calls == [("low", ())]
 
 
 def test_fidelity_gate_fails_loudly_when_a_filename_stays_missing() -> None:
@@ -522,7 +544,7 @@ def test_fidelity_gate_fails_loudly_when_a_filename_stays_missing() -> None:
             webp_bytes=b"RIFF....WEBP",
             prev_context=None,
         )
-    assert len(gateway.transcribe_calls) == 2
+    assert gateway.transcribe_calls == [("low", ()), ("high", ("harbour_dry_depth_thresh.tif",))]
 
 
 # Cited synthesis.
@@ -557,9 +579,7 @@ def test_synthesis_without_valid_citations_after_retry_raises(tmp_path: Path) ->
 
 
 class GuidanceStageGateway(FakeGateway):
-    def extract_document_meta(
-        self, rel_path: str, project_id: str, outline_and_excerpt: str
-    ) -> DocumentMetaExtraction:
+    def catalogue(self, rel_path: str, project_id: str) -> DocumentMetaExtraction:
         return DocumentMetaExtraction(
             title="Style guide",
             client="Contoso Ports",
@@ -591,23 +611,24 @@ def test_second_compile_with_build_cache_makes_no_provider_requests(tmp_path: Pa
     # Sorts before AGENTS.md, so it is doc_001: the section the fake synthesis cites.
     (tmp_path / "corpus" / "p1" / "2024-memo.md").write_text("# Results\n\nSeagrass at 59,494 ha.")
     (tmp_path / "corpus" / "p1" / "AGENTS.md").write_text("Memo is final.")
-    client = FakeOpenAIClient()
+    api = ScriptedOpenAI()
 
     def build() -> list[str]:
         with BuildCache(tmp_path / "cache.db") as cache:
-            gateway = OpenAIGateway(
-                client=cast(openai.OpenAI, client), cache=cache, embedding_dimensions=8
+            corpus = compile_corpus(
+                tmp_path / "corpus", api.gateway(cache=cache), topic="t", title="T"
             )
-            corpus = compile_corpus(tmp_path / "corpus", gateway, topic="t", title="T")
         return [corpus.synthesis_markdown, *(c.content for c in corpus.all_chunks())]
 
     first = build()
-    requests_after_first = client.call_count
+    requests_after_first = api.request_count
     second = build()
 
     assert requests_after_first == 3
-    assert client.call_count == requests_after_first
+    assert api.request_count == requests_after_first
     assert second == first
+    # Each compiler operation states its own effort.
+    assert [b["reasoning"]["effort"] for b in api.requests("/responses")] == ["low", "medium"]
 
 
 # Rendered formats end to end.
