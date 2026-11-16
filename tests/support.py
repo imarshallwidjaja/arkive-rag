@@ -420,6 +420,12 @@ def structured_body(output: BaseModel, **kwargs: Any) -> dict[str, Any]:
     return response_body([message(output.model_dump_json())], **kwargs)
 
 
+def refusal_body(text: str = "I can't help with that.") -> dict[str, Any]:
+    """A completed response whose message refuses instead of giving structured output."""
+    refusal = message("") | {"content": [{"type": "refusal", "refusal": text}]}
+    return response_body([refusal])
+
+
 def decision_body(answers: Sequence[float | None], input_tokens: int = 50) -> dict[str, Any]:
     return {
         "answers": [

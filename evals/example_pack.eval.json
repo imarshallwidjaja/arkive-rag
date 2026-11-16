@@ -1,5 +1,5 @@
 {
-  "format": "arkive-eval-pack/2",
+  "format": "arkive-eval-pack/3",
   "name": "example-bathymetry",
   "description": "Fictional example pack for a small marine survey corpus (Northwind Marine and Contoso Ports). Every name, value and file in it is invented; it shows the pack format and drives the offline tests.",
   "corpus_fingerprint": null,
@@ -42,58 +42,75 @@
   "qa_cases": [
     {
       "case_id": "harbour_median_rainfall",
+      "kind": "lookup",
       "question": "What median rainfall reference line does the harbour lidar memo chart show?",
       "ground_truth_facts": ["The chart shows a Nine Year Median of 330.9 mm."],
       "required_groups": [["330.9"], ["median"]],
-      "source_anchors": ["p101-harbour-lidar/harbour-memo.md (doc_001), section Rainfall"]
+      "source_anchors": [
+        {"doc_id": "doc_001", "pages": null}
+      ]
     },
     {
       "case_id": "reef_case_study_status",
+      "kind": "lookup",
       "question": "Is there a finished case study for the reef sonar project?",
       "ground_truth_facts": ["No: the reef Sentinel-2 case study has not been written yet."],
       "required_groups": [["not been written", "not yet", "no case study"]],
-      "source_anchors": ["p103-reef-sonar/AGENTS.md (doc_003), section Status"]
+      "source_anchors": [
+        {"doc_id": "doc_003", "pages": null}
+      ]
+    },
+    {
+      "case_id": "reef_survey_fee",
+      "kind": "abstention",
+      "question": "What fee did Northwind Marine charge for the reef sonar project?",
+      "ground_truth_facts": ["The corpus does not state a fee for the reef sonar project."],
+      "required_groups": [["does not", "not stated", "no fee"]]
     }
   ],
-  "holdout_memo": {
-    "included_paths": ["p101-harbour-lidar", "p103-reef-sonar"],
-    "held_out_markers": ["p102", "estuary-multibeam"],
-    "reference_doc_id": "doc_002",
-    "memo_instructions": "You are a hydrographic analyst at Northwind Marine writing the proposal for the Contoso Ports estuary multibeam survey. Write the complete proposal in Markdown from the scoping notes in the prompt. Every project-specific fact must come from the scoping notes. Prior Northwind Marine project documents may be available through your tools; when they are, follow their house structure, conventions and explanations. Return only the proposal.",
-    "run_notes": "scoping_notes.json\n- project: Contoso Ports estuary multibeam bathymetry survey\n- sonar: multibeam echosounder, 400 kHz, 2024-02-01 .. 2024-03-15\n- area: 812 km2, vertical datum LAT\n- tiling: 2000 x 2000 px tiles\n- outputs: estuary_depth_grid.tif, estuary_depth_uncertainty.tif; nodata=9999; masking=None\n- risks: false soundings over moorings and dredged channels\n- fee: 120,000 AUD\n",
-    "rubric": [
-      {
-        "check_id": "scope_and_budget",
-        "category": "house_structure",
-        "description": "A scope section and a budget section.",
-        "require_groups": [["scope"], ["budget"]]
-      },
-      {
-        "check_id": "limitations_section",
-        "category": "house_structure",
-        "description": "A limitations section that recommends ground truthing.",
-        "require_groups": [["limitation"], ["ground truth", "check line"]]
-      },
-      {
-        "check_id": "tile_size_not_contaminated",
-        "category": "anti_contamination",
-        "description": "Keeps the 2000 x 2000 tile size and does not claim the 500 x 500 tiles of the harbour lidar project; contrasting with the harbour project's 1 m grid is allowed.",
-        "require_groups": [["2000 x 2000", "2000x2000"]],
-        "forbid_any": ["500 x 500", "500x500"]
-      },
-      {
-        "check_id": "no_borrowed_masking_claim",
-        "category": "anti_contamination",
-        "description": "States that no masking was applied and does not borrow the harbour project's land mask.",
-        "require_groups": [["no masking applied"]],
-        "forbid_any": ["coastline land mask", "masked using the harbour"]
-      },
-      {
-        "check_id": "deliverables_and_area_kept",
-        "category": "anti_contamination",
-        "description": "Lists both GeoTIFF deliverables and keeps the 812 km2 survey area.",
-        "require_groups": [["estuary_depth_grid.tif"], ["estuary_depth_uncertainty.tif"], ["812 km2"]]
-      }
-    ]
-  }
+  "holdouts": [
+    {
+      "holdout_id": "estuary-proposal",
+      "included_paths": ["p101-harbour-lidar", "p103-reef-sonar"],
+      "held_out_markers": ["p102", "estuary-multibeam"],
+      "reference_doc_id": "doc_002",
+      "instructions": "You are a hydrographic analyst at Northwind Marine writing the proposal for the Contoso Ports estuary multibeam survey. Write the complete proposal in Markdown from the scoping notes in the prompt. Every project-specific fact must come from the scoping notes. Prior Northwind Marine project documents may be available through your tools; when they are, follow their house structure, conventions and explanations. Return only the proposal.",
+      "run_notes": "scoping_notes.json\n- project: Contoso Ports estuary multibeam bathymetry survey\n- sonar: multibeam echosounder, 400 kHz, 2024-02-01 .. 2024-03-15\n- area: 812 km2, vertical datum LAT\n- tiling: 2000 x 2000 px tiles\n- outputs: estuary_depth_grid.tif, estuary_depth_uncertainty.tif; nodata=9999; masking=None\n- risks: false soundings over moorings and dredged channels\n- fee: 120,000 AUD\n",
+      "exemplar_paths": ["p101-harbour-lidar/harbour-memo.md"],
+      "rubric": [
+        {
+          "check_id": "scope_and_budget",
+          "category": "house_structure",
+          "description": "A scope section and a budget section.",
+          "require_groups": [["scope"], ["budget"]]
+        },
+        {
+          "check_id": "limitations_section",
+          "category": "house_structure",
+          "description": "A limitations section that recommends ground truthing.",
+          "require_groups": [["limitation"], ["ground truth", "check line"]]
+        },
+        {
+          "check_id": "tile_size_not_contaminated",
+          "category": "anti_contamination",
+          "description": "Keeps the 2000 x 2000 tile size and does not claim the 500 x 500 tiles of the harbour lidar project; contrasting with the harbour project's 1 m grid is allowed.",
+          "require_groups": [["2000 x 2000", "2000x2000"]],
+          "forbid_any": ["500 x 500", "500x500"]
+        },
+        {
+          "check_id": "no_borrowed_masking_claim",
+          "category": "anti_contamination",
+          "description": "States that no masking was applied and does not borrow the harbour project's land mask.",
+          "require_groups": [["no masking applied"]],
+          "forbid_any": ["coastline land mask", "masked using the harbour"]
+        },
+        {
+          "check_id": "deliverables_and_area_kept",
+          "category": "anti_contamination",
+          "description": "Lists both GeoTIFF deliverables and keeps the 812 km2 survey area.",
+          "require_groups": [["estuary_depth_grid.tif"], ["estuary_depth_uncertainty.tif"], ["812 km2"]]
+        }
+      ]
+    }
+  ]
 }

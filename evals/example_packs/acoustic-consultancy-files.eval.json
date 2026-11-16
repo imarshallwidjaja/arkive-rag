@@ -1,0 +1,288 @@
+{
+  "format": "arkive-eval-pack/3",
+  "name": "example-acoustic-consultancy-files",
+  "description": "Fictional eval pack for the acoustic-consultancy-files example collection (Larkspur Acoustics, one flat folder of noise reports, quotations and a planning response). Every name, value and file in it is invented.",
+  "corpus_fingerprint": "5e1617e770bd919926b21408691b32403dab57a9deecde22ef4e4cc38d829a71",
+  "retrieval_cases": [],
+  "qa_cases": [
+    {
+      "case_id": "fernmoss_quoted_fee",
+      "kind": "lookup",
+      "question": "What total fee did Larkspur Acoustics quote for the Fernmoss Primary School heat pump assessment?",
+      "ground_truth_facts": [
+        "Quotation LA-Q-111 totals GBP 3,510 for 4.5 days, excluding VAT."
+      ],
+      "required_groups": [
+        [
+          "3,510"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_005",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "sound_level_meters_by_survey",
+      "kind": "multi_document",
+      "question": "Which sound level meter did Larkspur Acoustics use on each of its four noise surveys?",
+      "ground_truth_facts": [
+        "Corvane depot: Tessaly SL-55.",
+        "Fernmoss Primary School: Tessaly SL-40.",
+        "Hartwell Tap Room: Orrin 820.",
+        "Pellow Mill: Brakel NX3."
+      ],
+      "required_groups": [
+        [
+          "SL-55"
+        ],
+        [
+          "SL-40"
+        ],
+        [
+          "Orrin 820"
+        ],
+        [
+          "Brakel NX3"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_001",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_004",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_006",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_008",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "pellow_survey_dates",
+      "kind": "abstention",
+      "question": "On which dates did Larkspur Acoustics run the Pellow Mill noise survey?",
+      "ground_truth_facts": [
+        "The Pellow Mill documents give a 72-hour survey but no survey dates."
+      ],
+      "required_groups": [
+        [
+          "does not",
+          "not stated",
+          "no record",
+          "not available",
+          "cannot find",
+          "not in"
+        ]
+      ]
+    },
+    {
+      "case_id": "nsr_meaning",
+      "kind": "vocabulary",
+      "question": "What does NSR mean in Larkspur Acoustics reports, and which property was the nearest NSR for the Fernmoss heat pumps?",
+      "ground_truth_facts": [
+        "NSR means noise-sensitive receptor.",
+        "The nearest NSR for the Fernmoss heat pumps is the rear garden of 7 Fernmoss Close, 22 m from the plant deck."
+      ],
+      "required_groups": [
+        [
+          "noise-sensitive receptor",
+          "noise sensitive receptor"
+        ],
+        [
+          "7 Fernmoss Close"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_004",
+          "pages": null
+        }
+      ]
+    }
+  ],
+  "holdouts": [
+    {
+      "holdout_id": "pellow-mill-facade-report",
+      "included_paths": [
+        "corvane-depot-night-noise-report.pdf",
+        "corvane-depot-quotation.docx",
+        "corvane-depot-response-to-planning-comments.docx",
+        "fernmoss-school-heat-pump-report.pdf",
+        "fernmoss-school-quotation.pdf",
+        "hartwell-tap-room-noise-report.docx",
+        "hartwell-tap-room-quotation.docx"
+      ],
+      "held_out_markers": [
+        "pellow-mill"
+      ],
+      "reference_doc_id": "doc_008",
+      "instructions": "You are Tomasz Reyburn, acoustic consultant, at Larkspur Acoustics writing the facade noise report for the Pellow Mill residential conversion. Write the complete report in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Larkspur Acoustics documents, follow their house structure and wording. Return only the report.",
+      "run_notes": "- our ref: LA-R-139; quotation LA-Q-139\n- client: Pellow Mill Developments LLP; contact Mr Callum Odegaard\n- author: Tomasz Reyburn; checker: Orla Penhallow\n- building: Pellow Mill, 4 storeys, brick; 24 flats planned over ground to third floor\n- west side: faces the Wendlecombe branch line, freight trains overnight; every west flat counts as an NSR for rail noise\n- south side: faces Canal Street, light local traffic\n- logging: 72 h; W2 = west elevation, 2nd-floor scaffold; S1 = south elevation, 1st floor; meter Brakel NX3\n- pass-bys: 14 night freight trains picked out of audio pellow_w2_audio_01.wav .. pellow_w2_audio_14.wav\n- W2 day 07:00-23:00: LAeq 61, LAmax 89, LA90 44 dB\n- W2 night 23:00-07:00: LAeq 56, LAmax 87, LA90 38 dB\n- S1 day 07:00-23:00: LAeq 52, LAmax 71, LA90 41 dB\n- S1 night 23:00-07:00: LAeq 43, LAmax 66, LA90 33 dB\n- facade west: glazing Rw 41, vent Dn,e,w 42, bedroom LAmax predicted 44 dB\n- facade south: glazing Rw 33, vent Dn,e,w 34, bedroom LAmax predicted 38 dB\n- facade east: glazing Rw 31, vent Dn,e,w 34, bedroom LAmax predicted 35 dB\n- prediction basis: windows shut, vents open; rooms per architect's window schedule PM-WS-07\n- conclusion: rail freight governs the west design; west bedrooms need Rw 41 or better + acoustic trickle vents, or mechanical ventilation with windows shut; south and east fine with ordinary thermal double glazing\n- advice: Rw 41 glazing + acoustic trickle vents in all west habitable rooms; acoustic mastic around new frames at the brickwork (unsealed joint may cost 5 dB or more); pre-occupation test of 2 west bedrooms\n",
+      "exemplar_paths": [
+        "corvane-depot-night-noise-report.pdf",
+        "fernmoss-school-heat-pump-report.pdf",
+        "hartwell-tap-room-noise-report.docx"
+      ],
+      "rubric": [
+        {
+          "check_id": "report_identity_kept",
+          "category": "project_facts",
+          "description": "Carries the LA-R-139 reference and the client contact.",
+          "require_groups": [
+            [
+              "LA-R-139"
+            ],
+            [
+              "Odegaard"
+            ]
+          ]
+        },
+        {
+          "check_id": "facade_specification_kept",
+          "category": "project_facts",
+          "description": "Specifies Rw 41 glazing for the west elevation and cites window schedule PM-WS-07.",
+          "require_groups": [
+            [
+              "Rw 41"
+            ],
+            [
+              "PM-WS-07"
+            ]
+          ]
+        },
+        {
+          "check_id": "survey_evidence_kept",
+          "category": "project_facts",
+          "description": "Names the meter and the pass-by audio files, and the 87 dB night LAmax.",
+          "require_groups": [
+            [
+              "Brakel NX3"
+            ],
+            [
+              "pellow_w2_audio_01.wav"
+            ],
+            [
+              "87"
+            ]
+          ]
+        },
+        {
+          "check_id": "no_borrowed_site_values",
+          "category": "anti_contamination",
+          "description": "Does not carry over another project's site, meter or report reference.",
+          "forbid_any": [
+            "Sallowfield",
+            "Quayside",
+            "Fernmoss Close",
+            "Tessaly SL-55",
+            "LA-R-126"
+          ]
+        }
+      ]
+    },
+    {
+      "holdout_id": "corvane-depot-night-noise-report",
+      "included_paths": [
+        "fernmoss-school-heat-pump-report.pdf",
+        "fernmoss-school-quotation.pdf",
+        "hartwell-tap-room-noise-report.docx",
+        "hartwell-tap-room-quotation.docx",
+        "pellow-mill-facade-report.docx",
+        "pellow-mill-quotation.pdf"
+      ],
+      "held_out_markers": [
+        "corvane"
+      ],
+      "reference_doc_id": "doc_001",
+      "instructions": "You are Orla Penhallow, principal consultant, at Larkspur Acoustics writing the night-time noise report for the Corvane haulage depot. Write the complete report in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Larkspur Acoustics documents, follow their house structure and wording. Return only the report.",
+      "run_notes": "- our ref: LA-R-126; quotation LA-Q-126\n- client: Corvane Logistics Ltd; contact Ms Priya Lanchester\n- author: Orla Penhallow; checker: Bea Ashdown-Kerr\n- depot: 32 trailer bays; one gate, onto Sallowfield Road\n- neighbours: Sallowfield Terrace back gardens look onto the yard over 60 m of rough grass\n- application: permit movements 23:00-07:00; at present emergencies only\n- S1 = logger at back fence of 11 Sallowfield Terrace, 5 weeknights; files corvane_s1_night1.csv .. corvane_s1_night5.csv\n- S2 = attended in the yard: reversing tractor unit at 10 m; refrigeration unit at 5 m\n- meter: Tessaly SL-55\n- S1 23:00-07:00, median of 5 nights: LAeq 47, LAmax 78, LA90 39 dB\n- S1 05:00-07:00, median of 5 nights: LAeq 53, LAmax 78, LA90 42 dB\n- S2 reversing alarm, 10 m: LAeq 86, LAmax 93 dB\n- S2 refrigeration unit, 5 m: LAeq 74, LAmax 76 dB\n- sources: tonal reversing alarms; reefer units left on with trailers parked\n- events: top S1 LAmax when trucks reverse into bays 8-14 (they back onto the terrace); tonal alarm audible in all logged events over 70 dB\n- council sleep-disturbance criterion: LAmax 60 dB; nearest NSR got 78\n- HGVs per night hour at the gate (camera, mean of 5 weeknights): 23-00 6; 00-01 3; 01-02 2; 02-03 1; 03-04 4; 04-05 9; 05-06 14; 06-07 11\n- pattern: traffic peaks 05:00-07:00 ahead of the morning shift, same hours as the highest S1 LAeq\n- view: early-morning activity is over the criterion today; longer hours with no mitigation would spread such events through the night\n- with mitigation: predicted LAmax 59 dB or lower, enough to back the longer hours\n- mitigation: broadband alarms on all depot tractor units, visiting hauliers told by gate instruction; relocate bays 8-14 to the yard's west side; 3 m earth bund on the east boundary; reefers plugged into the shore power posts when they arrive, diesel units switched off\n",
+      "exemplar_paths": [
+        "fernmoss-school-heat-pump-report.pdf",
+        "hartwell-tap-room-noise-report.docx",
+        "pellow-mill-facade-report.docx"
+      ],
+      "rubric": [
+        {
+          "check_id": "report_identity_kept",
+          "category": "project_facts",
+          "description": "Carries the LA-R-126 reference and the client contact.",
+          "require_groups": [
+            [
+              "LA-R-126"
+            ],
+            [
+              "Lanchester"
+            ]
+          ]
+        },
+        {
+          "check_id": "threshold_comparison_kept",
+          "category": "project_facts",
+          "description": "Compares the 78 dB LAmax with the 60 dB threshold and gives the 59 dB mitigated prediction.",
+          "require_groups": [
+            [
+              "78"
+            ],
+            [
+              "60 dB"
+            ],
+            [
+              "59"
+            ]
+          ]
+        },
+        {
+          "check_id": "survey_evidence_kept",
+          "category": "project_facts",
+          "description": "Names the meter and the logger files.",
+          "require_groups": [
+            [
+              "Tessaly SL-55"
+            ],
+            [
+              "corvane_s1_night1.csv"
+            ]
+          ]
+        },
+        {
+          "check_id": "mitigation_kept",
+          "category": "project_facts",
+          "description": "Recommends the 3 m earth bund and shore power for refrigerated trailers.",
+          "require_groups": [
+            [
+              "3 m"
+            ],
+            [
+              "bund"
+            ],
+            [
+              "shore power"
+            ]
+          ]
+        },
+        {
+          "check_id": "no_borrowed_site_values",
+          "category": "anti_contamination",
+          "description": "Does not carry over another project's site or meter.",
+          "forbid_any": [
+            "Pellow",
+            "Canal Street",
+            "Brakel NX3",
+            "Orrin 820",
+            "Calderon HX-14"
+          ]
+        }
+      ]
+    }
+  ]
+}

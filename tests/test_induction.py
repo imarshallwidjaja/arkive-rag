@@ -821,6 +821,42 @@ def test_units_are_paragraphs_list_items_and_table_header_rows_only() -> None:
     assert texts(pipeless, ("doc_001", "doc_002")) == [short, long_header]
 
 
+@pytest.mark.parametrize("glyph", ["\u2022", "\u25e6", "\u25aa", "\u2023", "\u2043", "\uf0b7"])
+def test_bullet_glyphs_of_pdf_transcripts_start_list_items(glyph: str) -> None:
+    lines = [f"{glyph} Grid delivered as GeoTIFF.", f"  {glyph} Lines delivered as Shapefile."]
+
+    # Consecutive glyph bullets without blank lines are separate units, like `-` items.
+    assert induction.standing_units("\n".join(lines)) == [
+        induction.StandingUnit(line.strip(), header=False) for line in lines
+    ]
+    # A glyph inside a sentence starts nothing.
+    inline = f"Deliverables:\nGrid {glyph} Lines {glyph} Mosaic."
+    assert induction.standing_units(inline) == [induction.StandingUnit(inline, header=False)]
+
+
+@pytest.mark.parametrize("marker", ["\u2022", "-"])
+def test_a_table_row_or_header_that_opens_with_a_list_marker_stays_in_its_table(
+    marker: str,
+) -> None:
+    header = "Deliverable | Format\n--- | ---"
+    row = f"{header}\n{marker} Bathymetric grid | GeoTIFF\nMosaic | GeoTIFF"
+    assert induction.standing_units(row) == [induction.StandingUnit(header, header=True)]
+    marked_header = f"{marker} Deliverable | Format\n--- | ---"
+    assert induction.standing_units(f"{marked_header}\nBathymetric grid | GeoTIFF") == [
+        induction.StandingUnit(marked_header, header=True)
+    ]
+
+
+def test_a_list_item_right_after_a_table_with_outer_pipes_ends_the_table() -> None:
+    header = "| Measure | Basis |\n| --- | --- |"
+    item = "- Each measurement report records current site baseline | as supplied"
+
+    assert induction.standing_units(f"{header}\n| Noise | LAeq |\n{item}") == [
+        induction.StandingUnit(header, header=True),
+        induction.StandingUnit(item, header=False),
+    ]
+
+
 def test_a_unit_keeps_the_inner_bytes_of_its_holder_section() -> None:
     # Two trailing spaces before a newline are a Markdown hard line break.
     broken = (

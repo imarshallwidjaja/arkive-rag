@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -201,12 +201,39 @@ class AgentRequest[T: BaseModel](Protocol):
     def text(self) -> str: ...
 
 
+TOOL_CALL_ARGUMENTS_CHARS = 2_000
+TOOL_CALL_RESULT_HEAD_CHARS = 200
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One call the model made to one of the conversation's tools.
+
+    `arguments` is the argument text exactly as the model sent it, so malformed JSON is kept;
+    text over `TOOL_CALL_ARGUMENTS_CHARS` characters is cut there and ends with a marker giving
+    the full length. `result_chars` is the length of the text returned to the model (an
+    invalid-input error message included) and `result_head` its first
+    `TOOL_CALL_RESULT_HEAD_CHARS` characters; both are None when the tool raised and so ended
+    the run. `images` counts the images returned with the text.
+    """
+
+    name: str
+    arguments: str
+    result_chars: int | None
+    result_head: str | None
+    images: int
+
+
 @dataclass(frozen=True)
 class Conversation:
     """One free-text agent conversation. Only status "completed" is a usable answer.
 
     Other statuses: the final response's own status (for example "incomplete", with any
     partial `answer`), "empty_answer", "max_turns", or "provider_error" with `error` set.
+
+    `tool_calls` lists the calls in the order they were invoked. A call is recorded before its
+    tool runs, so a call whose tool raised is listed too. A call to a tool name the
+    conversation does not have is answered by the Agents SDK and is not listed.
     """
 
     answer: str
@@ -214,7 +241,7 @@ class Conversation:
     error: str | None
     input_tokens: int
     output_tokens: int
-    tool_calls: int
+    tool_calls: tuple[ToolCall, ...]
     turns: int
     elapsed_seconds: float
 
@@ -594,12 +621,18 @@ class _ToolFailure(Exception):
 
 @dataclass
 class _RunTally:
-    """Counts for one agent run; only touched from that run's event loop."""
+    """Counts and tool calls for one agent run; only touched from that run's event loop."""
 
     turns: int = 0
-    tool_calls: int = 0
+    tool_calls: list[ToolCall] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+
+
+def _recorded_arguments(arguments: str) -> str:
+    if len(arguments) <= TOOL_CALL_ARGUMENTS_CHARS:
+        return arguments
+    return f"{arguments[:TOOL_CALL_ARGUMENTS_CHARS]}[... cut, {len(arguments)} characters in all]"
 
 
 class _GatewayResponsesModel(OpenAIResponsesModel):
@@ -676,7 +709,8 @@ def _sdk_tool_output(result: ToolResult) -> str | list[ToolOutputText | ToolOutp
 
 def _sdk_tool(tool: Tool, tally: _RunTally) -> FunctionTool:
     async def invoke(_context: ToolContext[Any], arguments: str) -> Any:
-        tally.tool_calls += 1
+        index = len(tally.tool_calls)
+        tally.tool_calls.append(ToolCall(tool.name, _recorded_arguments(arguments), None, None, 0))
         try:
             args = json.loads(arguments or "{}")
             if not isinstance(args, dict):
@@ -686,9 +720,16 @@ def _sdk_tool(tool: Tool, tally: _RunTally) -> FunctionTool:
                 result = await result
         except TOOL_INPUT_ERRORS as exc:
             # Invalid input: recovering from it is part of the agent's task.
-            return f"ERROR: {type(exc).__name__}: {exc}"
+            result = f"ERROR: {type(exc).__name__}: {exc}"
         except Exception as exc:
             raise _ToolFailure(exc) from exc
+        text, images = (result, ()) if isinstance(result, str) else (result.text, result.images)
+        tally.tool_calls[index] = replace(
+            tally.tool_calls[index],
+            result_chars=len(text),
+            result_head=text[:TOOL_CALL_RESULT_HEAD_CHARS],
+            images=len(images),
+        )
         return _sdk_tool_output(result)
 
     # Non-strict: tool schemas come from callers (and MCP servers) with optional properties.
@@ -1071,7 +1112,7 @@ class OpenAIGateway:
                 error,
                 tally.input_tokens,
                 tally.output_tokens,
-                tally.tool_calls,
+                tuple(tally.tool_calls),
                 tally.turns,
                 time.monotonic() - started,
             )

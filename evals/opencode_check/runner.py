@@ -360,7 +360,8 @@ def main(
         make_private_directory(events_dir)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    # Refused again when written; checked here so a link costs no container or model call.
+    # Publishing would replace a link, not write through it; refusing one here keeps a
+    # mistaken output path from costing a container or model call.
     links = [str(p) for p in outputs if p.is_symlink()]
     if links:
         raise typer.BadParameter(f"refusing to write through symlinks: {links}")

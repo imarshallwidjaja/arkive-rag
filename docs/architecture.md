@@ -244,12 +244,17 @@ not confirm.
    (`standing_candidates`, no provider call) from the Markdown of the type's
    exemplar sections:
 
-   - A *unit* is a paragraph, one item of a list (a list marker starts an
-     item; an unmarked line right after it continues it), or a table's header
-     row with its separator row. A table starts at a line opening with `|`,
-     or at a line holding `|` right above a separator row (a table without
-     outer pipes), and runs through every following line that holds `|`. A
-     block quote that is not a visual transcript is a paragraph. Headings,
+   - A *unit* is a paragraph, one item of a list (a list marker,
+     `LIST_MARKER`, starts an item: `-`, `*`, `+`, a number followed by `.` or
+     `)`, or one of the bullet glyphs PDF text layers carry, U+2022, U+25E6,
+     U+25AA, U+2023, U+2043 and U+F0B7, the Private Use Area bullet of Word's
+     Symbol font; an unmarked line right after it continues it), or a table's
+     header row with its separator row. A table starts at a line opening with
+     `|`, or at a line holding `|` right above a separator row (a table without
+     outer pipes); such a starting line is never a list item, whatever its
+     first character. A table whose first line opens with `|` runs through the
+     following lines that hold `|` and are not list items; a table without
+     outer pipes runs through every following line that holds `|`. A block quote that is not a visual transcript is a paragraph. Headings,
      visual transcripts (`> **[Visual` blocks), fenced blocks and table body
      rows are not units. A unit's text keeps its inner bytes, such as the
      trailing spaces of a hard line break; only the whole unit is stripped.
@@ -350,6 +355,14 @@ at 1,536 dimensions. The CLI has no model options.
   predicates means no request; more than 400 are split across requests.
 - `converse` is the free-text agent conversation the evaluation harness uses
   (see Evaluation). It runs on the caller's event loop and is never cached.
+  Its `Conversation.tool_calls` lists every call to one of its tools in
+  invocation order as a `ToolCall`: the tool name, the argument text as the
+  model sent it (cut at 2,000 characters with a marker giving the full
+  length), the length and first 200 characters of the text returned to the
+  model, and the number of images. A call is recorded before its tool runs,
+  so a call whose tool raised is listed with no result. A call to a tool name
+  the conversation does not have is answered by the Agents SDK and is not
+  listed.
 - Hosted Agents SDK tracing is off unless the caller passes `trace=True`
   (`--trace`). The trace export key is passed with each run, not set on the
   SDK's process-wide exporter. `trace=True` while
@@ -593,21 +606,47 @@ facet twice is a usage error, because each facet takes one value.
 `evals/` is a harness outside the `arkive_rag` package; it is not in the wheel.
 `python -m evals.run --pack <file> --snapshot <db> --out <dir> [--corpus <dir>]`
 runs an eval pack and writes `results.json`, `report.md` and, for layer 3,
-`blind-drafts/` to `--out`. `--out` is required and should be a private
-directory outside the repository; the runner creates it with mode 0700 and
-writes 0600 files. Every layer calls OpenAI, so it needs `OPENAI_API_KEY`.
-Before creating any output or calling any model the runner checks, for every
+one `holdouts/<holdout_id>/` folder per holdout to `--out`. `--out` is required and should be a private
+directory outside the repository; the runner creates it with mode 0700,
+refusing a symlink in its place, and writes 0600 files. It publishes every
+output file by writing a temporary file in the same directory and renaming it
+over the destination (`write_private_text`), so a failed write never truncates
+an earlier result and a symlink at the destination is replaced, never written
+through. Every layer calls OpenAI, so it needs `OPENAI_API_KEY`.
+Before creating any output, gateway or build cache or calling any model the runner checks, for every
 layer it will run (so `--layer all` checks layer 3 before layer 1 calls
-anything), that the pack is a valid `arkive-eval-pack/2` file, that it
-defines the requested layers, that layers 2 and 3 have `--corpus`, that
-`--out` and `--cache` overlap none of the pack, snapshot and corpus paths,
-that the snapshot opens, that its `corpus_fingerprint` matches the pack's
-when the pack sets one, that every retrieval case's `filters` resolve
-against it, that the fingerprint of the `--corpus` files (found by
-`discover_corpus`) equals the snapshot's, and that the holdout's reference
-and included files pass the layer 3 guards below. A failure is a usage error
-(exit 2) without a traceback. A failure after model calls have been made
-prints the usage line before the error.
+anything), that the pack is a valid `arkive-eval-pack/3` file (a pack of
+another format is refused with a message naming format 3; no older format is
+read), that it defines the requested layers, that `--holdout` names one of
+its holdouts and comes with layer 3, that `--drafts` (a positive number of
+draft rounds, default 1) comes with layer 3, that layers 2 and 3 have `--corpus`,
+that `--out` and `--cache` overlap none of the pack, snapshot and corpus
+paths nor each other, that an existing `--out` is a directory, not a symlink,
+that the runner can write and search, with no directory named `results.json`
+or `report.md` in it, that an absent `--out` lies below no existing
+non-directory and its nearest existing ancestor is a directory the runner can
+write and search, that `--out` holds, when layer 3 runs, no `holdouts` directory from an earlier run (layer 3 needs a fresh
+directory, so no stale draft can sit beside new ones), that a `--cache` given
+with layer 3 is either absent and creatable by the same test as `--out` or a
+regular file, not a symlink, that the runner can read and write in a directory
+it can write and search (SQLite writes `-wal` and `-shm` files beside it),
+that the snapshot opens, that its `corpus_fingerprint` matches the
+pack's when the pack sets one, that every retrieval case's `filters` resolve
+against it and its `expected_docs` name documents of it, that every Q&A source anchor names a document of the snapshot
+and pages within it, that each anchor of a case other than `abstention`
+overlaps some section, and that each case's evidence (below) is at most 48,000
+characters, that the fingerprint of the `--corpus` files (found by
+`discover_corpus`) equals the snapshot's, that each selected holdout's
+reference, included files and exemplar paths pass the layer 3 guards below,
+that its reference and every `exemplar_paths` document have at least one
+section in the snapshot, and that LibreOffice (`soffice`) is on the path when
+a selected layer will convert a Word or PowerPoint file (layer 2 reads the
+whole corpus; layer 3 builds each selected holdout from its included files). A failure is a usage error
+(exit 2) without a traceback. Then, still before `--out` exists and before any
+model call, the gateways check the credential, `--trace` and model prices, and,
+when layer 3 runs, the `--cache` file is opened; a failure there exits 1 with the usage line and
+the error. A failure after model calls have been made also prints the usage
+line before the error.
 
 Eval agents and judges go through `OpenAIGateway` at medium reasoning effort
 on `gpt-6.1-sol`: agents through `converse`, judges through `run`, under the
@@ -622,8 +661,12 @@ input to a harness tool goes back to the model as an error message; any other
 exception from a harness tool stops the evaluation. An unexpected exception
 inside an MCP server tool reaches the model as a tool error, as any MCP host
 would see it, and does not stop the evaluation. Each run reports its tokens,
-turns, tool calls and the query embeddings that returned a vector
-(`search_embed_calls`). `--max-cost` sets one spend limit, a positive finite
+turns, the query embeddings that returned a vector (`search_embed_calls`), and
+its tool calls, each with the tool name, the argument text, the length and
+first 200 characters of the returned text and the image count (see Provider
+calls). The query embeddings are recorded per run, so a failure in one run
+cannot mark the next. `report.md` totals the calls and the returned
+characters per arm and tool name. `--max-cost` sets one spend limit, a positive finite
 number of USD, over every model call of the evaluation. Once the estimate
 reaches the limit, the next provider attempt stops the evaluation with an
 error, the usage line and a non-zero exit, and writes no report; a report an
@@ -633,44 +676,212 @@ request takes the estimate past the limit, the evaluation finishes normally.
 `report.md` (Usage) record calls, tokens and the estimated cost per operation.
 
 An eval pack is a JSON file validated by `EvalPack` in `evals/schema.py`
-(`format` `arkive-eval-pack/2`). It holds `retrieval_cases`, `qa_cases` and an
-optional `holdout_memo` task. A retrieval case may set `filters`, a mapping
+(`format` `arkive-eval-pack/3`). It holds `retrieval_cases`, `qa_cases` and a
+list of `holdouts`. A retrieval case may set `filters`, a mapping
 from facet name to value or alias that layer 1 passes to `rank_channels`;
 facets are induced per snapshot, so `arkive-rag inspect` lists the names and
-values a pack can use. Expected facts are *groups* of alternative
-substrings, matched NFKC-, case-, dash-, whitespace- and
-thousands-separator-insensitively. A `RubricCheck` passes when the memo
+values a pack can use. A Q&A case has a `kind`, one of `lookup`,
+`multi_document`, `aggregation`, `abstention`, `conflict` and `vocabulary`,
+and `source_anchors`, each `{"doc_id": ..., "pages": [first, last]}` or
+`"pages": null` for the whole document (Markdown sources have no pages, so
+their anchors use null; an anchor with page numbers on a Markdown document
+fails the preflight). Page numbers must be JSON integers: a boolean, a
+numeric string or a float such as `3.0` is refused. Every kind but
+`abstention`, where the corpus does not hold the answer, needs at least one
+anchor, and each of its anchors must overlap the text of some section of the
+snapshot; an anchor on a page no section covers fails the preflight with the
+case and the anchor named. A holdout has a unique
+`holdout_id` (letters, digits, `.`, `_` and `-`), `included_paths`,
+`held_out_markers`, `reference_doc_id`, `instructions`, `run_notes`, an
+optional `rubric` and `exemplar_paths`: the corpus-relative files the pack
+author names as this deliverable's exemplars and feedback documents, each of
+which must be one of the holdout's included files and a delivered document,
+not a curator note. The list is the same in
+every run: it does not depend on what induction makes of the corpus. An empty
+list means the exemplars-in-context arm does not run for that holdout. The
+rubric may be empty, because the lexical-overlap measures below need none.
+Expected facts are
+*groups* of alternative substrings, matched NFKC-, case-, dash-, whitespace-
+and thousands-separator-insensitively. A `RubricCheck` passes when the draft
 satisfies every `require_groups` group and contains no `forbid_any` phrase.
 An anti-contamination check requires the held-out project's own values and
-forbids only claims that a faithful memo cannot make, so a memo that contrasts
-its values with an earlier project's still passes. `evals/example_pack.eval.json`
-is a fictional pack; real packs stay in the private store.
+forbids only claims that a faithful draft cannot make, so a draft that
+contrasts its values with an earlier project's still passes. `evals/example_pack.eval.json`
+is a fictional pack for no corpus in the repository (its `corpus_fingerprint`
+is null); it is the offline tests' fixture. `evals/example_packs/` holds one
+fictional pack per example collection, for real paid runs against snapshots
+of that collection (see Example corpora). Real packs stay in the private store.
 
 | Layer | Module | Measures |
 | --- | --- | --- |
 | 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of BM25-only, dense-only and hybrid RRF ranking over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks all three arms from one query embedding per case. |
-| 2 | `agents.py` | An agent conversation answers each QA case with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and with the ten Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score; the judge grades citations against the case's `source_anchors`. Raw-file extraction runs once before timing. |
-| 3 | `agents.py` | Builds a holdout snapshot and compares three draft arms against a reference deliverable; the procedure and guards are below. |
+| 2 | `agents.py` | An agent conversation answers each QA case once with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and once with the ten Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score with evidence, below. Raw-file extraction runs once before timing. The report groups results by `kind`. |
+| 3 | `drafting.py` | For each holdout, or the one `--holdout` names, builds a holdout snapshot and runs `--drafts` rounds of three draft arms, and a fourth when the holdout's `exemplar_paths` is not empty, measured against a reference deliverable; the procedure, guards and measures are below. |
+
+The Q&A judge sees the question, the reference facts, the anchors and their
+evidence: the snapshot's Markdown of every section that overlaps an anchor's
+pages (every section of the document for a null anchor), each labelled with
+the document's path, `doc_id`, `section_id` and page span, so a citation by
+file and page and a citation by ID both resolve. The evidence is the
+snapshot's transcript and can itself be wrong, so the judge is told that the
+reference facts decide when they and the evidence disagree. Evidence over
+48,000 characters fails the preflight for that case; it is never cut. The
+judge scores factual accuracy and completeness against the reference facts (a
+fact the evidence supports is not an accuracy defect) and citation quality
+against the anchors, and lists the answer's material claims, each
+`supported` (by the reference facts or the evidence), `contradicted` (by the
+reference facts, or by the evidence where the facts are silent) or
+`unverifiable`. Each judged row of `results.json` carries the claims and
+`claim_counts`; `report.md` gives the contradicted and unverifiable counts per
+arm and per kind. An unverifiable claim is reported, never counted as a
+contradiction. A judge call that fails with a `ProviderError` other than the
+spend limit (output that fails schema validation, a refusal, output still
+truncated after the retry, a provider failure) leaves that row with `judge`
+null and the reason in `judge_missing`; the row keeps its phrase coverage.
+`report.md` counts the judged rows per arm and kind, averages judge scores over
+judged rows only, and lists each completed run that was not judged with the
+reason. The spend limit still stops the evaluation.
 
 For layer 3:
 
-1. Select a delivered reference document, not a curator note, with a `held_out_markers` entry in its path. Select files through `included_paths`; pack validation requires plain paths and `discover_corpus` refuses symlinks.
-2. Before copying files or calling a model, the guards reject selected files whose path contains a marker, whose top-level folder matches the reference's (or which are at the corpus root when the reference is there), or whose bytes match the reference. Markers match case- and dash-insensitively. The guards do not scan content: the curator must exclude changed copies and other documents that restate held-out facts.
-3. Compile the selected bytes alone into a holdout snapshot, using the full snapshot's embedding model and dimensions and optionally `--cache`. Check the snapshot again before publishing it as `<out>/holdout.arkive.db`. Cache reuse follows the request-input rules above.
-4. Draft from `run_notes` and `memo_instructions` with three arms: no tools, a five-chunk search tool, and the full MCP tools. Completed drafts receive rubric checks and a blinded side-by-side judgment against the reference.
+1. Select a delivered reference document, not a curator note, with a `held_out_markers` entry in its path. Select files through `included_paths`; pack validation requires plain paths and `discover_corpus` refuses symlinks. Every `exemplar_paths` entry must be one of the selected files and not a curator note.
+2. Before copying files or calling a model, the guards reject a selected file that is held-out material: its path contains a marker, or its bytes match the reference. Markers match case- and dash-insensitively. The guards infer nothing from folders, so a holdout works the same in a folder per project, nested folders or a flat folder: the pack author chooses markers that cover the held-out work's files (a marker may be a folder name) and lists `included_paths` explicitly. The guards do not scan content: the pack author must leave out changed copies, curator notes, summaries and other documents that restate held-out facts.
+3. Compile the selected bytes alone into a holdout snapshot, using the full snapshot's embedding model and dimensions and optionally `--cache`. Check the snapshot again before publishing it as `<out>/holdouts/<holdout_id>/holdout.arkive.db`. Cache reuse follows the request-input rules above.
+4. Run `--drafts` rounds. Three arms always run in every round from `run_notes` and `instructions`: `zero_shot` (no tools), `chunk_search` (a five-chunk search tool) and `arkive_mcp` (the MCP tools and the server instructions). The fourth, `exemplars_in_context`, runs when `exemplar_paths` is not empty; otherwise the report says it was not run. Every completed draft gets the rubric checks and the two lexical-overlap measures below, and the round's completed drafts get one blinded side-by-side judgment against the reference. A document of the holdout snapshot without sections, such as an empty curator note, contributes no sections; a reference or exemplar document without sections stops the holdout.
+
+The `exemplars_in_context` arm has no tools. Its prompt holds the section
+Markdown of each `exemplar_paths` document of the holdout snapshot, labelled
+with its path and without visual transcripts, then the run notes. Its
+instructions are the holdout's `instructions` followed by
+`EXEMPLAR_DRAFTING_RULES` in `evals/drafting.py`: the drafting obligations of
+the MCP server instructions, reworded for documents in the prompt.
+`tests/test_evals.py` pins, word for word, every drafting surface: the
+drafting part of `arkive_rag.server.INSTRUCTIONS` (mode 2), the `get_blueprint`
+and `read_section` tool descriptions as the server publishes them, and
+`EXEMPLAR_DRAFTING_RULES`, beside a map from each obligation to its phrase in
+the server's rules and in `EXEMPLAR_DRAFTING_RULES`. An edit to any of them
+fails the test until the pins are updated together. The test does not judge
+whether the texts mean the same thing. The report gives each arm's input tokens, so the cost of
+carrying the exemplars is visible beside the other arms.
+
+The two measures compare wording, not meaning. They reuse the build's text
+functions from `arkive_rag.induction`: `standing_units`, word 4-gram
+`shingles` of `fold_for_quote` text, `containment`, `STANDING_MIN_WORDS` and
+`STANDING_RECURRENCE_CONTAINMENT`, and the list-marker pattern `LIST_MARKER`.
+A visual transcript is a block quote whose first line opens with
+`> **[Visual`, the same rule `standing_units` applies, so a line with that
+prefix inside an ordinary block quote or a fenced block starts nothing. The
+sections of curator notes in the holdout snapshot are not holdout text.
+
+- The *prose units* of a text are its `standing_units` that are not table
+  headers, with visual transcripts removed by `standing_units` itself. Each
+  unit loses its leading list marker before it is folded, so a `1.` item and
+  a `-` item with the same words measure the same. A marker counts only when
+  horizontal space and content follow it on the same line; a `1.` alone on its
+  line stays a word of the paragraph it opens. A unit's shingles are those
+  of its folded text.
+- A draft's *prose shingles* are the union of its prose units' shingles, of
+  units of any length.
+- The *text shingles* of the reference, of authorised input (the holdout's
+  `run_notes` and `instructions`) and of each holdout section are the union of
+  the text's whole-text shingles (visual transcripts removed) and the shingles
+  of each of its prose units. Folding a whole text joins a hyphen or dash at a
+  line end with the next unit's first word, so the two forms differ; their
+  union means a sentence present on both sides always matches on this side,
+  and a shingle the reference carries anywhere, even in a table, is never
+  stray.
+- The *holdout text* is the union of the text shingles of every holdout
+  section: one set, not one per section.
+- A prose unit is *held* when the holdout text contains at least
+  `STANDING_RECURRENCE_CONTAINMENT` of its shingles. A paragraph that joins
+  sentences from two holdout sections can therefore be held.
+- A *house unit* is a prose unit of the reference, in the full snapshot, of at
+  least `STANDING_MIN_WORDS` words that is held. The *house shingles* are the
+  union of the house units' shingles minus authorised input's text shingles.
+- *House-text recall* is the share of the house shingles that are among the
+  draft's prose shingles. It is null when the holdout has no house shingles;
+  the report gives the number of house units and house shingles.
+- A *copied unit* is a prose unit of the draft, of at least
+  `STANDING_MIN_WORDS` words, that is held. The *stray shingles* are the union
+  of the copied units' shingles that are in the holdout text and in neither
+  the reference's nor authorised input's text shingles.
+- *Copied-text contamination* is the number of stray shingles divided by the
+  number of the draft's prose shingles. Words a drafter adds to a copied
+  passage, such as the new project's client name, are not in the holdout text
+  and do not count. It is 0 for a draft without a copied unit and null only
+  for a draft without prose shingles. Both measures lie between 0 and 1.
+
+`results.json` lists, per draft, each house unit with the share of it the draft
+holds and each copied unit with its stray-shingle count, by the first 120
+characters of the unit. The measures have limits. They compare wording, not
+meaning. Tables, headings and fenced blocks are not prose: their text counts
+neither as house text nor towards a draft. A unit under `STANDING_MIN_WORDS`
+words is never a house or copied unit, though its shingles count in the
+draft's total. A visual transcript contributes nothing and separates the text
+around it, as blank lines would. A block quote is one unit however many
+paragraphs it holds, so a copied paragraph inside a longer quote can go
+unseen. The shared fold joins a hyphen at a line end with the next word. A
+house paragraph that the reference's authors reworded counts partly as
+contamination. A draft paragraph stitched together from several short copied
+sentences, with words of the drafter's own between them, can hold under
+`STANDING_RECURRENCE_CONTAINMENT` of its shingles in the holdout text and then
+counts as no copied unit. The holdout text includes each section's whole-text
+shingles, which join the end of one list item to the start of the next, so a
+draft sentence that happens to span two adjacent holdout list items can count
+as copied. The zero-shot arm never sees the collection, so its contamination
+shows the observed rate of such false matches. Repeated drafts from one
+holdout build measure drafting variation, not build variation.
+
+Rubric diagnostics label each required group of each rubric check by where one
+of its alternatives first occurs: `run_notes`, `instructions`, `holdout` (any
+section of the holdout snapshot) or `none`. The report lists every check with a
+group labelled `none` as "required phrase found in no supplied input". The
+label tells the pack author where a phrase can come from; it is not a verdict
+on whether a draft can derive it.
+
+The blind judge receives the run notes, the reference without its visual
+transcripts and the round's completed drafts under `Candidate_<n>` labels, and
+is told that figures are out of scope. Its output counts only when its
+assessments and its ranking each name exactly the labels sent, once each.
+Otherwise, or when the judge call fails with a `ProviderError` other than the
+spend limit (output that fails schema validation, a refusal, output still
+truncated after the retry, a provider failure), the round keeps its drafts and
+measures, `blind_comparison` is null and `blind_comparison_missing` gives the
+reason, as it does for a round where no draft completed. The spend limit still
+stops the evaluation.
+
+`report.md` gives, per holdout and arm, the completed drafts, both measures and
+each judge score as median [minimum, maximum] over the rounds with n, the
+number of observations behind it, the rounds that judged the arm, the stray
+and draft shingle totals, rubric pass counts per check, input and output
+tokens and tool-call totals, with each round's ranking or the reason it was
+not judged. Drafts that did not complete are left out of the measures, rubric
+counts and judge scores; their tokens and tool calls are counted. In the
+report, `n/a` means no observation: no completed draft with a value, no judged
+round or, for recall, no house shingles. In `results.json`, a null recall means the holdout
+has no house shingles, a null contamination means the draft has no prose
+shingles, and null measures and rubric for an arm mean its draft did not
+complete; zero is a measured value. No decision rule is applied: comparing
+arms from these medians and ranges is the reader's step.
 
 The evaluation harness compiles the holdout snapshot through `compile_corpus`
-itself, the one real OpenAI build outside `arkive-rag build`. Blinded drafts and
-`blind_key.json` are written to `<out>/blind-drafts`. `tests/test_evals.py`
-covers pack validation, scoring, the rubric, the holdout guards, the run-status
-contract, the layer 3 flow, the runner's input checks and the tool adapters
-offline, using the example pack and a scripted OpenAI HTTP transport.
+itself, the one real OpenAI build outside `arkive-rag build`. Each round's
+blinded drafts and `blind_key.json` are written to
+`<out>/holdouts/<holdout_id>/blind-drafts/round-<n>/`. `results.json` keys
+layer 3 results by `holdout_id`; each holdout lists its `rounds`, each with the
+arms' runs, rubric results and measures. `tests/test_evals.py` covers pack
+validation, scoring, the rubric, the lexical-overlap measures, the rubric
+diagnostics, the exemplars-in-context prompt and rules, the holdout guards, the
+run-status contract, per-run embedding records, the judge's evidence and claim
+counts, the layer 3 rounds, the runner's input checks, a run of every layer of
+the example pack and the tool adapters offline, using the example pack and a
+scripted OpenAI HTTP transport; `tests/test_llm.py` covers the tool-call record.
 
 ### Example corpora
 
-`evals/example_corpora/` holds two small fictional corpora, so anyone can build
-real snapshots without private documents. They are organised in different
-ways, and induction gives them different facet schemas:
+`evals/example_corpora/` holds three small fictional corpora, so anyone can
+build real snapshots without private documents. They are organised in
+different ways, and induction gives them different facet schemas:
 
 - `coastal-survey-projects`: one folder per survey project, each holding a
   proposal, a technical memorandum and reviewer feedback, with a curator note
@@ -680,14 +891,46 @@ ways, and induction gives them different facet schemas:
   campaign briefs and post-campaign reviews, with a casual root `AGENTS.md`.
   `harbourline-launch-deck.pptx`, the results deck sent after the campaign's
   flight, has a chart whose weekly reach values appear only in the image.
+- `acoustic-consultancy-files`: one flat folder of Word and PDF files with no
+  curator note, dated only by the files' embedded metadata. It holds two
+  recurring deliverable types, noise reports and quotations, and one type with
+  a single document, a response to planning comments. The older and newer
+  noise reports use different layouts; they share recurring house paragraphs,
+  a caveat that varies by one instrument name, and a section only the newest
+  report holds. `corvane-depot-night-noise-report.pdf` has a chart whose
+  values appear only in the image.
 
-Both repeat deliverable types, reviewer feedback, defined and undefined
+The first two repeat deliverable types, reviewer feedback, defined and undefined
 acronyms, one acronym with two meanings, tool names, stated attributes,
 exact numbers and filenames. Each also has one standing section that recurs
 across projects: every coastal proposal ends with the same standard terms,
 and every campaign brief ends with the same disclosure, so their blueprints
 have standing passage candidates to select. They are built with the ordinary
 `arkive-rag build` command; the snapshots are not tracked.
+
+`evals/example_packs/<collection>.eval.json` is the eval pack of each
+collection, built for real paid evaluation runs against a snapshot of that
+collection; `evals/example_pack.eval.json` stays the offline test fixture.
+Each pack sets the collection's `corpus_fingerprint`, has no retrieval cases,
+and has four Q&A cases, one each of `lookup`, `multi_document`, `abstention`
+and `vocabulary`, whose anchors cover whole documents. The holdouts are:
+
+- `coastal-survey-projects`: the proposal and the technical memorandum of the
+  Fennick Canal project (`q103`), each built from the `q101` and `q102`
+  folders.
+- `creator-campaigns`: the Kettlecraft winter campaign brief, built from the
+  root `AGENTS.md`, the other creator's campaigns and the same creator's
+  Corriemoor campaign.
+- `acoustic-consultancy-files`: two noise reports, the Pellow Mill facade
+  report and the Corvane depot night noise report, each built from the files
+  of the other three projects.
+
+`test_example_collection_packs_match_their_collections_and_hold_out_their_references`
+in `tests/test_evals.py` checks, without a snapshot or a model call, that every
+pack in `evals/example_packs/` loads, that its fingerprint matches its
+collection's files, that every anchor and `reference_doc_id` names a document
+of the collection (`doc_001` is the first file in path order), and that every
+holdout passes `check_reference_held_out` and `select_holdout_sources`.
 
 ### OpenCode check
 
@@ -782,7 +1025,8 @@ non-interactively, on several topics at once. It needs Docker and
   outcome, the tokens and OpenCode's cost estimate from `step_finish` events,
   the exit code), `report.md` and the raw event stream of each scenario under
   `events/`, all owner-only (`write_private_text` in `evals/run.py`, which
-  refuses a symlink at the destination; `events/` must be a real directory).
+  publishes by replacement, so a symlink at the destination is replaced, never
+  written through; `events/` must be a real directory).
   OpenCode can omit the last step's `step_finish`, so token and cost totals
   are lower bounds, and the `search` tool's query embeddings are not in them. The exit status is 1 when any scenario fails or
   cannot run. Before building an image or starting a container, the runner

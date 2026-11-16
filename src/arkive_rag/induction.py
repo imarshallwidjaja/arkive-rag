@@ -1076,13 +1076,21 @@ STANDING_SHINGLE_WORDS = 4
 # 0.8 to 1.0 between projects, so light edits such as a changed year still count as recurrence.
 STANDING_RECURRENCE_CONTAINMENT = 0.8
 
-_WORD = re.compile(r"\w+")
+WORD = re.compile(r"\w+")
 _MARKDOWN_HEADING_LINE = re.compile(r"#{1,6}\s")
-_LIST_ITEM = re.compile(r"\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
+# A list item's leading marker and the horizontal space after it, followed by content on the
+# same line. Besides Markdown markers, the bullet glyphs PDF text layers carry into
+# transcripts; U+F0B7 is the Private Use Area bullet that Word's Symbol font writes into PDF
+# text layers.
+LIST_MARKER = re.compile(
+    r"(?:[-*+\u2022\u25e6\u25aa\u2023\u2043\uf0b7]|\d{1,3}[.)])[^\S\r\n]+(?=\S)"
+)
+_LIST_ITEM = re.compile(rf"\s*{LIST_MARKER.pattern}")
 _FENCE_LINE = re.compile(r"\s*(`{3,}|~{3,})")
 _TABLE_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 # How the compiler opens a visual transcript; a transcript is a description, not house text.
-_VISUAL_PREFIX = "> **[Visual"
+VISUAL_TRANSCRIPT_PREFIX = "> **[Visual"
+_TABLE_KINDS = ("outer_pipe_table", "pipeless_table")
 
 
 @dataclass(frozen=True)
@@ -1106,14 +1114,17 @@ def _is_table_separator(row: str) -> bool:
 
 
 def standing_units(markdown: str) -> list[StandingUnit]:
-    """The units of one section in order. A blank line, heading or fenced block ends a unit;
-    a list marker starts one, and an unmarked line right after a list item continues it.
-    A table starts at a line opening with `|`, or at a line holding `|` right above a
-    separator row (a table without outer pipes); it continues through every line holding
-    `|`. Headings, fenced blocks, visual transcripts and table body rows are not units; a
-    table without a separator row has no header unit. A block quote that is not a visual
-    transcript is a paragraph. A unit's text keeps its inner bytes, such as the trailing
-    spaces of a hard line break."""
+    """The units of one section in order. A blank line, heading or fenced block ends a unit.
+    A table starts at a line opening with `|` (outer pipes), or at a line holding `|` right
+    above a separator row, whatever its first character. A table with outer pipes continues
+    through lines that hold `|` and do not open with a list marker (`LIST_MARKER`), so a list
+    item written right after it is a list item; a table without outer pipes continues
+    through every line holding `|`, so its rows stay in it whatever their first character.
+    Any other line that opens with a list marker starts a unit; an unmarked line right after
+    a list item continues it. Headings, fenced blocks, visual transcripts and table body rows
+    are not units; a table without a separator row has no header unit. A block quote that is
+    not a visual transcript is a paragraph. A unit's text keeps its inner bytes, such as the
+    trailing spaces of a hard line break."""
     units: list[StandingUnit] = []
     kind: str | None = None
     lines: list[str] = []
@@ -1122,10 +1133,10 @@ def standing_units(markdown: str) -> list[StandingUnit]:
         nonlocal kind
         text = "\n".join(lines).strip()
         if kind in ("paragraph", "item") or (
-            kind == "quote" and not text.startswith(_VISUAL_PREFIX)
+            kind == "quote" and not text.startswith(VISUAL_TRANSCRIPT_PREFIX)
         ):
             units.append(StandingUnit(text, header=False))
-        elif kind == "table" and len(lines) >= 2 and _is_table_separator(lines[1]):
+        elif kind in _TABLE_KINDS and len(lines) >= 2 and _is_table_separator(lines[1]):
             units.append(StandingUnit("\n".join(lines[:2]).strip(), header=True))
         kind = None
         lines.clear()
@@ -1145,16 +1156,18 @@ def standing_units(markdown: str) -> list[StandingUnit]:
         if not stripped or _MARKDOWN_HEADING_LINE.match(stripped):
             flush()
             continue
-        if _LIST_ITEM.match(line):
-            flush()
-            kind = "item"
-        elif kind == "table" and "|" in stripped:
+        if "|" in stripped and (
+            kind == "pipeless_table" or (kind == "outer_pipe_table" and not _LIST_ITEM.match(line))
+        ):
             pass
         elif stripped.startswith("|") or (
             "|" in stripped and i + 1 < len(all_lines) and _is_table_separator(all_lines[i + 1])
         ):
             flush()
-            kind = "table"
+            kind = "outer_pipe_table" if stripped.startswith("|") else "pipeless_table"
+        elif _LIST_ITEM.match(line):
+            flush()
+            kind = "item"
         elif stripped.startswith(">"):
             if kind != "quote":
                 flush()
@@ -1167,13 +1180,14 @@ def standing_units(markdown: str) -> list[StandingUnit]:
     return units
 
 
-def _shingles(folded: str) -> frozenset[tuple[str, ...]]:
-    words = _WORD.findall(folded)
+def shingles(folded: str) -> frozenset[tuple[str, ...]]:
+    """The word `STANDING_SHINGLE_WORDS`-grams of text already in `fold_for_quote` form."""
+    words = WORD.findall(folded)
     n = STANDING_SHINGLE_WORDS
     return frozenset(tuple(words[i : i + n]) for i in range(len(words) - n + 1))
 
 
-def _containment(part: frozenset[tuple[str, ...]], whole: frozenset[tuple[str, ...]]) -> float:
+def containment(part: frozenset[tuple[str, ...]], whole: frozenset[tuple[str, ...]]) -> float:
     """Share of `part`'s 4-grams that `whole` holds; `part` is never empty for a unit."""
     return len(part & whole) / len(part)
 
@@ -1196,8 +1210,8 @@ class _PlacedUnit:
         if self.unit.header or other.unit.header:
             return self.unit.header == other.unit.header and self.folded == other.folded
         return self.folded == other.folded or (
-            _containment(self.grams, other.grams) >= STANDING_RECURRENCE_CONTAINMENT
-            and _containment(other.grams, self.grams) >= STANDING_RECURRENCE_CONTAINMENT
+            containment(self.grams, other.grams) >= STANDING_RECURRENCE_CONTAINMENT
+            and containment(other.grams, self.grams) >= STANDING_RECURRENCE_CONTAINMENT
         )
 
 
@@ -1234,7 +1248,7 @@ def standing_candidates(
         for doc in docs
         for s in sorted(doc.reading.sections, key=lambda s: s.ordinal)
     ]
-    section_grams = {sid: _shingles(view.folded_sections[sid]) for _, sid in sections}
+    section_grams = {sid: shingles(view.folded_sections[sid]) for _, sid in sections}
     placed: list[_PlacedUnit] = []
     for doc, sid in sections:
         for unit in standing_units(view.markdown(sid)):
@@ -1247,9 +1261,9 @@ def standing_candidates(
                     continue
             else:
                 folded = fold_for_quote(unit.text)
-                if len(_WORD.findall(folded)) < STANDING_MIN_WORDS:
+                if len(WORD.findall(folded)) < STANDING_MIN_WORDS:
                     continue
-            placed.append(_PlacedUnit(doc, sid, unit, folded, _shingles(folded)))
+            placed.append(_PlacedUnit(doc, sid, unit, folded, shingles(folded)))
     headers: dict[str, set[str]] = {}
     for p in placed:
         if p.unit.header:
@@ -1265,7 +1279,7 @@ def standing_candidates(
             if p.unit.header:
                 held = p.folded in headers.get(sid, ())
             else:
-                held = _containment(p.grams, section_grams[sid]) >= STANDING_RECURRENCE_CONTAINMENT
+                held = containment(p.grams, section_grams[sid]) >= STANDING_RECURRENCE_CONTAINMENT
             if held:
                 found.append(sid)
         return tuple(found)

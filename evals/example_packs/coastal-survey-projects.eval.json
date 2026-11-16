@@ -1,0 +1,301 @@
+{
+  "format": "arkive-eval-pack/3",
+  "name": "example-coastal-survey-projects",
+  "description": "Fictional eval pack for the coastal-survey-projects example collection (Quillfen Geomatics, survey projects Q101 to Q103). Every name, value and file in it is invented.",
+  "corpus_fingerprint": "3740c519149ffad6462d720c459586549668804ffe5a9f1399d4bd898fc61f6d",
+  "retrieval_cases": [],
+  "qa_cases": [
+    {
+      "case_id": "brenlow_minimum_channel_depth",
+      "kind": "lookup",
+      "question": "What minimum depth did the Brenlow estuary survey find in the dredged channel, and where?",
+      "ground_truth_facts": [
+        "The minimum depth in the dredged channel is 6.42 m below Chart Datum.",
+        "It is at the bend south of the Ferrow road bridge."
+      ],
+      "required_groups": [
+        [
+          "6.42"
+        ],
+        [
+          "Ferrow"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_003",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "sonavex_survey_fees",
+      "kind": "multi_document",
+      "question": "Which Quillfen proposals plan a Sonavex R4 multibeam survey, and what fixed fee does each quote?",
+      "ground_truth_facts": [
+        "The Q101 Brenlow Estuary proposal uses the Sonavex R4 and quotes a fixed fee of GBP 38,400, excluding VAT.",
+        "The Q103 Fennick Canal proposal uses the Sonavex R4 and quotes a fixed fee of GBP 16,900, excluding VAT."
+      ],
+      "required_groups": [
+        [
+          "Q101",
+          "Brenlow"
+        ],
+        [
+          "38,400"
+        ],
+        [
+          "Q103",
+          "Fennick"
+        ],
+        [
+          "16,900"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_001",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_008",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "fennick_sound_speed_casts",
+      "kind": "abstention",
+      "question": "How often were sound speed casts taken during the Q103 Fennick Canal survey?",
+      "ground_truth_facts": [
+        "The collection does not state a sound speed cast interval for the Q103 survey; only the Q101 memorandum gives one."
+      ],
+      "required_groups": [
+        [
+          "does not",
+          "not stated",
+          "no record",
+          "not available",
+          "cannot find",
+          "not in"
+        ]
+      ]
+    },
+    {
+      "case_id": "pcr_meanings",
+      "kind": "vocabulary",
+      "question": "What does PCR mean in Quillfen Geomatics documents?",
+      "ground_truth_facts": [
+        "PCR means project change request in the Q101 review feedback and the Q103 proposal.",
+        "PCR means point cloud registration in the Q102 memorandum and its review feedback."
+      ],
+      "required_groups": [
+        [
+          "project change request"
+        ],
+        [
+          "point cloud registration"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_002",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_005",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_006",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_008",
+          "pages": null
+        }
+      ]
+    }
+  ],
+  "holdouts": [
+    {
+      "holdout_id": "fennick-canal-proposal",
+      "included_paths": [
+        "q101-brenlow-estuary",
+        "q102-oskary-quarry"
+      ],
+      "held_out_markers": [
+        "q103"
+      ],
+      "reference_doc_id": "doc_008",
+      "instructions": "You are Imani Castellane, Survey Lead at Quillfen Geomatics, writing the proposal for the Fennick Waterways Trust canal siltation survey. Write the complete proposal in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Quillfen Geomatics documents, follow their house structure and wording. Return only the proposal.",
+      "run_notes": "- job: Q103, Fennick Canal siltation survey; our ref QG-PR-103\n- client: Fennick Waterways Trust\n- author: Imani Castellane (Survey Lead); issue date 20 April 2026\n- client question: silt gained since the 2021 survey along the 7.8 km reach, Hob Lock to Carrow aqueduct\n- platform: small boat; sensor Sonavex R4 multibeam\n- positioning: RTK GNSS; total station at the 2 road bridges (no GNSS there)\n- processing: Hydrolith 7; differencing vs 2021 surface in SurfGrid\n- outputs: silt thickness + volume for each lock pound\n- files: fennick_reach_25cm.tif (GeoTIFF, gridded surface); fennick_silt_thickness.tif (GeoTIFF, silt thickness grid); Q103 memo (PDF)\n- variations: PCR = project change request; both parties sign it first; each one gives extra fee + extra days; covers any change of scope, area or programme\n- timing: May 2026, 3 days on the water, canal at its usual level; processing 7 working days afterwards\n- price: GBP 16,900 fixed, VAT excluded\n",
+      "exemplar_paths": [
+        "q101-brenlow-estuary/q101-proposal.md",
+        "q102-oskary-quarry/q102-proposal.md"
+      ],
+      "rubric": [
+        {
+          "check_id": "fee_kept",
+          "category": "project_facts",
+          "description": "States the GBP 16,900 fixed fee.",
+          "require_groups": [
+            [
+              "16,900"
+            ]
+          ]
+        },
+        {
+          "check_id": "reach_and_limits_kept",
+          "category": "project_facts",
+          "description": "States the 7.8 km reach from Hob Lock to the Carrow aqueduct.",
+          "require_groups": [
+            [
+              "7.8 km"
+            ],
+            [
+              "Hob Lock"
+            ],
+            [
+              "Carrow"
+            ]
+          ]
+        },
+        {
+          "check_id": "deliverable_files_kept",
+          "category": "project_facts",
+          "description": "Names both GeoTIFF deliverables exactly.",
+          "require_groups": [
+            [
+              "fennick_reach_25cm.tif"
+            ],
+            [
+              "fennick_silt_thickness.tif"
+            ]
+          ]
+        },
+        {
+          "check_id": "programme_kept",
+          "category": "project_facts",
+          "description": "States the May 2026 survey month and seven working days of processing.",
+          "require_groups": [
+            [
+              "May 2026"
+            ],
+            [
+              "7 working days",
+              "seven working days"
+            ]
+          ]
+        },
+        {
+          "check_id": "no_borrowed_project_values",
+          "category": "anti_contamination",
+          "description": "Does not carry over the Q101 or Q102 fees, files, launch or survey area.",
+          "forbid_any": [
+            "38,400",
+            "21,700",
+            "brenlow_dtm_50cm.tif",
+            "oskary_pit_2026.laz",
+            "Kittiwake",
+            "12.6 km"
+          ]
+        }
+      ]
+    },
+    {
+      "holdout_id": "fennick-canal-technical-memorandum",
+      "included_paths": [
+        "q101-brenlow-estuary",
+        "q102-oskary-quarry"
+      ],
+      "held_out_markers": [
+        "q103"
+      ],
+      "reference_doc_id": "doc_009",
+      "instructions": "You are Imani Castellane, Survey Lead at Quillfen Geomatics, writing the technical memorandum for the Fennick Waterways Trust canal siltation survey. Write the complete memorandum in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Quillfen Geomatics documents or review feedback, follow their house structure and wording. Return only the memorandum.",
+      "run_notes": "- job: Q103, Fennick Canal siltation survey\n- client: Fennick Waterways Trust\n- author: Imani Castellane; checker: Dmitri Halloway; issue date 2 June 2026\n- sensor: Sonavex R4 MBES, 400 kHz, run from a 5 m workboat\n- vertical reference: Fennick canal datum, defined as Hob Lock top water level\n- HWX tie-in: at Hob Lock; most recent repeat 21 May 2026\n- bridge sections: total station fixes good to 0.03 m under both road bridges\n- processing: cleaning in Hydrolith 7; difference vs 2021 surface in SurfGrid\n- headline: average silt gain 0.31 m since 2021 over the 7.8 km reach; total 9,870 m3\n- max thickness: 0.74 m, pound upstream of Carrow aqueduct\n- TPU (95 % confidence): depths 0.07 m; silt thickness 0.10 m\n- pound Hob Lock-Wren Lock: 2.9 km, mean 0.22 m, 2,640 m3\n- pound Wren Lock-Mill Lock: 2.6 km, mean 0.29 m, 3,180 m3\n- pound Mill Lock-Carrow aqueduct: 2.3 km, mean 0.44 m, 4,050 m3\n- files: fennick_reach_25cm.tif (25 cm grid, canal datum); fennick_silt_thickness.tif (thickness since 2021)\n- caveat: 2021 grid spacing 1 m, so thicknesses under 0.10 m carry no meaning\n",
+      "exemplar_paths": [
+        "q101-brenlow-estuary/q101-technical-memorandum.md",
+        "q102-oskary-quarry/q102-technical-memorandum.pdf",
+        "q101-brenlow-estuary/q101-review-feedback.md",
+        "q102-oskary-quarry/q102-review-feedback.md"
+      ],
+      "rubric": [
+        {
+          "check_id": "headline_results_kept",
+          "category": "project_facts",
+          "description": "States the 0.31 m mean silt, the 9,870 m3 total and the 0.74 m maximum.",
+          "require_groups": [
+            [
+              "0.31"
+            ],
+            [
+              "9,870"
+            ],
+            [
+              "0.74"
+            ]
+          ]
+        },
+        {
+          "check_id": "pound_volumes_kept",
+          "category": "project_facts",
+          "description": "Gives the volume of each of the three pounds.",
+          "require_groups": [
+            [
+              "2,640"
+            ],
+            [
+              "3,180"
+            ],
+            [
+              "4,050"
+            ]
+          ]
+        },
+        {
+          "check_id": "datum_and_tie_in_kept",
+          "category": "project_facts",
+          "description": "Names the canal datum at Hob Lock and the 21 May 2026 repeat of the HWX tie-in.",
+          "require_groups": [
+            [
+              "Hob Lock"
+            ],
+            [
+              "21 May 2026"
+            ]
+          ]
+        },
+        {
+          "check_id": "uncertainty_kept",
+          "category": "project_facts",
+          "description": "Gives both TPU figures at 95 % confidence.",
+          "require_groups": [
+            [
+              "0.07"
+            ],
+            [
+              "0.10"
+            ],
+            [
+              "95"
+            ]
+          ]
+        },
+        {
+          "check_id": "no_borrowed_project_values",
+          "category": "anti_contamination",
+          "description": "Does not carry over Q101 or Q102 results or files.",
+          "forbid_any": [
+            "6.42",
+            "125,500",
+            "1,284,330",
+            "brenlow_soundings.csv",
+            "Saltgate"
+          ]
+        }
+      ]
+    }
+  ]
+}

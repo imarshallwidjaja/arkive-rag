@@ -658,6 +658,76 @@ def test_agent_run_returns_unknown_tool_names_to_the_model_and_fails_on_behaviou
         api.gateway().run_agent(AgentProbe())
 
 
+def test_conversation_records_each_tool_call_in_order_with_its_arguments_and_result() -> None:
+    long_key = "k" * 3_000
+    long_arguments = json.dumps({"key": long_key})
+    api = agent_turns(
+        response_body(
+            [
+                function_call("c1", "lookup", '{"key": "intro"}'),
+                function_call("c2", "lookup", '{"key": "chart"}'),
+            ]
+        ),
+        response_body([function_call("c3", "lookup", '{"key": "missing"}')]),
+        response_body([function_call("c4", "lookup", '{"key": ')]),
+        response_body([function_call("c5", "lookup", long_arguments)]),
+        response_body([function_call("c6", "hallucinated_tool", "{}")]),
+        response_body([message("done")]),
+    )
+
+    run = asyncio.run(
+        api.gateway().converse(
+            operation="probe",
+            instructions="i",
+            prompt="q",
+            tools=(LOOKUP,),
+            max_turns=8,
+            effort="low",
+        )
+    )
+
+    assert run.status == "completed"
+    intro, chart, missing, malformed, long = run.tool_calls
+    assert intro == llm.ToolCall("lookup", '{"key": "intro"}', 14, "value of intro", 0)
+    assert (chart.result_chars, chart.result_head, chart.images) == (10, "chart page", 1)
+    # Invalid input is text returned to the model, so its error message is the result.
+    assert missing.result_head == "ERROR: NotFoundError: no section 'missing'"
+    assert malformed.arguments == '{"key": '
+    assert malformed.result_head is not None and malformed.result_head.startswith(
+        "ERROR: JSONDecodeError"
+    )
+    assert long.arguments == (
+        f"{long_arguments[:2_000]}[... cut, {len(long_arguments)} characters in all]"
+    )
+    assert long.result_chars == len(f"value of {long_key}")
+    assert long.result_head == f"value of {long_key}"[:200]
+
+    def failing(args: dict[str, Any]) -> str:
+        raise ProviderError("embedding service down")
+
+    broken = Tool("broken", "Fail.", {"type": "object", "properties": {}}, failing)
+    api = agent_turns(
+        response_body([function_call("c1", "lookup", '{"key": "a"}')]),
+        response_body([function_call("c2", "broken", "{}")]),
+    )
+    ended = asyncio.run(
+        api.gateway().converse(
+            operation="probe",
+            instructions="i",
+            prompt="q",
+            tools=(LOOKUP, broken),
+            max_turns=4,
+            effort="low",
+        )
+    )
+    # A call whose tool raised is still listed, with no result.
+    assert ended.status == "provider_error"
+    assert [(c.name, c.result_chars, c.result_head) for c in ended.tool_calls] == [
+        ("lookup", 10, "value of a"),
+        ("broken", None, None),
+    ]
+
+
 def test_trace_passes_its_key_with_each_run_and_leaves_the_global_exporter_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

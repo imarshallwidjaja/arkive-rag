@@ -1,0 +1,237 @@
+{
+  "format": "arkive-eval-pack/3",
+  "name": "example-creator-campaigns",
+  "description": "Fictional eval pack for the creator-campaigns example collection (Hollin & Pike Creative, campaigns of two creators). Every name, value and file in it is invented.",
+  "corpus_fingerprint": "d006c51c40628384ed602b8ae1595e8568be11fde62214b1ef2a76b65cfba61b",
+  "retrieval_cases": [],
+  "qa_cases": [
+    {
+      "case_id": "corriemoor_pairs_sold",
+      "kind": "lookup",
+      "question": "How many Trail 2 pairs did the Corriemoor relaunch sell, against what target?",
+      "ground_truth_facts": [
+        "The Corriemoor Trail Relaunch sold 4,870 Trail 2 pairs against a target of 4,600."
+      ],
+      "required_groups": [
+        [
+          "4,870"
+        ],
+        [
+          "4,600"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_007",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "newsletter_ctr_against_target",
+      "kind": "multi_document",
+      "question": "How did newsletter CTR compare with its target on the Glowmilk Spring 2026 and Kettlecraft Winter Warmers campaigns?",
+      "ground_truth_facts": [
+        "Glowmilk Spring 2026 newsletter CTR was 4.1 % against a 3.5 % target.",
+        "Kettlecraft Winter Warmers newsletter CTR was 2.6 % against a 3.0 % target, a miss."
+      ],
+      "required_groups": [
+        [
+          "4.1"
+        ],
+        [
+          "3.5"
+        ],
+        [
+          "2.6"
+        ],
+        [
+          "3.0"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_003",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_009",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "fqv_expansion",
+      "kind": "abstention",
+      "question": "What does the FQV in the FQV score stand for?",
+      "ground_truth_facts": [
+        "The collection uses the FQV score as a measure but never says what FQV stands for."
+      ],
+      "required_groups": [
+        [
+          "does not",
+          "not stated",
+          "no record",
+          "not available",
+          "cannot find",
+          "not in",
+          "not defined",
+          "never defined",
+          "never says"
+        ]
+      ]
+    },
+    {
+      "case_id": "cta_meanings",
+      "kind": "vocabulary",
+      "question": "What does CTA mean in Hollin & Pike's campaign files?",
+      "ground_truth_facts": [
+        "CTA usually means call to action.",
+        "On the Harbourline launch, CTA was also the Coastal Tourism Alliance, the tourism partner."
+      ],
+      "required_groups": [
+        [
+          "call to action"
+        ],
+        [
+          "Coastal Tourism Alliance"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_001",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_002",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_003",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_004",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_005",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_006",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_007",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_008",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_009",
+          "pages": null
+        }
+      ]
+    }
+  ],
+  "holdouts": [
+    {
+      "holdout_id": "kettlecraft-winter-campaign-brief",
+      "included_paths": [
+        "AGENTS.md",
+        "juno-acheampong",
+        "teodor-vasquez-lund/corriemoor-trail-relaunch"
+      ],
+      "held_out_markers": [
+        "kettlecraft-winter"
+      ],
+      "reference_doc_id": "doc_008",
+      "instructions": "You are a campaign manager at Hollin & Pike Creative writing the campaign brief for Teodor Vasquez-Lund's Kettlecraft Homeware winter campaign. Write the complete brief in Markdown from the run notes in the prompt, taking every campaign-specific fact from the run notes, and when your tools give you prior Hollin & Pike documents, follow their house structure and wording. Return only the brief.",
+      "run_notes": "- campaign: Kettlecraft Winter Warmers\n- client: Kettlecraft Homeware\n- creator: Teodor Vasquez-Lund\n- channels: email newsletter; short-form video\n- target audience: first-time home owners, 25-35\n- spend: GBP 14,800\n- dates: 3 November to 19 December 2025\n- goal: 2,400 Winter Warmer flask sets sold online by 19 December\n- tagline: \"Hot at nine, hot at five.\"\n- CTA: buyers must order by 18 December for pre-holiday delivery\n- assets: 3 newsletter features (Pinloom scheduling); 5 x 15-second videos (Clipstack edit); UGC round-up: customers' winter-walk content\n- KPIs: newsletter link CTR, target 3.0 %; CPM ceiling GBP 5.50; daily online orders via Sparkboard\n- must include: 12-hour heat claim shown with its test ref KH-TR-118; the delivery cut-off shown in every asset\n",
+      "exemplar_paths": [
+        "juno-acheampong/glowmilk-spring-2026/campaign-brief.md",
+        "juno-acheampong/harbourline-launch/campaign-brief.md",
+        "teodor-vasquez-lund/corriemoor-trail-relaunch/campaign-brief.md",
+        "juno-acheampong/glowmilk-spring-2026/post-campaign-review.md",
+        "teodor-vasquez-lund/corriemoor-trail-relaunch/post-campaign-review.md"
+      ],
+      "rubric": [
+        {
+          "check_id": "budget_and_flight_kept",
+          "category": "project_facts",
+          "description": "States the GBP 14,800 budget and the 3 November to 19 December 2025 flight.",
+          "require_groups": [
+            [
+              "14,800"
+            ],
+            [
+              "3 November"
+            ],
+            [
+              "19 December"
+            ]
+          ]
+        },
+        {
+          "check_id": "sales_target_and_cut_off_kept",
+          "category": "project_facts",
+          "description": "States the 2,400 flask-set target and the 18 December order cut-off.",
+          "require_groups": [
+            [
+              "2,400"
+            ],
+            [
+              "18 December"
+            ]
+          ]
+        },
+        {
+          "check_id": "heat_claim_reference_kept",
+          "category": "project_facts",
+          "description": "Names the 12-hour heat claim with test reference KH-TR-118.",
+          "require_groups": [
+            [
+              "KH-TR-118"
+            ],
+            [
+              "12-hour",
+              "12 hour"
+            ]
+          ]
+        },
+        {
+          "check_id": "measure_thresholds_kept",
+          "category": "project_facts",
+          "description": "States the 3.0 % CTR target, the GBP 5.50 CPM ceiling and Sparkboard as the order source.",
+          "require_groups": [
+            [
+              "3.0 %",
+              "3.0%"
+            ],
+            [
+              "5.50"
+            ],
+            [
+              "Sparkboard"
+            ]
+          ]
+        },
+        {
+          "check_id": "no_borrowed_campaign_values",
+          "category": "anti_contamination",
+          "description": "Does not carry over another campaign's master file, artwork file, deck, region or key message.",
+          "forbid_any": [
+            "glowmilk_spring_cutdowns_v3.mp4",
+            "corriemoor_trail2_display_a1.pdf",
+            "harbourline-launch-deck.pptx",
+            "Ostrey",
+            "Lunch they'll actually finish"
+          ]
+        }
+      ]
+    }
+  ]
+}
