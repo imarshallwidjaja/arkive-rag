@@ -66,11 +66,12 @@ def _failed(scenario: Scenario, transcript: Transcript, exit_code: int | None = 
     return [c.check for c in evaluate(scenario, transcript, exit_code, FACETS) if not c.passed]
 
 
-def test_shipped_scenario_file_covers_the_example_corpora_and_names_no_facet() -> None:
+def test_shipped_scenario_topics_are_shipped_example_corpora_and_prompts_name_no_facet() -> None:
     scenario_file = ScenarioFile.load(runner.DEFAULT_SCENARIOS)
     assert scenario_file.topics == ("coastal-survey-projects", "creator-campaigns")
+    # Other example corpora may exist for the evaluation harness without an OpenCode scenario.
     corpora = Path(__file__).resolve().parents[1] / "evals" / "example_corpora"
-    assert sorted(p.name for p in corpora.iterdir()) == sorted(scenario_file.topics)
+    assert set(scenario_file.topics) <= {p.name for p in corpora.iterdir() if p.is_dir()}
     every_prompt = " ".join(s.prompt for s in scenario_file.scenarios)
     assert "document_role" not in every_prompt and "creator=" not in every_prompt
     assert len(scenario_file.scenarios) == 10
