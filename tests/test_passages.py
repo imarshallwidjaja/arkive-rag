@@ -3,22 +3,32 @@ from __future__ import annotations
 import importlib
 import itertools
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pytest
 
 from arkive_rag import passages
-from arkive_rag.models import fold_for_quote
+from arkive_rag.models import DocumentDate, fold_for_quote
 from arkive_rag.passages import (
     STANDING_RECURRENCE_CONTAINMENT,
+    CandidateWording,
     ExemplarDocument,
     ExemplarSection,
+    HolderUnit,
+    HoldingSection,
+    HouseUnit,
     StandingCandidate,
     StandingUnit,
     containment,
+    holder_wording,
+    holding_sections,
+    house_units,
+    is_passage_unit,
     shingles,
     standing_candidates,
     standing_units,
     without_visual_transcripts,
+    word_candidates,
 )
 
 # One section covering every block the unit rules tell apart: a paragraph, Markdown and glyph
@@ -361,3 +371,257 @@ def test_candidates_group_duplicates_in_canonical_order_whatever_the_input_order
     # A document given twice is a caller error, not a second exemplar.
     with pytest.raises(ValueError, match="repeat"):
         candidates(documents(*docs), ("doc_001", "doc_002", "doc_001"))
+
+
+# A candidate's wording.
+
+# Sixteen words; the later wordings change only the last word, so they keep 12 of 13 4-grams
+# and say the same thing.
+REDUCTION = "Soundings are reduced to chart datum using the tide gauge records of the survey week."
+FORTNIGHT = REDUCTION.replace("week.", "fortnight.")
+MONTH = REDUCTION.replace("week.", "month.")
+
+
+def dated(*docs: tuple[str | None, Sequence[str]]) -> list[ExemplarDocument]:
+    """Documents doc_001, doc_002, ... under folders p1, p2, ..., each with a printed date
+    (or none) and its sections' Markdown."""
+    built = documents(*((f"p{n}/r.md", s) for n, (_, s) in enumerate(docs, start=1)))
+    return [
+        replace(doc, date=None if iso is None else DocumentDate(iso=iso, basis="printed"))
+        for doc, (iso, _) in zip(built.values(), docs, strict=True)
+    ]
+
+
+def wording(docs: Sequence[ExemplarDocument]) -> CandidateWording:
+    (worded,) = word_candidates(docs, standing_candidates(docs))
+    return worded.wording
+
+
+def test_the_newest_dated_holder_supplies_the_wording_and_the_others_are_variants() -> None:
+    docs = dated(("2024-03-01", [REDUCTION]), ("2026-01", [FORTNIGHT]), ("2025-06-10", [MONTH]))
+    (candidate,) = standing_candidates(docs)
+
+    # Identity stays discovery's: the first holder's text and every holding section.
+    assert candidate.text == REDUCTION
+    (worded,) = word_candidates(docs, (candidate,))
+    assert worded.holding == holding_sections(docs, candidate)
+    assert worded.holding == tuple(
+        HoldingSection(doc.doc_id, sid, (HolderUnit(sid, doc.date, text, False),))
+        for sid, doc, text in zip(
+            candidate.citations, docs, (REDUCTION, FORTNIGHT, MONTH), strict=True
+        )
+    )
+    assert worded.wording == CandidateWording(
+        FORTNIGHT,
+        "doc_002_sec_001",
+        "newest_holder",
+        (
+            HolderUnit("doc_001_sec_001", docs[0].date, REDUCTION, False),
+            HolderUnit("doc_003_sec_001", docs[2].date, MONTH, False),
+        ),
+        None,
+    )
+    # A holder whose wording folds like the chosen one is no variant.
+    same = dated(("2024-03-01", [REDUCTION.upper()]), ("2025-01-01", [REDUCTION]))
+    assert wording(same) == CandidateWording(
+        REDUCTION, "doc_002_sec_001", "newest_holder", (), None
+    )
+
+
+@pytest.mark.parametrize(
+    "dates",
+    [
+        pytest.param((None, "2025-06-10"), id="undated"),
+        pytest.param(("2025-06-10", "2025-06-10"), id="tied"),
+        pytest.param(("2025-06", "2025-06-10"), id="month-against-a-day-of-it"),
+        # The newest is later than both, but the two older dates show no order between them.
+        pytest.param(("2025-06", "2025-06-10", "2026-01-01"), id="older-pair-unordered"),
+    ],
+)
+def test_dates_that_show_no_order_keep_the_first_holder(dates: tuple[str | None, ...]) -> None:
+    texts = (REDUCTION, FORTNIGHT, MONTH)[: len(dates)]
+
+    chosen = wording(dated(*((d, [t]) for d, t in zip(dates, texts, strict=True))))
+
+    assert (chosen.text, chosen.source_section_id, chosen.wording_from) == (
+        REDUCTION,
+        "doc_001_sec_001",
+        "first_holder",
+    )
+    assert chosen.first_holder_reason == "dates_show_no_order"
+    assert [v.text for v in chosen.variants] == list(texts[1:])
+
+
+def test_a_holding_section_without_exactly_one_holder_unit_keeps_the_first_holder() -> None:
+    # Two units of the newest section say the same thing: which one is the wording is unknown.
+    twice = dated(("2024-03-01", [REDUCTION]), ("2025-06-10", [f"{FORTNIGHT}\n\n{MONTH}"]))
+    (candidate,) = standing_candidates(twice)
+    assert [len(s.units) for s in holding_sections(twice, candidate)] == [1, 2]
+    assert (wording(twice).wording_from, wording(twice).first_holder_reason) == (
+        "first_holder",
+        "holder_units_not_one",
+    )
+    assert [v.text for v in wording(twice).variants] == [FORTNIGHT, MONTH]
+    # The newest section holds the candidate's 4-grams only across two units: it has no
+    # holder unit and gives no variant. (Its second unit recurs on its own as a candidate.)
+    split = REDUCTION.replace(" using", ".\n\nUsing")
+    spread = dated(("2024-03-01", [REDUCTION]), ("2025-06-10", [split]))
+    candidate = standing_candidates(spread)[0]
+    assert candidate.text == REDUCTION
+    assert [len(s.units) for s in holding_sections(spread, candidate)] == [1, 0]
+    assert word_candidates(spread, (candidate,))[0].wording == CandidateWording(
+        REDUCTION, "doc_001_sec_001", "first_holder", (), "holder_units_not_one"
+    )
+    # The newest document holds it in two sections, each with one holder unit.
+    two_sections = dated(("2024-03-01", [REDUCTION]), ("2025-06-10", [FORTNIGHT, MONTH]))
+    assert (wording(two_sections).wording_from, wording(two_sections).first_holder_reason) == (
+        "first_holder",
+        "newest_holds_it_twice",
+    )
+
+
+# Twenty-nine words. EARLY and LATE each change one word of NEWEST, so each keeps 23 of its 27
+# 4-grams and says the same thing as NEWEST; between them only 19 survive, so they do not.
+NEWEST = (
+    "Every survey we deliver is reduced to the stated vertical datum, checked against an"
+    " independent crossline, reviewed by a second surveyor and archived with its raw files"
+    " for seven years."
+)
+EARLY = NEWEST.replace("stated", "declared")
+LATE = NEWEST.replace("raw", "source")
+
+
+def test_two_candidates_never_store_the_same_newest_holder_unit() -> None:
+    docs = dated(("2024-03-01", [EARLY]), ("2025-03-01", [LATE]), ("2026-03-01", [NEWEST]))
+    found = standing_candidates(docs)
+    # Both candidates are held by the newest report's one unit.
+    assert [(c.text, c.citations) for c in found] == [
+        (EARLY, ("doc_001_sec_001", "doc_003_sec_001")),
+        (LATE, ("doc_002_sec_001", "doc_003_sec_001")),
+    ]
+
+    first, second = word_candidates(docs, found)
+
+    # Worded in canonical order, the first takes the newest unit; the second keeps its own.
+    assert (first.wording.text, first.wording.wording_from) == (NEWEST, "newest_holder")
+    assert second.wording == CandidateWording(
+        LATE,
+        "doc_002_sec_001",
+        "first_holder",
+        (HolderUnit("doc_003_sec_001", docs[2].date, NEWEST, False),),
+        "newest_unit_taken",
+    )
+    # Two projects whose final reports both hold the newest wording: each candidate's newest
+    # holder is another section, but the wording folds alike, so it is still taken.
+    projects = documents(
+        ("p1/01-draft.md", [EARLY]),
+        ("p1/02-final.md", [NEWEST]),
+        ("p2/01-draft.md", [LATE]),
+        ("p2/02-final.md", [NEWEST.upper()]),
+    )
+    finals = [
+        replace(doc, date=DocumentDate(iso=iso, basis="printed"))
+        for doc, iso in zip(
+            projects.values(), ("2024-03-01", "2026-01-15", "2025-03-01", "2026-02-15"), strict=True
+        )
+    ]
+    first, second = word_candidates(finals, standing_candidates(finals))
+    assert (first.wording.source_section_id, first.wording.text) == (
+        "doc_004_sec_001",
+        NEWEST.upper(),
+    )
+    assert (second.wording.source_section_id, second.wording.text) == ("doc_003_sec_001", LATE)
+    assert second.wording.first_holder_reason == "newest_unit_taken"
+
+
+def test_a_table_header_variant_compares_the_header_row_and_each_columns_alignment() -> None:
+    aligned = HEADER.replace("| --- | --- | --- |", "| :--- | ---: | --- |")
+    docs = dated(("2024-03-01", [HEADER]), ("2025-03-01", [aligned]))
+
+    (worded,) = word_candidates(docs, standing_candidates(docs))
+
+    # The header rows fold alike, so they recur as one candidate; the alignment differs.
+    assert worded.candidate.citations == ("doc_001_sec_001", "doc_002_sec_001")
+    assert (worded.wording.text, worded.wording.wording_from) == (aligned, "newest_holder")
+    assert worded.wording.variants == (HolderUnit("doc_001_sec_001", docs[0].date, HEADER, True),)
+    # A padded separator row aligns its columns as the compact one does: no variant, so a
+    # passage of it may be standing.
+    padded = HEADER.replace("| --- | --- | --- |", "| ----------- | --------- | ------ |")
+    centred = aligned.replace(":--- |", ":---: |", 1)
+    assert wording(dated(("2024-03-01", [HEADER]), ("2025-03-01", [padded]))) == CandidateWording(
+        padded, "doc_002_sec_001", "newest_holder", (), None
+    )
+    recentred = dated(("2024-03-01", [aligned]), ("2025-03-01", [centred]))
+    assert [v.text for v in wording(recentred).variants] == [aligned]
+
+
+def test_a_selection_takes_the_wording_of_a_holder_that_holds_it_in_one_unit() -> None:
+    docs = dated(
+        ("2024-03-01", [REDUCTION]),
+        ("2025-03-01", [FORTNIGHT]),
+        ("2026-03-01", [f"{MONTH}\n\n{MONTH.upper()}", "Scope only."]),
+    )
+    (worded,) = word_candidates(docs, standing_candidates(docs))
+
+    assert holder_wording(worded, "doc_001_sec_001") == CandidateWording(
+        REDUCTION,
+        "doc_001_sec_001",
+        "selected_holder",
+        tuple(
+            HolderUnit(f"doc_00{n}_sec_001", docs[n - 1].date, text, False)
+            for n, text in ((2, FORTNIGHT), (3, MONTH), (3, MONTH.upper()))
+        ),
+        None,
+    )
+    with pytest.raises(ValueError, match="'doc_003_sec_001' holds candidate_01 in 2 units"):
+        holder_wording(worded, "doc_003_sec_001")
+    with pytest.raises(ValueError, match="'doc_003_sec_002' is not a section that holds"):
+        holder_wording(worded, "doc_003_sec_002")
+
+
+# House text seen in one exemplar.
+
+
+def test_nominated_units_skip_any_holders_wording_and_repeat_no_unit() -> None:
+    # The candidate's first holder says "declared"; the newer holder says "stated". The
+    # nominated unit shares 8 of its 14 4-grams with the newer holder's wording, 5 with the
+    # first holder's.
+    near_holder = (
+        "Each crew notes that every survey we deliver is reduced to the stated vertical datum"
+        " before lunch."
+    )
+    policy = "Personal data collected on site is deleted thirty days after the final report."
+    docs = dated(
+        ("2024-03-01", [EARLY]),
+        ("2025-03-01", [NEWEST]),
+        (
+            "2026-03-01",
+            [f"{near_holder}\n\n{policy}\n\n{policy}", policy.upper(), "Scope only here."],
+        ),
+    )
+    found = standing_candidates(docs)
+    assert [c.citations for c in found] == [("doc_001_sec_001", "doc_002_sec_001")]
+
+    units = house_units(docs, ("doc_003_sec_001", "doc_003_sec_002"), found)
+
+    # The near-holder unit belongs to the candidate's house text; the policy is taken once,
+    # though it repeats in its section and, folded alike, in the next nominated section.
+    assert units == (HouseUnit("doc_003_sec_001", 2, policy),)
+    with pytest.raises(ValueError, match="doc_009_sec_001"):
+        house_units(docs, ("doc_009_sec_001",), found)
+
+
+def test_a_passage_unit_is_a_recurrable_unit_of_its_section_exactly() -> None:
+    section = f"## Method\n\n{REDUCTION}\n\nShort line.\n\n{HEADER}\n| Grid | g.tif | GeoTIFF |"
+    assert is_passage_unit(REDUCTION, section)
+    assert is_passage_unit(HEADER, section)
+    # A substring of a unit, a unit too short to recur, and a heading are not passage units.
+    assert not is_passage_unit(REDUCTION[:-1], section)
+    assert not is_passage_unit("Short line.", section)
+    assert not is_passage_unit("## Method", section)
+    # A unit rejoins its lines with `\n`, so in a section that breaks them otherwise it is a
+    # unit but not in the section byte for byte.
+    two_lines = REDUCTION.replace(" using", "\nusing")
+    assert is_passage_unit(two_lines, two_lines)
+    assert [u.text for u in standing_units(two_lines.replace("\n", "\r\n"))] == [two_lines]
+    assert not is_passage_unit(two_lines, two_lines.replace("\n", "\r\n"))

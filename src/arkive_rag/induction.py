@@ -3,10 +3,12 @@
 `induce` runs five steps in a fixed order: organise (facets and recurring deliverable types),
 bind (facet values to documents), then the glossary and the blueprints concurrently, then the
 topic guide. Every generating step goes through `generate_checked`: run, validate, rerun once
-with the rejections named, then raise. Only three outcomes reduce output without failing, and
+with the rejections named, then raise. Only four outcomes reduce output without failing, and
 the build report counts each: an observation whose quote is still unlocated after the rerun
 (in the reading pass), a glossary definition the support check does not confirm (kept with
-`definition=None`), and a blueprint convention or pitfall it does not confirm (dropped).
+`definition=None`), a blueprint convention or pitfall it does not confirm (dropped), and a
+unit of a nominated house section that the house-text check does not confirm or refuses
+(dropped, with its disposition recorded).
 
 Everything that reaches a prompt or a cache key is in a canonical sorted order, and
 concurrent results are gathered in submission order, so an unchanged corpus with the same
@@ -33,6 +35,8 @@ from arkive_rag.models import (
     BlueprintGuidance,
     BlueprintSection,
     BuildReport,
+    CandidateRecord,
+    ConditionalPassage,
     CorpusDocument,
     CuratorNote,
     Facet,
@@ -43,11 +47,20 @@ from arkive_rag.models import (
     GlossarySense,
     GuidanceDraft,
     GuideDraft,
+    HouseSectionNomination,
+    NominatedDisposition,
+    NominatedUnitRecord,
     NotFoundError,
     ObservationCard,
     OrganisationDraft,
+    Passage,
+    PassageVariant,
     ReadSection,
+    RecurringCandidateRecord,
+    RecurringDisposition,
+    RecurringKind,
     RejectedOutputError,
+    SingleExemplarPassage,
     StandingPassage,
     TermObservation,
     fold_facet_label,
@@ -465,6 +478,9 @@ def check_organisation(
     type_names: set[str] = set()
     for dtype in draft.deliverable_types:
         folded = fold_text(dtype.name).strip()
+        # A snapshot resolves a type by this fold, so a type that folds to nothing is unnamed.
+        if not fold_facet_label(dtype.name):
+            rejections.append(f"deliverable type {dtype.name!r} is blank")
         if folded in type_names:
             rejections.append(f"deliverable type {dtype.name!r} is given twice")
         type_names.add(folded)
@@ -910,25 +926,51 @@ conventions and reviewer pitfalls a new one must respect. Use the tools to read
 the exemplars' sections and the feedback documents before you answer. The
 request may list craft leads: observations noted while each document was read.
 They are leads, not evidence: read the section a lead names and use it only if
-the source shows it, citing the sections that do.
+the source shows it, citing the sections that do. The request also gives the
+curators' notes: their stated intent outranks your inference, but a note is not
+a source; cite only sections of this type's exemplar and feedback documents.
 
 - description: what this deliverable is for and who reads it.
 - outline: the sections a new deliverable of this type should have, in order,
-  each with its purpose and the section IDs of exemplar sections that show it.
+  each with its purpose and the exemplar or feedback section IDs that show it.
+  Each exemplar outline in the request carries the document's date and its
+  basis. When exemplars differ in layout, describe the newest dated exemplar's
+  layout as the current one and say which exemplars use the older one; when
+  their dates do not order them, claim no order. A curator note that states
+  which layout or wording is current outranks dates.
 - conventions: house rules for structure, tables, units, naming, caveats,
-  disclaimers and tone, each citing the section IDs that show it.
-- pitfalls: what reviewers asked authors to fix, each citing the feedback or
-  exemplar section IDs that show it.
-- standing_passages: the request lists standing passage candidates: blocks of
+  disclaimers and tone, each citing the exemplar or feedback section IDs that
+  show it.
+- pitfalls: what reviewers asked authors to fix, each citing the exemplar or
+  feedback section IDs that show it.
+- passages: the request lists recurring passage candidates: blocks of
   exemplar text (paragraphs, list items, table header rows) that recur in
-  another exemplar document. Select each candidate that is standing house
-  content: organisation or tool background, method references, reference
-  entries, acknowledgements, disclaimers, disclosures, standard table headers
-  and standing caveats. Leave out every candidate that is specific to one
-  project, client, place, period or result. For each one you select, give its
-  candidate_id exactly as listed and a short label. Never write passage text.
-  Give an empty list when no candidate is standing house content or when the
-  request lists none.
+  another exemplar document, each with the wording a passage would store and
+  the other holders' differing wordings (variants) with their dates. For each
+  candidate you use, give its candidate_id exactly as listed, a short label
+  and its kind:
+  - standing: house content that applies to any deliverable of this type as
+    written, such as organisation or tool background, method references,
+    reference entries, acknowledgements, disclaimers, disclosures, standard
+    table headers and standing caveats. Its condition is null. A candidate
+    listed with variants is worded differently by its holders, so it cannot be
+    standing.
+  - conditional: reusable wording that applies only when something about the
+    new project holds, or that names something that varies between projects.
+    Its condition is one sentence that states the fact of the new project, as
+    the user's inputs would state it, that makes the passage apply, and names
+    the part of the passage that varies.
+  holder_section_id is null, unless a curator note states which wording, or
+  which document's wording, is current: then give the section, among those the
+  candidate is found in, whose wording the note makes current.
+  Leave out a candidate that only states one project's facts. Never write
+  passage text. Give an empty list when the request lists no candidate or none
+  is reusable.
+- house_sections: exemplar sections, each by section ID with a short label,
+  whose content is house matter that does not recur in another exemplar, such
+  as a recently added policy statement or disclosure. Code copies the
+  section's text units, leaving out those that recur or that overlap a
+  candidate; you write none of it. Give an empty list when there are none.
 
 State the outline, conventions and pitfalls generically: no project-specific
 values, names, places or dates. Cite only section IDs the tools returned (for
@@ -1063,16 +1105,17 @@ def craft_leads(view: CorpusView, doc_ids: Sequence[str]) -> tuple[CraftLead, ..
     return tuple(sorted(leads))
 
 
-# Standing passage candidates. Code finds the blocks of a type's exemplar text that recur in
-# another exemplar document (`arkive_rag.passages`); the blueprint agent only selects and
-# labels them, so a stored passage is exemplar text by construction.
+# Recurring passage candidates. Code finds the blocks of a type's exemplar text that recur in
+# another exemplar document and the wording each takes (`arkive_rag.passages`); the blueprint
+# agent only selects, kinds and labels them, and names house sections whose units code takes,
+# so a stored passage is exemplar text by construction.
 
 
 def exemplar_documents(
     view: CorpusView, doc_ids: Sequence[str]
 ) -> tuple[_passages.ExemplarDocument, ...]:
-    """The citable documents `doc_ids`, each once, with their sections in ordinal order, as
-    candidate discovery reads them."""
+    """The citable documents `doc_ids`, each once, with their dates and their sections in
+    ordinal order, as candidate discovery reads them."""
     documents = []
     for doc in map(view.document, sorted(set(doc_ids))):
         sections = sorted(doc.reading.sections, key=lambda s: s.ordinal)
@@ -1080,7 +1123,7 @@ def exemplar_documents(
             _passages.ExemplarDocument(
                 doc.doc_id,
                 doc.rel_path,
-                None,
+                doc.reading.date,
                 tuple(
                     _passages.ExemplarSection(doc.section_id(s.ordinal), s.markdown)
                     for s in sections
@@ -1109,6 +1152,42 @@ def offered_candidates(
     return tuple(candidates[i] for i in sorted(ranked[:MAX_STANDING_CANDIDATES]))
 
 
+# Why the request says a candidate keeps its first holder's wording.
+_FIRST_HOLDER_REASONS: dict[_passages.FirstHolderReason, str] = {
+    "holder_units_not_one": "a section it is found in holds it in zero or several units",
+    "dates_show_no_order": "the holders' dates do not show which is newest",
+    "newest_holds_it_twice": "the newest document holds it in several sections",
+    "newest_unit_taken": "the newest holder's wording is already another candidate's",
+}
+
+
+def render_candidate(worded: _passages.WordedCandidate) -> str:
+    """An offered candidate as the blueprint request lists it: where it is found, the wording
+    a passage stores and why, and the variants with their dates."""
+    c, w = worded.candidate, worded.wording
+    if w.first_holder_reason is not None:
+        source = f"the first holder, because {_FIRST_HOLDER_REASONS[w.first_holder_reason]}"
+    else:
+        source = "the newest dated holder"
+    lines = [
+        f"[{c.candidate_id}] found in {', '.join(c.citations)}; wording from"
+        f" {w.source_section_id} ({source})",
+        w.text,
+    ]
+    for variant in w.variants:
+        dated = f"{variant.date.iso}, {variant.date.basis}" if variant.date else "undated"
+        lines += [f"Variant in {variant.section_id} ({dated}):", variant.text]
+    return "\n".join(lines)
+
+
+def _outline_text(doc: CorpusDocument) -> str:
+    date = doc.reading.date
+    dated = f"{date.iso} ({date.basis})" if date else "none known"
+    lines = [f"{doc.doc_id}: {doc.reading.card.title}", f"Date: {dated}"]
+    lines += [f"- {doc.section_id(s.ordinal)}: {s.heading_path}" for s in doc.reading.sections]
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class WriteBlueprint:
     operation: ClassVar[str] = "write_blueprint"
@@ -1117,65 +1196,124 @@ class WriteBlueprint:
     max_turns: ClassVar[int] = BLUEPRINT_MAX_TURNS
     instructions: ClassVar[str] = BLUEPRINT_INSTRUCTIONS
     deliverable_type: DeliverableType
+    notes: tuple[CuratorNote, ...]
     exemplar_outlines: tuple[str, ...]
     feedback_documents: tuple[str, ...]
     craft_leads: tuple[CraftLead, ...]
-    standing_candidates: tuple[_passages.StandingCandidate, ...]
+    candidates: tuple[_passages.WordedCandidate, ...]
     # How many candidates `standing_candidates` found before `offered_candidates` cut them.
-    standing_candidates_found: int
+    candidates_found: int
     tools: tuple[Tool, ...]
     source_digest: str
     feedback: str | None = None
 
     def text(self) -> str:
         dtype = self.deliverable_type
+        notes = "\n\n".join(f"### {n.scope_path}\n{n.content}" for n in self.notes) or "(none)"
         exemplars = "\n\n".join(self.exemplar_outlines)
         feedback_docs = "\n".join(self.feedback_documents) or "(none)"
         leads = "\n".join(
             f"- [{lead.section_id}] {lead.aspect}: {lead.statement}" for lead in self.craft_leads
         )
-        if self.standing_candidates:
-            candidates = "\n\n".join(
-                f"[{c.candidate_id}] found in {', '.join(c.citations)}\n{c.text}"
-                for c in self.standing_candidates
-            )
-            offered = len(self.standing_candidates)
-            if offered < self.standing_candidates_found:
+        if self.candidates:
+            candidates = "\n\n".join(map(render_candidate, self.candidates))
+            offered = len(self.candidates)
+            if offered < self.candidates_found:
                 candidates = (
-                    f"(this list was cut from {self.standing_candidates_found} candidates to"
+                    f"(this list was cut from {self.candidates_found} candidates to"
                     f" the {offered} that recur in the most exemplar documents)\n\n{candidates}"
                 )
         elif len(dtype.exemplar_doc_ids) == 1:
             candidates = (
                 "(none: this type has one exemplar document, so no text can recur in another;"
-                " return an empty standing_passages list)"
+                " return an empty passages list)"
             )
         else:
             candidates = (
                 "(none: no block of this type's exemplars recurs in another exemplar document;"
-                " return an empty standing_passages list)"
+                " return an empty passages list)"
             )
         text = (
             f"DELIVERABLE TYPE: {dtype.name}\nDESCRIPTION: {dtype.description}\n\n"
-            f"EXEMPLAR OUTLINES:\n{exemplars}\n\nFEEDBACK DOCUMENTS:\n{feedback_docs}\n\n"
+            f"CURATOR NOTES (stated intent; never cite them):\n{notes}\n\n"
+            f"EXEMPLAR OUTLINES (each with the document's date and its basis):\n{exemplars}\n\n"
+            f"FEEDBACK DOCUMENTS:\n{feedback_docs}\n\n"
             f"CRAFT LEADS (verify each in its section before using it):\n{leads or '(none)'}\n\n"
-            f"STANDING PASSAGE CANDIDATES (select by candidate_id; the first section listed"
-            f" holds the text as shown):\n{candidates}"
+            f"RECURRING PASSAGE CANDIDATES (select by candidate_id; the text shown under each"
+            f" candidate is the wording a passage stores):\n{candidates}"
         )
         return f"{text}\n\n{self.feedback}" if self.feedback else text
+
+
+@dataclass(frozen=True)
+class CheckedBlueprint:
+    """A blueprint answer that passed validation: the blueprint with its recurring passages,
+    one disposition record per recurring candidate found, in candidate order, and the accepted
+    house-section nominations, whose units still face the house-text check."""
+
+    blueprint: Blueprint
+    records: tuple[RecurringCandidateRecord, ...]
+    nominations: tuple[HouseSectionNomination, ...]
+
+
+@dataclass(frozen=True)
+class _Choice:
+    kind: RecurringKind
+    label: str
+    condition: str | None
+    wording: _passages.CandidateWording
+
+
+def _recurring_passage(
+    candidate: _passages.StandingCandidate, choice: _Choice
+) -> StandingPassage | ConditionalPassage:
+    w = choice.wording
+    if choice.kind == "standing":
+        return StandingPassage(
+            kind="standing",
+            label=choice.label,
+            text=w.text,
+            citations=candidate.citations,
+            source_section_id=w.source_section_id,
+            wording_from=w.wording_from,
+        )
+    assert choice.condition is not None, "check_blueprint rejects a conditional without one"
+    return ConditionalPassage(
+        kind="conditional",
+        label=choice.label,
+        text=w.text,
+        citations=candidate.citations,
+        source_section_id=w.source_section_id,
+        wording_from=w.wording_from,
+        condition=choice.condition,
+        variants=tuple(
+            PassageVariant(
+                section_id=v.section_id,
+                doc_date_iso=v.date.iso if v.date else None,
+                text=v.text,
+            )
+            for v in w.variants
+        ),
+    )
 
 
 def check_blueprint(
     draft: BlueprintDraft,
     dtype: DeliverableType,
-    candidates: Sequence[_passages.StandingCandidate],
+    found: Sequence[_passages.StandingCandidate],
+    offered: Sequence[_passages.WordedCandidate],
     view: CorpusView,
-) -> Checked[Blueprint]:
-    """Structure, citations and the standing passage selection. Selected passages take their
-    text and citations from the candidates, in candidate order."""
+) -> Checked[CheckedBlueprint]:
+    """Structure, citations, the passage selection and the house-section nominations.
+    Outline items, conventions and pitfalls cite sections of the type's exemplar or feedback
+    documents, nothing else. Selected passages take their text, citations and variants from
+    the offered candidates, and no two store wording that folds alike; every candidate
+    `found` gets its disposition record in the same candidate-order pass."""
     rejections: list[str] = []
     if not draft.outline:
         rejections.append("the outline is empty")
+    exemplars = frozenset(dtype.exemplar_doc_ids)
+    sources = exemplars | frozenset(dtype.feedback_doc_ids)
     cited = [("outline", s.heading, s.citations) for s in draft.outline]
     cited += [("convention", g.statement, g.citations) for g in draft.conventions]
     cited += [("pitfall", g.statement, g.citations) for g in draft.pitfalls]
@@ -1185,18 +1323,87 @@ def check_blueprint(
         for citation in citations:
             if citation not in view.sections:
                 rejections.append(f"{kind} {label!r}: {citation!r} is not a citable section ID")
-    by_id = {c.candidate_id: c for c in candidates}
-    labels: dict[str, str] = {}
-    for selection in draft.standing_passages:
-        if selection.candidate_id not in by_id:
+            elif view.sections[citation][0].doc_id not in sources:
+                rejections.append(
+                    f"{kind} {label!r}: {citation!r} is not a section of this type's exemplar"
+                    " or feedback documents"
+                )
+    by_id = {w.candidate.candidate_id: w for w in offered}
+    chosen: dict[str, _Choice] = {}
+    seen: set[str] = set()
+    for selection in draft.passages:
+        cid = selection.candidate_id
+        condition = (selection.condition or "").strip() or None
+        holder = selection.holder_section_id
+        if cid not in by_id:
+            rejections.append(f"passage {cid!r} is not a listed candidate_id")
+            continue
+        if cid in seen:
+            rejections.append(f"passage {cid!r} is selected twice")
+            continue
+        seen.add(cid)
+        if not selection.label.strip():
+            rejections.append(f"passage {cid!r} has a blank label")
+            continue
+        if selection.kind == "conditional" and condition is None:
+            # Whether a candidate has variants does not depend on which holder words it.
+            otherwise = "leave it out" if by_id[cid].wording.variants else "make it standing"
             rejections.append(
-                f"standing passage {selection.candidate_id!r} is not a listed candidate_id"
+                f"passage {cid!r} is conditional without a condition; state the fact of the new"
+                f" project that makes it apply and the part that varies, or {otherwise}"
             )
-        elif selection.candidate_id in labels:
-            rejections.append(f"standing passage {selection.candidate_id!r} is selected twice")
-        elif not selection.label.strip():
-            rejections.append(f"standing passage {selection.candidate_id!r} has a blank label")
-        labels.setdefault(selection.candidate_id, selection.label.strip())
+            continue
+        if selection.kind == "standing" and condition is not None:
+            rejections.append(
+                f"passage {cid!r} is standing but has a condition; make it conditional, or give"
+                " a null condition"
+            )
+            continue
+        wording = by_id[cid].wording
+        if holder is not None:
+            if not holder.strip():
+                rejections.append(
+                    f"passage {cid!r} has a blank holder_section_id; name a section it is found"
+                    " in that holds it in one unit, or give a null holder_section_id"
+                )
+                continue
+            try:
+                wording = _passages.holder_wording(by_id[cid], holder.strip())
+            except ValueError as exc:
+                rejections.append(
+                    f"passage {cid!r}: holder_section_id {exc}; name a section it is found in"
+                    " that holds it in one unit, or give a null holder_section_id"
+                )
+                continue
+        if selection.kind == "standing" and wording.variants:
+            rejections.append(
+                f"passage {cid!r} is standing, but its holders word it differently (it has"
+                " variants); make it conditional with a condition, or leave it out"
+            )
+            continue
+        chosen[cid] = _Choice(selection.kind, selection.label.strip(), condition, wording)
+    # In candidate order, so the later candidate is the one told to change.
+    stored: dict[str, str] = {}
+    for cid in (w.candidate.candidate_id for w in offered if w.candidate.candidate_id in chosen):
+        folded = fold_for_quote(chosen[cid].wording.text)
+        if folded in stored:
+            rejections.append(
+                f"passage {cid!r} would store the same wording as passage {stored[folded]!r};"
+                " name another holder_section_id or none, or leave it out"
+            )
+        stored.setdefault(folded, cid)
+    nominated: dict[str, HouseSectionNomination] = {}
+    for nomination in draft.house_sections:
+        sid = nomination.section_id
+        if sid not in view.sections or view.sections[sid][0].doc_id not in exemplars:
+            rejections.append(
+                f"house section {sid!r} is not a section of an exemplar document of this type"
+            )
+        elif sid in nominated:
+            rejections.append(f"house section {sid!r} is listed twice")
+        elif not nomination.label.strip():
+            rejections.append(f"house section {sid!r} has a blank label")
+        nominated.setdefault(sid, nomination)
     if rejections:
         return Checked.reject(rejections)
 
@@ -1206,78 +1413,120 @@ def check_blueprint(
             for g in items
         )
 
-    return Checked.accept(
-        Blueprint(
-            deliverable_type=dtype.name,
-            description=draft.description,
-            exemplar_doc_ids=dtype.exemplar_doc_ids,
-            feedback_doc_ids=dtype.feedback_doc_ids,
-            outline=tuple(
-                BlueprintSection(
-                    heading=s.heading,
-                    purpose=s.purpose,
-                    citations=tuple(dict.fromkeys(s.citations)),
-                )
-                for s in draft.outline
-            ),
-            conventions=guidance(draft.conventions),
-            pitfalls=guidance(draft.pitfalls),
-            standing_passages=tuple(
-                StandingPassage(label=labels[c.candidate_id], text=c.text, citations=c.citations)
-                for c in candidates
-                if c.candidate_id in labels
-            ),
+    selected: dict[RecurringKind, RecurringDisposition] = {
+        "standing": "selected_standing",
+        "conditional": "selected_conditional",
+    }
+    passages: list[Passage] = []
+    records: list[RecurringCandidateRecord] = []
+    for candidate in found:
+        cid = candidate.candidate_id
+        disposition: RecurringDisposition
+        if cid not in by_id:
+            disposition, text = "not_offered", candidate.text
+        elif cid not in chosen:
+            disposition, text = "declined", by_id[cid].wording.text
+        else:
+            choice = chosen[cid]
+            passages.append(_recurring_passage(candidate, choice))
+            disposition, text = selected[choice.kind], choice.wording.text
+        records.append(
+            RecurringCandidateRecord(
+                deliverable_type=dtype.name,
+                candidate_id=cid,
+                disposition=disposition,
+                citations=candidate.citations,
+                text=text,
+            )
         )
+    blueprint = Blueprint(
+        deliverable_type=dtype.name,
+        description=draft.description,
+        exemplar_doc_ids=dtype.exemplar_doc_ids,
+        feedback_doc_ids=dtype.feedback_doc_ids,
+        outline=tuple(
+            BlueprintSection(
+                heading=s.heading, purpose=s.purpose, citations=tuple(dict.fromkeys(s.citations))
+            )
+            for s in draft.outline
+        ),
+        conventions=guidance(draft.conventions),
+        pitfalls=guidance(draft.pitfalls),
+        passages=tuple(passages),
     )
+    return Checked.accept(CheckedBlueprint(blueprint, tuple(records), tuple(nominated.values())))
 
 
 BLUEPRINT_SUPPORT_OPERATION = "check_blueprint"
+HOUSE_TEXT_OPERATION = "check_house_text"
+HOUSE_TEXT_PREDICATE = (
+    "This text states no fact about a particular project, whether the one this document"
+    " reports or an earlier one (its client, site, dates, quantities or results), and it could"
+    " appear unchanged in another document of the same kind."
+)
 
 
 def guidance_predicate(statement: str) -> str:
     return f'The cited text shows or supports this writing guidance: "{statement}"'
 
 
+def house_text_evidence(doc: CorpusDocument, section: ReadSection, unit: str) -> str:
+    """One window: the unit with its document's card (title, deliverable type, date, summary
+    and stated attributes, as binding shows them), its heading path and its whole section, so
+    the check judges the unit where it stands and sees which project the document reports."""
+    card = doc.reading.card
+    attributes = "\n".join(f"- {a.name}: {a.value}" for a in card.attributes) or "(none)"
+    return (
+        f"DOCUMENT TITLE: {card.title}\nDELIVERABLE TYPE: {card.deliverable_type}\n"
+        f"DATE: {card.doc_date or 'not stated'}\nSUMMARY: {card.summary}\n"
+        f"ATTRIBUTES:\n{attributes}\nHEADING PATH: {section.heading_path}\n"
+        f"SECTION:\n{section.markdown}\n\nTHIS TEXT:\n{unit}"
+    )
+
+
 @dataclass(frozen=True)
 class BlueprintResult:
     blueprint: Blueprint
+    records: tuple[CandidateRecord, ...]
     dropped: int
     refusals: int
-
-
-def _outline_text(doc: CorpusDocument) -> str:
-    lines = [f"{doc.doc_id}: {doc.reading.card.title}"]
-    lines += [f"- {doc.section_id(s.ordinal)}: {s.heading_path}" for s in doc.reading.sections]
-    return "\n".join(lines)
+    house_refusals: int
 
 
 def write_blueprint(
-    gateway: LanguageGateway, view: CorpusView, tools: SourceTools, dtype: DeliverableType
+    gateway: LanguageGateway,
+    view: CorpusView,
+    tools: SourceTools,
+    dtype: DeliverableType,
+    notes: Sequence[CuratorNote],
 ) -> BlueprintResult:
     outlines = tuple(_outline_text(view.document(d)) for d in dtype.exemplar_doc_ids)
     feedback_docs = tuple(
         f"{d}: {view.document(d).reading.card.title}" for d in dtype.feedback_doc_ids
     )
     leads = craft_leads(view, (*dtype.exemplar_doc_ids, *dtype.feedback_doc_ids))
-    found = _passages.standing_candidates(exemplar_documents(view, dtype.exemplar_doc_ids))
-    candidates = offered_candidates(view, found)
-    blueprint = generate_checked(
+    exemplars = exemplar_documents(view, dtype.exemplar_doc_ids)
+    found = _passages.standing_candidates(exemplars)
+    offered = _passages.word_candidates(exemplars, offered_candidates(view, found))
+    checked = generate_checked(
         f"blueprint for {dtype.name!r}",
         lambda feedback: gateway.run_agent(
             WriteBlueprint(
                 dtype,
+                tuple(notes),
                 outlines,
                 feedback_docs,
                 leads,
-                candidates,
+                offered,
                 len(found),
                 tools.tools,
                 tools.digest,
                 feedback,
             )
         ),
-        lambda draft: check_blueprint(draft, dtype, candidates, view),
+        lambda draft: check_blueprint(draft, dtype, found, offered, view),
     )
+    blueprint = checked.blueprint
     dropped = refusals = 0
 
     def supported(items: tuple[BlueprintGuidance, ...]) -> tuple[BlueprintGuidance, ...]:
@@ -1298,13 +1547,51 @@ def write_blueprint(
                 dropped += 1
         return tuple(kept)
 
-    checked = blueprint.model_copy(
+    records: list[CandidateRecord] = list(checked.records)
+    house: list[Passage] = []
+    house_refusals = 0
+    labels = {n.section_id: n.label.strip() for n in checked.nominations}
+    for unit in _passages.house_units(exemplars, tuple(labels), found):
+        doc, section = view.sections[unit.section_id]
+        (probability,) = gateway.judge(
+            HOUSE_TEXT_OPERATION,
+            house_text_evidence(doc, section, unit.text),
+            [HOUSE_TEXT_PREDICATE],
+        )
+        outcome: NominatedDisposition
+        if probability is None:
+            house_refusals += 1
+            outcome = "nominated_refused"
+        elif probability < SUPPORT_THRESHOLD:
+            outcome = "nominated_dropped"
+        else:
+            outcome = "nominated_kept"
+            house.append(
+                SingleExemplarPassage(
+                    kind="single_exemplar",
+                    label=labels[unit.section_id],
+                    text=unit.text,
+                    citations=(unit.section_id,),
+                    heading_path=section.heading_path,
+                )
+            )
+        records.append(
+            NominatedUnitRecord(
+                deliverable_type=dtype.name,
+                section_id=unit.section_id,
+                unit_ordinal=unit.ordinal,
+                disposition=outcome,
+                text=unit.text,
+            )
+        )
+    result = blueprint.model_copy(
         update={
             "conventions": supported(blueprint.conventions),
             "pitfalls": supported(blueprint.pitfalls),
+            "passages": (*blueprint.passages, *house),
         }
     )
-    return BlueprintResult(checked, dropped, refusals)
+    return BlueprintResult(result, tuple(records), dropped, refusals, house_refusals)
 
 
 # Step 5: guide.
@@ -1457,6 +1744,7 @@ class CorpusKnowledge:
     assignments: dict[str, dict[str, tuple[str, ...]]]
     glossary: tuple[GlossaryEntry, ...]
     blueprints: tuple[Blueprint, ...]
+    candidate_records: tuple[CandidateRecord, ...]
     guide_markdown: str
     report: BuildReport
 
@@ -1479,7 +1767,7 @@ def induce(
         # Blueprints are queued first; the glossary batches and then the definition checks
         # queue behind them on the same workers.
         blueprint_futures = [
-            pool.submit(write_blueprint, gateway, view, tools, dtype)
+            pool.submit(write_blueprint, gateway, view, tools, dtype, tuple(notes))
             for dtype in organisation.deliverable_types
         ]
         glossary = write_glossary(gateway, view, pool)
@@ -1499,11 +1787,17 @@ def induce(
         BIND_OPERATION: binding.refusals,
         DEFINITION_OPERATION: glossary.refusals,
         BLUEPRINT_SUPPORT_OPERATION: sum(b.refusals for b in blueprints),
+        HOUSE_TEXT_OPERATION: sum(b.house_refusals for b in blueprints),
     }
+    dispositions: dict[str, dict[str, int]] = {}
+    for b in blueprints:
+        counts = Counter[str](r.disposition for r in b.records)
+        dispositions[b.blueprint.deliverable_type] = dict(sorted(counts.items()))
     report = BuildReport(
         discarded_unlocated_quotes=sum(d.reading.discarded_quotes for d in documents),
         unsupported_definitions=glossary.unsupported,
         dropped_blueprint_statements=sum(b.dropped for b in blueprints),
+        passage_dispositions=dispositions,
         judge_refusals={k: v for k, v in refusals.items() if v},
         pruned_facet_values=list(binding.pruned_values),
         pruned_facets=list(binding.pruned_facets),
@@ -1513,6 +1807,7 @@ def induce(
         assignments=binding.assignments,
         glossary=glossary.entries,
         blueprints=tuple(b.blueprint for b in blueprints),
+        candidate_records=tuple(r for b in blueprints for r in b.records),
         guide_markdown=guide,
         report=report,
     )

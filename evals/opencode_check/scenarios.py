@@ -344,11 +344,12 @@ def _words(text: str) -> str:
 
 
 def _reproduction_outcome(completed: Sequence[ToolCall], answer: str, topic: str) -> CheckOutcome:
-    """Whether the answer reproduces a standing passage of the blueprint that the last
-    completed `get_blueprint` call on `topic` returned, the one the agent drafted from: its
-    text, or its first `REPRODUCED_PREFIX_WORDS` words, compared after `fold_for_quote`. A
-    blueprint without standing passages is a missing precondition of the snapshot, reported
-    under its own check name so it is not read as an agent failure."""
+    """Whether the answer reproduces a standing passage (a passage of kind `standing`, which
+    the drafting rules say to reproduce as written) of the blueprint that the last completed
+    `get_blueprint` call on `topic` returned, the one the agent drafted from: its text, or
+    its first `REPRODUCED_PREFIX_WORDS` words, compared after `fold_for_quote`. A blueprint
+    without standing passages is a missing precondition of the snapshot, reported under its
+    own check name so it is not read as an agent failure."""
     fetched = [
         c
         for c in completed
@@ -361,11 +362,11 @@ def _reproduction_outcome(completed: Sequence[ToolCall], answer: str, topic: str
             f"no completed get_blueprint call on {topic}",
         )
     blueprint = _json_object(fetched[-1].output)
-    items = blueprint.get("standing_passages")
+    items = blueprint.get("passages")
     passages = [
         p["text"]
         for p in (items if isinstance(items, list) else [])
-        if isinstance(p, dict) and isinstance(p.get("text"), str)
+        if isinstance(p, dict) and p.get("kind") == "standing" and isinstance(p.get("text"), str)
     ]
     if not passages:
         return CheckOutcome(

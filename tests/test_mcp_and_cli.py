@@ -22,7 +22,11 @@ from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
 from tests.support import (
     BATHYMETRY_CORPUS,
+    DATA_HANDLING,
+    DATED_REPORTS,
+    HOUSE_STANDARD,
     MARKETING_CORPUS,
+    REDUCTION,
     FakeGateway,
     ScriptedOpenAI,
     compile_snapshot,
@@ -127,8 +131,8 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
     blueprint = data(memo_blueprint)
     assert blueprint["deliverable_type"] == "survey memorandum"
     assert blueprint["outline"] and blueprint["conventions"]
-    # A single exemplar shows no recurrence, so the memorandum has no standing passages.
-    assert blueprint["standing_passages"] == []
+    # A single exemplar shows no recurrence, so the memorandum has no recurring passages.
+    assert blueprint["passages"] == []
     assert data(guide)["glossary_terms"] == ["LAT"]
     assert data(guide)["curator_notes"][0]["scope_path"] == "p103-reef-sonar/AGENTS.md"
     assert [d["rel_path"] for d in data(memos)] == [
@@ -186,6 +190,72 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
     assert error_text(bad_type).endswith("valid types: proposal, survey memorandum")
 
 
+def test_get_blueprint_serves_each_passage_kind_and_inspect_prints_their_dispositions(
+    tmp_path: Path,
+) -> None:
+    gateway = FakeGateway(house_headings=("Data handling",))
+    path = compile_snapshot(tmp_path, DATED_REPORTS, topic="reports", gateway=gateway)
+
+    (served,) = call_tools(
+        (path,),
+        [("get_blueprint", {"topic": "reports", "deliverable_type": "survey report"})],
+        None,
+    )
+    inspected = CliRunner().invoke(app, ["inspect", str(path)])
+
+    blueprint = data(served)
+    standing, conditional, single = blueprint["passages"]
+    assert standing == {
+        "kind": "standing",
+        "label": "Method",
+        "text": HOUSE_STANDARD,
+        "citations": ["doc_001_sec_002", "doc_002_sec_002", "doc_003_sec_002"],
+        "source_section_id": "doc_003_sec_002",
+        "wording_from": "newest_holder",
+    }
+    assert {k: v for k, v in conditional.items() if k not in standing} == {
+        "condition": "The project states its own method.",
+        "variants": [
+            {
+                "section_id": "doc_001_sec_002",
+                "doc_date_iso": "2024-03-01",
+                "text": REDUCTION.format("week"),
+            },
+            {
+                "section_id": "doc_002_sec_002",
+                "doc_date_iso": "2025-03-12",
+                "text": REDUCTION.format("month"),
+            },
+        ],
+    }
+    assert single == {
+        "kind": "single_exemplar",
+        "label": "Data handling",
+        "text": DATA_HANDLING,
+        "citations": ["doc_003_sec_004"],
+        "heading_path": "South Survey Report > Data handling",
+    }
+    # Dispositions are build records: inspect prints them, the MCP tools do not serve them.
+    assert "candidate_id" not in json.dumps(blueprint)
+    assert inspected.exit_code == 0, inspected.output
+    summary = json.loads(inspected.stdout)
+    assert [
+        (r.get("candidate_id") or f"{r['section_id']}#{r['unit_ordinal']}", r["disposition"])
+        for r in summary["blueprint_candidates"]
+    ] == [
+        ("candidate_01", "selected_standing"),
+        ("candidate_02", "selected_conditional"),
+        ("doc_003_sec_004#1", "nominated_kept"),
+    ]
+    assert summary["build_report"]["passage_dispositions"] == {
+        "survey report": {
+            "nominated_kept": 1,
+            "selected_conditional": 1,
+            "selected_standing": 1,
+        }
+    }
+
+
 def test_catalog_rejects_two_snapshots_with_the_same_topic(
     snapshots: tuple[Path, Path], tmp_path: Path
 ) -> None:
@@ -234,6 +304,8 @@ def test_cli_inspect_and_grep_work_offline(
         "format": "pdf",
         "title": "Rainfall",
         "doc_date": None,
+        "doc_date_iso": None,
+        "doc_date_basis": None,
         "deliverable_type": "document",
         "page_count": 2,
         "is_curator_note": False,

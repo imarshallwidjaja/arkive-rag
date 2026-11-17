@@ -12,7 +12,7 @@ import tempfile
 import threading
 import unicodedata
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice, pairwise
@@ -28,8 +28,11 @@ from arkive_rag.models import (
     Blueprint,
     BlueprintSummary,
     BuildReport,
+    CandidateRecord,
     CompiledCorpus,
+    ConditionalPassage,
     CuratorNote,
+    DocumentDate,
     DocumentInfo,
     DocumentOutline,
     Facet,
@@ -40,22 +43,29 @@ from arkive_rag.models import (
     GlossaryTermSummary,
     GrepMatch,
     InvalidFilterError,
+    NominatedUnitRecord,
     NotFoundError,
     PageVisualView,
     ProviderError,
+    RecurringCandidateRecord,
     SearchHit,
     SectionOutlineItem,
     SectionReadView,
+    SingleExemplarPassage,
     SnapshotIntegrityError,
+    StandingPassage,
     TopicGuide,
     TopicSummary,
     UnsafePathError,
     corpus_fingerprint,
     fold_facet_label,
+    fold_for_quote,
     fold_text,
+    is_strictly_newer,
 )
+from arkive_rag.passages import is_passage_unit
 
-SCHEMA_VERSION = "3.0"
+SCHEMA_VERSION = "4.0"
 RRF_K = 60.0
 CHANNEL_DEPTH = 100
 MAX_TOP_K = 50
@@ -71,7 +81,8 @@ CREATE TABLE curator_notes (
 CREATE TABLE documents (
     doc_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, rel_path TEXT NOT NULL UNIQUE,
     sha256 TEXT NOT NULL, format TEXT NOT NULL, title TEXT NOT NULL, doc_date TEXT,
-    deliverable_type TEXT NOT NULL, summary TEXT NOT NULL, page_count INTEGER NOT NULL,
+    doc_date_iso TEXT, doc_date_basis TEXT, deliverable_type TEXT NOT NULL,
+    summary TEXT NOT NULL, page_count INTEGER NOT NULL,
     is_curator_note INTEGER NOT NULL CHECK (is_curator_note IN (0, 1)));
 CREATE TABLE facets (
     name TEXT PRIMARY KEY, ordinal INTEGER NOT NULL UNIQUE, description TEXT NOT NULL,
@@ -91,6 +102,14 @@ CREATE TABLE glossary (ordinal INTEGER PRIMARY KEY, term TEXT NOT NULL, entry_js
 CREATE TABLE blueprints (
     ordinal INTEGER PRIMARY KEY, deliverable_type TEXT NOT NULL UNIQUE,
     blueprint_json TEXT NOT NULL);
+CREATE TABLE blueprint_candidates (
+    ordinal INTEGER PRIMARY KEY,
+    deliverable_type TEXT NOT NULL REFERENCES blueprints(deliverable_type),
+    candidate_id TEXT, section_id TEXT REFERENCES sections(section_id), unit_ordinal INTEGER,
+    disposition TEXT NOT NULL, citations_json TEXT NOT NULL, text TEXT NOT NULL,
+    CHECK ((candidate_id IS NOT NULL AND section_id IS NULL AND unit_ordinal IS NULL)
+        OR (candidate_id IS NULL AND section_id IS NOT NULL AND unit_ordinal IS NOT NULL)),
+    UNIQUE (deliverable_type, candidate_id), UNIQUE (deliverable_type, section_id, unit_ordinal));
 CREATE TABLE sections (
     section_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL REFERENCES documents(doc_id),
     ordinal INTEGER NOT NULL, heading_path TEXT NOT NULL, level INTEGER NOT NULL,
@@ -108,7 +127,7 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
     chunk_id UNINDEXED, content_norm, breadcrumb_norm,
     tokenize='porter unicode61 remove_diacritics 2');
 """
-# Every table a 3.0 snapshot holds; `TopicSnapshot.open` requires each one.
+# Every table a snapshot of this schema holds; `TopicSnapshot.open` requires each one.
 TABLES = frozenset(re.findall(r"CREATE (?:VIRTUAL )?TABLE (\w+)", SCHEMA))
 # Every key is required when a snapshot opens.
 META_KEYS = (
@@ -131,6 +150,30 @@ with from by about show tell give list find and or not"""
 _STOPWORDS = frozenset(_FILLER_WORDS.split())
 _FOLDERS: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
 _SETTINGS: TypeAdapter[dict[str, Any]] = TypeAdapter(dict[str, Any])
+_CITATIONS: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
+
+
+def _candidate_record(row: sqlite3.Row) -> CandidateRecord:
+    """A `blueprint_candidates` row as its record; the table's CHECK fixes which shape."""
+    citations = _CITATIONS.validate_json(row["citations_json"])
+    if row["candidate_id"] is not None:
+        return RecurringCandidateRecord(
+            deliverable_type=row["deliverable_type"],
+            candidate_id=row["candidate_id"],
+            disposition=row["disposition"],
+            citations=citations,
+            text=row["text"],
+        )
+    record = NominatedUnitRecord(
+        deliverable_type=row["deliverable_type"],
+        section_id=row["section_id"],
+        unit_ordinal=row["unit_ordinal"],
+        disposition=row["disposition"],
+        text=row["text"],
+    )
+    if citations != record.citations:
+        raise ValueError(f"nominated unit row cites {citations}, not its section")
+    return record
 
 
 def _nfkc(text: str) -> str:
@@ -168,6 +211,157 @@ def check_build_paths(corpus_dir: Path, *outputs: Path) -> None:
         raise UnsafePathError(f"build outputs must be different files: {resolved}")
 
 
+@dataclass(frozen=True)
+class CitableSection:
+    """A section of a citable document, as a blueprint's passages are checked against it."""
+
+    doc_id: str
+    heading_path: str
+    markdown: str
+
+
+def check_stored_blueprint(
+    b: Blueprint,
+    records: Sequence[CandidateRecord],
+    sections: Mapping[str, CitableSection],
+    dates: Mapping[str, DocumentDate | None],
+) -> None:
+    """Raise SnapshotIntegrityError unless the blueprint holds what its readers rely on.
+
+    `sections` are the citable sections and `dates` the citable documents with their dates.
+    The blueprint's documents and citations resolve; its type is not blank once folded and its
+    exemplar and feedback documents neither repeat nor overlap; every passage has a label and
+    text that is a recurrable unit of its source section and occurs in it byte for byte
+    (`is_passage_unit`), keeps its kind's rules against the blueprint's exemplars, and every
+    variant is such a unit of its section, dated as its document; no two passages store text
+    that folds alike (`fold_for_quote`);
+    a `newest_holder` passage comes from a holding document dated strictly newer than every
+    other (so every holder is dated), and a `first_holder` one from its first citation; and
+    the selected candidate records match the passages one to one, in order. The build runs
+    this before it writes a snapshot, and opening a snapshot runs it again.
+    """
+    label = f"blueprint {b.deliverable_type!r}"
+
+    def fail(problem: str) -> SnapshotIntegrityError:
+        return SnapshotIntegrityError(f"{label} {problem}")
+
+    if not fold_facet_label(b.deliverable_type):
+        raise fail("has a blank deliverable type")
+    named = (*b.exemplar_doc_ids, *b.feedback_doc_ids)
+    if len(set(named)) != len(named):
+        raise fail(f"names a document twice among its exemplar and feedback documents: {named}")
+    for doc_id in named:
+        if doc_id not in dates:
+            raise fail(f"names document {doc_id!r}, which is not a citable document")
+    guidance = [c for s in b.outline for c in s.citations]
+    guidance += [c for g in (*b.conventions, *b.pitfalls) for c in g.citations]
+    exemplar_cited = [(f"passage {p.label!r}", c) for p in b.passages for c in p.citations]
+    exemplar_cited += [
+        (
+            f"candidate record {r.candidate_id!r}"
+            if isinstance(r, RecurringCandidateRecord)
+            else f"candidate record for unit {r.unit_ordinal} of {r.section_id!r}",
+            c,
+        )
+        for r in records
+        for c in r.citations
+    ]
+    for section_id in (*guidance, *(c for _, c in exemplar_cited)):
+        if section_id not in sections:
+            raise fail(f"cites {section_id!r}, which is not a citable section")
+    for what, section_id in exemplar_cited:
+        if sections[section_id].doc_id not in b.exemplar_doc_ids:
+            raise fail(
+                f"has a {what} citing {section_id!r}, which is not a section of the"
+                " blueprint's exemplars"
+            )
+    for p in b.passages:
+        if not p.label.strip():
+            raise fail(f"has a {p.kind} passage with a blank label")
+        if isinstance(p, SingleExemplarPassage):
+            (source,) = p.citations
+            if p.heading_path != sections[source].heading_path:
+                raise fail(
+                    f"has a single-exemplar passage {p.label!r} whose heading path is not"
+                    f" that of {source!r}"
+                )
+        else:
+            source = p.source_section_id
+            holders = [sections[c].doc_id for c in p.citations]
+            if len(set(holders)) < 2:
+                raise fail(
+                    f"has a {p.kind} passage {p.label!r} whose citations name fewer than two"
+                    " exemplar documents"
+                )
+            if p.wording_from == "first_holder" and source != p.citations[0]:
+                raise fail(
+                    f"has a first_holder passage {p.label!r} whose wording is not from its"
+                    " first citation"
+                )
+            if p.wording_from == "newest_holder":
+                owner = sections[source].doc_id
+                newest = all(
+                    is_strictly_newer(dates[owner], dates[d]) for d in holders if d != owner
+                )
+                if not newest:
+                    raise fail(
+                        f"has a newest_holder passage {p.label!r} whose source document is not"
+                        " dated strictly newer than every other holding document"
+                    )
+            if isinstance(p, ConditionalPassage):
+                for v in p.variants:
+                    date = dates[sections[v.section_id].doc_id]
+                    if v.doc_date_iso != (date.iso if date else None):
+                        raise fail(
+                            f"has a passage {p.label!r} whose variant in {v.section_id!r} is"
+                            f" dated {v.doc_date_iso!r}, not as its document"
+                        )
+                    if not is_passage_unit(v.text, sections[v.section_id].markdown):
+                        raise fail(
+                            f"has a passage {p.label!r} whose variant is not a unit of"
+                            f" {v.section_id!r}"
+                        )
+        if not is_passage_unit(p.text, sections[source].markdown):
+            raise fail(f"has a passage {p.label!r} whose text is not a unit of {source!r}")
+    worded: dict[str, str] = {}
+    for p in b.passages:
+        folded = fold_for_quote(p.text)
+        if folded in worded:
+            raise fail(
+                f"has passages {worded[folded]!r} and {p.label!r} that store the same wording"
+            )
+        worded[folded] = p.label
+    kinds = {
+        "selected_standing": StandingPassage,
+        "selected_conditional": ConditionalPassage,
+        "nominated_kept": SingleExemplarPassage,
+    }
+    selected = [r for r in records if r.disposition in kinds]
+    matched = len(selected) == len(b.passages) and all(
+        isinstance(p, kinds[r.disposition]) and p.citations == r.citations and p.text == r.text
+        for r, p in zip(selected, b.passages, strict=False)
+    )
+    if not matched:
+        raise fail(
+            f"has {len(b.passages)} passages that do not match its {len(selected)} selected"
+            " candidate records in kind, citations and text, in order"
+        )
+
+
+def _check_stored_blueprints(corpus: CompiledCorpus) -> None:
+    """`check_stored_blueprint` for every blueprint of a corpus about to be written."""
+    citable = [d for d in corpus.documents if not d.is_curator_note]
+    sections = {
+        s.section_id: CitableSection(d.doc_id, s.heading_path, s.markdown)
+        for d in citable
+        for s in d.sections
+    }
+    dates = {d.doc_id: d.date for d in citable}
+    for b in corpus.blueprints:
+        records = [r for r in corpus.candidate_records if r.deliverable_type == b.deliverable_type]
+        check_stored_blueprint(b, records, sections, dates)
+
+
 def write_snapshot(corpus: CompiledCorpus, output_path: Path) -> None:
     """Write the corpus to `output_path` atomically: readers see the old file or the new one.
 
@@ -180,6 +374,9 @@ def write_snapshot(corpus: CompiledCorpus, output_path: Path) -> None:
             f" ({len(chunks)}, {corpus.embedding_dimensions})"
         )
     check_build_paths(corpus.corpus_dir, output_path)
+    # A build never publishes a snapshot that `TopicSnapshot.open` would refuse for its
+    # blueprints.
+    _check_stored_blueprints(corpus)
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # A unique 0600 sibling, so concurrent writers never share a temporary file.
@@ -292,7 +489,7 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
         row = 0
         for ordinal, doc in enumerate(corpus.documents, start=1):
             db.execute(
-                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc.doc_id,
                     ordinal,
@@ -301,6 +498,8 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
                     doc.format,
                     doc.title,
                     doc.doc_date,
+                    doc.date.iso if doc.date else None,
+                    doc.date.basis if doc.date else None,
                     doc.deliverable_type,
                     doc.summary,
                     len(doc.pages),
@@ -360,6 +559,23 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
                     "INSERT INTO chunks_fts VALUES (?, ?, ?)",
                     (chunk.chunk_id, _nfkc(chunk.content), _nfkc(chunk.breadcrumb)),
                 )
+        # After the sections, which nominated rows reference.
+        db.executemany(
+            "INSERT INTO blueprint_candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    i,
+                    r.deliverable_type,
+                    r.candidate_id if isinstance(r, RecurringCandidateRecord) else None,
+                    r.section_id if isinstance(r, NominatedUnitRecord) else None,
+                    r.unit_ordinal if isinstance(r, NominatedUnitRecord) else None,
+                    r.disposition,
+                    json.dumps(list(r.citations)),
+                    r.text,
+                )
+                for i, r in enumerate(corpus.candidate_records, start=1)
+            ],
+        )
 
 
 def _snippet(line: str, needle: str) -> str:
@@ -442,9 +658,11 @@ class TopicSnapshot:
         self.embedding_model: str = meta["embedding_model"]
         db.row_factory = sqlite3.Row
         self._load_facets(db)
+        # DocumentInfo validates each row, the date's ISO shape and basis included.
         documents = db.execute(
-            "SELECT doc_id, rel_path, sha256, format, title, doc_date, deliverable_type, summary,"
-            " page_count, is_curator_note FROM documents ORDER BY ordinal"
+            "SELECT doc_id, rel_path, sha256, format, title, doc_date, doc_date_iso,"
+            " doc_date_basis, deliverable_type, summary, page_count, is_curator_note"
+            " FROM documents ORDER BY ordinal"
         )
         self._documents = {
             r["doc_id"]: DocumentInfo.model_validate(
@@ -549,27 +767,30 @@ class TopicSnapshot:
             self._docs_by_value.setdefault((r["facet"], r["value"]), set()).add(r["doc_id"])
 
     def _load_knowledge(self, db: sqlite3.Connection) -> None:
-        """Glossary and blueprint rows, validated and with every reference resolved."""
-        citable = {
-            r["section_id"]: r["doc_id"]
+        """Glossary, blueprint and candidate rows, validated and with every reference resolved."""
+        sections = {
+            r["section_id"]: CitableSection(r["doc_id"], r["heading_path"], r["markdown"])
             for r in db.execute(
-                "SELECT s.section_id, s.doc_id FROM sections s JOIN documents d"
-                " ON d.doc_id = s.doc_id WHERE d.is_curator_note = 0"
+                "SELECT s.section_id, s.doc_id, s.heading_path, s.markdown FROM sections s"
+                " JOIN documents d ON d.doc_id = s.doc_id WHERE d.is_curator_note = 0"
             )
         }
-        documents = {d for d, info in self._documents.items() if not info.is_curator_note}
         try:
             self.glossary = [
                 GlossaryEntry.model_validate_json(r["entry_json"])
                 for r in db.execute("SELECT entry_json FROM glossary ORDER BY ordinal")
             ]
-            self.blueprints = [
-                Blueprint.model_validate_json(r["blueprint_json"])
-                for r in db.execute("SELECT blueprint_json FROM blueprints ORDER BY ordinal")
+            rows = db.execute(
+                "SELECT deliverable_type, blueprint_json FROM blueprints ORDER BY ordinal"
+            ).fetchall()
+            self.blueprints = [Blueprint.model_validate_json(r["blueprint_json"]) for r in rows]
+            self.candidate_records = [
+                _candidate_record(r)
+                for r in db.execute("SELECT * FROM blueprint_candidates ORDER BY ordinal")
             ]
         except ValidationError as exc:
             raise SnapshotIntegrityError(
-                f"{self.path}: a glossary or blueprint row is malformed: {exc}"
+                f"{self.path}: a glossary, blueprint or blueprint candidate row is malformed: {exc}"
             ) from exc
         cited = [
             (f"glossary term {e.term!r}", c)
@@ -577,9 +798,14 @@ class TopicSnapshot:
             for s in e.senses
             for c in s.citations
         ]
+        for label, section_id in cited:
+            if section_id not in sections:
+                raise SnapshotIntegrityError(
+                    f"{self.path}: {label} cites {section_id!r}, which is not a citable section"
+                    " of this snapshot"
+                )
         types: dict[str, str] = {}
         for b in self.blueprints:
-            label = f"blueprint {b.deliverable_type!r}"
             # `blueprint()` resolves a type by this folded label, so two would be ambiguous.
             folded = fold_facet_label(b.deliverable_type)
             if folded in types:
@@ -588,35 +814,30 @@ class TopicSnapshot:
                     " the same deliverable type"
                 )
             types[folded] = b.deliverable_type
-            cited += [(label, c) for s in b.outline for c in s.citations]
-            cited += [(label, c) for g in (*b.conventions, *b.pitfalls) for c in g.citations]
-            for doc_id in (*b.exemplar_doc_ids, *b.feedback_doc_ids):
-                if doc_id not in documents:
-                    raise SnapshotIntegrityError(
-                        f"{self.path}: {label} names document {doc_id!r}, which is not a"
-                        " citable document of this snapshot"
-                    )
-            for passage in b.standing_passages:
-                # A missing section is refused below with every other unresolved citation.
-                cited += [(label, c) for c in passage.citations]
-                for c in passage.citations:
-                    if c in citable and citable[c] not in b.exemplar_doc_ids:
-                        raise SnapshotIntegrityError(
-                            f"{self.path}: {label} has a standing passage citing {c!r}, which"
-                            " is not a section of the blueprint's exemplars"
-                        )
-                resolved = all(c in citable for c in passage.citations)
-                if resolved and len({citable[c] for c in passage.citations}) < 2:
-                    raise SnapshotIntegrityError(
-                        f"{self.path}: {label} has a standing passage {passage.label!r} whose"
-                        " citations name fewer than two exemplar documents"
-                    )
-        for label, section_id in cited:
-            if section_id not in citable:
+        for row, b in zip(rows, self.blueprints, strict=True):
+            # Candidate rows reference the row's type column, so it must be the blueprint's.
+            if row["deliverable_type"] != b.deliverable_type:
                 raise SnapshotIntegrityError(
-                    f"{self.path}: {label} cites {section_id!r}, which is not a citable section"
-                    " of this snapshot"
+                    f"{self.path}: blueprint row {row['deliverable_type']!r} holds the blueprint"
+                    f" of {b.deliverable_type!r}"
                 )
+        dates = {
+            d: (
+                DocumentDate(iso=info.doc_date_iso, basis=info.doc_date_basis)
+                if info.doc_date_iso is not None and info.doc_date_basis is not None
+                else None
+            )
+            for d, info in self._documents.items()
+            if not info.is_curator_note
+        }
+        for b in self.blueprints:
+            records = [
+                r for r in self.candidate_records if r.deliverable_type == b.deliverable_type
+            ]
+            try:
+                check_stored_blueprint(b, records, sections, dates)
+            except SnapshotIntegrityError as exc:
+                raise SnapshotIntegrityError(f"{self.path}: {exc}") from exc
 
     @classmethod
     def open(cls, path: Path) -> TopicSnapshot:

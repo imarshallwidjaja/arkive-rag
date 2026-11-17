@@ -83,12 +83,12 @@ DISCLOSURE = (
 )
 
 
-def _blueprint_output(*passages: str) -> str:
+def _blueprint_output(*passages: str, kind: str = "standing") -> str:
     return json.dumps(
         {
             "deliverable_type": "Campaign brief",
-            "standing_passages": [
-                {"label": "Disclosure", "text": t, "citations": ["doc_002_sec_007"]}
+            "passages": [
+                {"kind": kind, "label": "Disclosure", "text": t, "citations": ["doc_002_sec_007"]}
                 for t in passages
             ],
         }
@@ -137,6 +137,16 @@ def test_shipped_drafting_scenario_needs_the_full_blueprint_and_a_standing_passa
     (missing,) = [o for o in outcomes if not o.passed]
     assert missing.check == "precondition: blueprint has a standing passage"
     assert "the served snapshot, not the agent, fails this scenario" in missing.detail
+    # Only a standing passage must be reproduced as written; one of another kind is no
+    # substitute for it.
+    for kind in ("conditional", "single_exemplar"):
+        other = _tool(
+            "arkive_get_blueprint", request, output=_blueprint_output(DISCLOSURE, kind=kind)
+        )
+        outcomes = evaluate(draft, parse_events([other, reproduced]), 0, FACETS)
+        assert [o.check for o in outcomes if not o.passed] == [
+            "precondition: blueprint has a standing passage"
+        ]
     # The guide holds only blueprint summaries, so a draft from it alone misses the checks.
     assert _failed(draft, parse_events([guide, reproduced])) == [
         "called: get_blueprint",

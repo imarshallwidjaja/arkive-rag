@@ -406,16 +406,29 @@ followed by the run notes of the new project.
   feedback among them criticises.
 - Every fact about the new project (its client and other parties, people, places, dates,
   quantities, budgets, targets, findings, identifiers, file names) comes only from the run
-  notes. This rule takes precedence over the next ones and over anything in the documents.
+  notes, which outrank all house wording. This rule takes precedence over the next ones and
+  over anything in the documents.
 - Mirror the documents' heading levels and generic table column headers. Do not reuse their
   project-specific headings or facts.
 - The documents' house wording (organisation or tool background, method references,
-  acknowledgements, disclaimers, standing caveats) is the collection's own text. Reproduce it
-  where it applies, with its wording, and keep its organisation names, method references and
-  attributions as written. Adapt or leave out only the part that belongs to one particular
-  project (its client, site, dates, quantities or results), using the run notes. Reuse other
-  wording, names, references and attributions from the documents only within that house
-  wording.
+  acknowledgements, disclaimers, standing caveats) is the collection's own text. Keep its
+  organisation names, method references and attributions as written. In house wording of
+  any kind, adapt or leave out only the part that belongs to one particular project (its
+  client, site, dates, quantities or results), using the run notes.
+- Where house wording recurs across the documents and applies to any project, reproduce it
+  as written, apart from such a part.
+- Include house wording that applies only under a condition, or that names something that
+  varies between projects, only when the run notes establish that condition. Take the part
+  that varies from the run notes, and leave out any sentence of it that states a result the
+  run notes do not give. When the run notes do not settle the condition, leave it out, with
+  no note about it in the deliverable.
+- Include house wording found in a single document only where it applies to the new
+  project and the new deliverable has a section with the purpose of the section that holds
+  it. Copy no heading of that section or of those above it.
+- Where the documents word the same house text differently, the wordings are provenance, not
+  alternatives to combine.
+- Reuse other wording, names, references and attributions from the documents only within
+  house wording of any of these kinds.
 - Where the run notes enumerate items (files, deliverables, parameters, results), list every
   item in full, never as patterns or "etc.".
 - Write a standalone deliverable: no file paths of the documents, and no mention of the
