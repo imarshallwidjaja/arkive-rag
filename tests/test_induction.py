@@ -22,15 +22,14 @@ from arkive_rag.induction import (
     DeliverableType,
     InductionExecutor,
     OrganiseCorpus,
-    StandingCandidate,
     WriteBlueprint,
     WriteGlossary,
     WriteGuide,
     canonical_aliases,
     check_organisation,
+    exemplar_documents,
     generate_checked,
     induce,
-    standing_candidates,
     term_clusters,
 )
 from arkive_rag.llm import AgentRequest, StructuredRequest
@@ -54,6 +53,7 @@ from arkive_rag.models import (
     StandingPassageSelection,
     TermObservation,
 )
+from arkive_rag.passages import standing_candidates
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
 from tests.support import BATHYMETRY_CORPUS, HOUSE_DISCLOSURE, MARKETING_CORPUS, FakeGateway
 
@@ -725,17 +725,7 @@ def test_a_blueprint_with_an_empty_outline_fails_after_one_rerun(tmp_path: Path)
     assert "the outline is empty" in rerun.feedback
 
 
-# Standing passage candidates.
-
-# Thirteen words, so ten word 4-grams: changing word 11 breaks two of them (0.8 recurs),
-# changing word 10 breaks three (0.7 does not).
-TERMS = "Quillfen Geomatics carries out every survey under its quality manual and audit schedule"
-AT_THRESHOLD = TERMS.replace("audit", "review")
-BELOW_THRESHOLD = TERMS.replace("and audit", "plus audit")
-HEADER = "| Deliverable | File name | Format |\n| --- | --- | --- |"
-DISCLAIMER = (
-    "Survey results describe the seabed on the survey dates only and certify nothing later."
-)
+# Standing passage candidates offered to the blueprint agent.
 
 
 def candidate_view(*docs: tuple[str, Sequence[str]]) -> CorpusView:
@@ -746,152 +736,6 @@ def candidate_view(*docs: tuple[str, Sequence[str]]) -> CorpusView:
             for n, (rel_path, markdowns) in enumerate(docs, start=1)
         )
     )
-
-
-def texts(view: CorpusView, exemplars: Sequence[str]) -> list[str]:
-    return [c.text for c in standing_candidates(view, exemplars)]
-
-
-def test_prose_recurs_at_exactly_the_containment_threshold_and_not_below() -> None:
-    assert induction.STANDING_RECURRENCE_CONTAINMENT == 0.8
-    at = candidate_view(("p1/a.md", [TERMS]), ("p2/b.md", [AT_THRESHOLD]))
-    below = candidate_view(("p1/a.md", [TERMS]), ("p2/b.md", [BELOW_THRESHOLD]))
-
-    (candidate,) = standing_candidates(at, ("doc_001", "doc_002"))
-
-    # The two wordings say the same thing, so they are one candidate held by the first.
-    assert candidate == StandingCandidate(
-        "candidate_01", TERMS, ("doc_001_sec_001", "doc_002_sec_001")
-    )
-    assert standing_candidates(below, ("doc_001", "doc_002")) == ()
-
-
-def test_recurrence_needs_another_top_level_folder_only_when_the_exemplars_span_folders() -> None:
-    view = candidate_view(
-        ("p1/a.md", [DISCLAIMER]), ("p1/b.md", [DISCLAIMER]), ("p2/c.md", ["Scope only."])
-    )
-    flat = candidate_view(("a.md", [DISCLAIMER]), ("b.md", [DISCLAIMER]))
-
-    assert texts(view, ("doc_001", "doc_002", "doc_003")) == []
-    assert texts(view, ("doc_001", "doc_002")) == [DISCLAIMER]
-    assert [c.citations for c in standing_candidates(flat, ("doc_001", "doc_002"))] == [
-        ("doc_001_sec_001", "doc_002_sec_001")
-    ]
-    # Recurrence within one document is not recurrence.
-    same_doc = candidate_view(("a.md", [DISCLAIMER, DISCLAIMER]), ("b.md", ["Other."]))
-    assert texts(same_doc, ("doc_001", "doc_002")) == []
-
-
-def test_units_are_paragraphs_list_items_and_table_header_rows_only() -> None:
-    reference = "- Harlow, J. (2019). *Multibeam practice for inland waters*. Survey Press."
-    heading = "## Quality assurance under the survey quality manual of the house"
-    visual = f"> **[Visual \u2014 Page 1: Chart]**\n> {DISCLAIMER}"
-    first = [
-        f"{heading}\n\n{reference}\n- Field notes of the first crew on the estuary.",
-        f"{HEADER}\n| Grid | `p1_grid.tif` | GeoTIFF |",
-        f"{visual}\n\n```\n{TERMS}\n```",
-        "| Name |\n| --- |\n| Grid |",
-    ]
-    second = [
-        f"{heading}\n\n- Moreau, L. (2021). Tide reduction.\n{reference}",
-        f"{HEADER}\n| Lines | `p2_lines.shp` | Shapefile |",
-        f"{visual}\n\n```\n{TERMS}\n```",
-        "| Name |\n| --- |\n| Lines |",
-    ]
-    view = candidate_view(("p1/a.md", first), ("p2/b.md", second))
-
-    # Each list item is its own unit; the header row keeps its separator row and the body
-    # differs; headings, visual transcripts, fenced blocks and one-column headers are not units.
-    assert texts(view, ("doc_001", "doc_002")) == [reference, HEADER]
-    other_header = candidate_view(
-        ("p1/a.md", [HEADER]), ("p2/b.md", [HEADER.replace("Format", "Size")])
-    )
-    assert texts(other_header, ("doc_001", "doc_002")) == []
-    # A table without outer pipes is a table too: a short one still has its header unit, and
-    # the body rows of a long one never join it, even when they recur.
-    short = "Name | Value\n--- | ---"
-    long_header = (
-        "Deliverable | File name | Format | Coordinate reference system\n--- | --- | --- | ---"
-    )
-    body = "Bathymetric grid | `grid.tif` | GeoTIFF | ETRS89 / UTM zone 30N with OD heights"
-    pipeless = candidate_view(
-        ("p1/a.md", [f"{short}\nGrid | 1", f"{long_header}\n{body}"]),
-        ("p2/b.md", [f"{short}\nLines | 2", f"{long_header}\n{body}"]),
-    )
-    assert texts(pipeless, ("doc_001", "doc_002")) == [short, long_header]
-
-
-@pytest.mark.parametrize("glyph", ["\u2022", "\u25e6", "\u25aa", "\u2023", "\u2043", "\uf0b7"])
-def test_bullet_glyphs_of_pdf_transcripts_start_list_items(glyph: str) -> None:
-    lines = [f"{glyph} Grid delivered as GeoTIFF.", f"  {glyph} Lines delivered as Shapefile."]
-
-    # Consecutive glyph bullets without blank lines are separate units, like `-` items.
-    assert induction.standing_units("\n".join(lines)) == [
-        induction.StandingUnit(line.strip(), header=False) for line in lines
-    ]
-    # A glyph inside a sentence starts nothing.
-    inline = f"Deliverables:\nGrid {glyph} Lines {glyph} Mosaic."
-    assert induction.standing_units(inline) == [induction.StandingUnit(inline, header=False)]
-
-
-@pytest.mark.parametrize("marker", ["\u2022", "-"])
-def test_a_table_row_or_header_that_opens_with_a_list_marker_stays_in_its_table(
-    marker: str,
-) -> None:
-    header = "Deliverable | Format\n--- | ---"
-    row = f"{header}\n{marker} Bathymetric grid | GeoTIFF\nMosaic | GeoTIFF"
-    assert induction.standing_units(row) == [induction.StandingUnit(header, header=True)]
-    marked_header = f"{marker} Deliverable | Format\n--- | ---"
-    assert induction.standing_units(f"{marked_header}\nBathymetric grid | GeoTIFF") == [
-        induction.StandingUnit(marked_header, header=True)
-    ]
-
-
-def test_a_list_item_right_after_a_table_with_outer_pipes_ends_the_table() -> None:
-    header = "| Measure | Basis |\n| --- | --- |"
-    item = "- Each measurement report records current site baseline | as supplied"
-
-    assert induction.standing_units(f"{header}\n| Noise | LAeq |\n{item}") == [
-        induction.StandingUnit(header, header=True),
-        induction.StandingUnit(item, header=False),
-    ]
-
-
-def test_a_unit_keeps_the_inner_bytes_of_its_holder_section() -> None:
-    # Two trailing spaces before a newline are a Markdown hard line break.
-    broken = (
-        "Quillfen Geomatics Ltd  \nRegistered surveyors under the house quality manual since 2009."
-    )
-    view = candidate_view(("p1/a.md", [f"Intro.\n\n{broken}  \n"]), ("p2/b.md", [broken]))
-
-    (candidate,) = standing_candidates(view, ("doc_001", "doc_002"))
-
-    assert candidate.text == broken
-    assert candidate.text in view.markdown(candidate.citations[0])
-
-
-def test_candidates_group_duplicates_in_canonical_order_whatever_the_input_order() -> None:
-    emphasised = DISCLAIMER.replace("seabed", "**seabed**")
-    docs = [
-        ("p1/a.md", ["# Scope\n\nThe p1 harbour.", emphasised]),
-        ("p2/b.md", [f"{DISCLAIMER}\n\n{HEADER}"]),
-        ("p3/c.md", [f"{HEADER}\n| Grid | x | y |", f"Intro.\n\n{DISCLAIMER}"]),
-    ]
-    expected = (
-        StandingCandidate(
-            "candidate_01", emphasised, ("doc_001_sec_002", "doc_002_sec_001", "doc_003_sec_002")
-        ),
-        StandingCandidate("candidate_02", HEADER, ("doc_002_sec_001", "doc_003_sec_001")),
-    )
-
-    results = {
-        standing_candidates(candidate_view(*docs), order)
-        for order in itertools.permutations(("doc_001", "doc_002", "doc_003"))
-    }
-
-    assert results == {expected}
-    # One exemplar cannot show recurrence.
-    assert standing_candidates(candidate_view(*docs), ("doc_002",)) == ()
 
 
 def test_the_blueprint_request_says_why_it_lists_no_candidates() -> None:
@@ -917,7 +761,7 @@ def test_candidates_beyond_the_cap_keep_those_in_the_most_documents_and_the_requ
         ("p1/a.md", sentences), ("p2/b.md", sentences), ("p3/c.md", sentences[-2:])
     )
     exemplars = ("doc_001", "doc_002", "doc_003")
-    found = standing_candidates(view, exemplars)
+    found = standing_candidates(exemplar_documents(view, exemplars))
 
     offered = induction.offered_candidates(view, found)
 

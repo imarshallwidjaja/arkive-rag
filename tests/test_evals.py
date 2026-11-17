@@ -22,7 +22,7 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ValidationError
 from typer.testing import CliRunner
 
-from arkive_rag import compiler, induction
+from arkive_rag import compiler
 from arkive_rag.llm import BudgetExceededError, Tool, ToolReply, ToolResult, UsageMeter
 from arkive_rag.models import (
     DocumentInfo,
@@ -31,6 +31,7 @@ from arkive_rag.models import (
     corpus_fingerprint,
     fold_for_quote,
 )
+from arkive_rag.passages import shingles
 from arkive_rag.server import INSTRUCTIONS, TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import TopicSnapshot
 from evals import drafting
@@ -64,7 +65,6 @@ from evals.drafting import (
     run_layer3_holdout,
     score_rubric,
     select_holdout_sources,
-    without_visual_transcripts,
 )
 from evals.opencode_check.scenarios import ARKIVE_TOOLS
 from evals.run import _layer2_report, _layer3_report, make_private_directory, write_private_text
@@ -381,7 +381,7 @@ def overlap_sources() -> OverlapSources:
 
 
 def grams(text: str) -> frozenset[tuple[str, ...]]:
-    return induction.shingles(fold_for_quote(text))
+    return shingles(fold_for_quote(text))
 
 
 def measure(sources: OverlapSources, draft: str) -> LexicalOverlap:
@@ -390,15 +390,6 @@ def measure(sources: OverlapSources, draft: str) -> LexicalOverlap:
     for value in (measured.house_text_recall, measured.copied_text_contamination):
         assert value is None or 0.0 <= value <= 1.0, measured
     return measured
-
-
-def test_visual_transcripts_are_block_quotes_whose_first_line_opens_with_the_prefix() -> None:
-    ordinary = f"> {HOUSE}\n> **[Visual \u2014 Page 2: Chart]** is how the compiler labels figures."
-    markdown = f"{ordinary}\n\n{visual('Map', MAP)}\n\nAfter."
-
-    assert without_visual_transcripts(markdown) == f"{ordinary}\n\n\nAfter."
-    # `standing_units` reads the same block as the one transcript.
-    assert [u.text for u in induction.standing_units(markdown)] == [ordinary, "After."]
 
 
 def test_house_text_is_reference_prose_the_holdout_holds_outside_authorised_input() -> None:
@@ -554,6 +545,163 @@ def test_a_fenced_block_is_kept_as_written_and_never_starts_a_visual_transcript(
     assert [u.stray_shingles for u in copied.copied_units] == [0]
     prompt = exemplars_prompt([("p101/memo.md", f"{fenced}\n\n{visual('Map', MAP)}")], "notes")
     assert f"{fenced}\n\nRUN NOTES:" in prompt and MAP not in prompt
+
+
+# Per case: the example collection's documents as their section Markdown, the reference, a
+# sibling deliverable of the same type, and the run notes. Every other non-note document of the
+# collection is holdout text. The Markdown collections give each file as one section and use a
+# curator note as run notes. The acoustic collection is Word and PDF only, so its noise reports
+# come from the section Markdown of its compiled snapshot (`ACOUSTIC_SECTIONS`), with each
+# holdout's run notes from its example pack.
+REPOSITORY = Path(__file__).resolve().parents[1]
+ACOUSTIC_SECTIONS = Path(__file__).with_name("acoustic-noise-report-sections.json")
+OVERLAP_PIN_MARKDOWN_CASES = {
+    "coastal-survey-projects": (
+        "q103-fennick-canal/q103-proposal.md",
+        "q101-brenlow-estuary/q101-proposal.md",
+        "q103-fennick-canal/AGENTS.md",
+    ),
+    "creator-campaigns": (
+        "teodor-vasquez-lund/kettlecraft-winter/campaign-brief.md",
+        "teodor-vasquez-lund/corriemoor-trail-relaunch/campaign-brief.md",
+        "AGENTS.md",
+    ),
+}
+OVERLAP_PIN_ACOUSTIC_CASES = {
+    "pellow-mill-facade-report": (
+        "pellow-mill-facade-report.docx",
+        "corvane-depot-night-noise-report.pdf",
+    ),
+    "corvane-depot-night-noise-report": (
+        "corvane-depot-night-noise-report.pdf",
+        "pellow-mill-facade-report.docx",
+    ),
+}
+
+
+def overlap_pin_cases() -> list[tuple[str, dict[str, list[str]], str, str, str]]:
+    cases = []
+    for name, (reference, sibling, notes) in OVERLAP_PIN_MARKDOWN_CASES.items():
+        root = REPOSITORY / "evals" / "example_corpora" / name
+        files = {
+            p.relative_to(root).as_posix(): p.read_text(encoding="utf-8")
+            for p in sorted(root.rglob("*.md"))
+        }
+        documents = {f: [t] for f, t in files.items() if not f.endswith("AGENTS.md")}
+        cases.append((name, documents, reference, sibling, files[notes]))
+    pack = json.loads(
+        (REPOSITORY / "evals" / "example_packs" / "acoustic-consultancy-files.eval.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    run_notes = {h["holdout_id"]: h["run_notes"] for h in pack["holdouts"]}
+    acoustic = json.loads(ACOUSTIC_SECTIONS.read_text(encoding="utf-8"))
+    for holdout_id, (reference, sibling) in OVERLAP_PIN_ACOUSTIC_CASES.items():
+        name = f"acoustic-consultancy-files/{holdout_id}"
+        cases.append((name, acoustic, reference, sibling, run_notes[holdout_id]))
+    return cases
+
+
+def test_lexical_overlap_of_drafts_from_the_example_collections_is_pinned() -> None:
+    measured: dict[str, object] = {}
+    for name, documents, reference, sibling, run_notes in overlap_pin_cases():
+        sources = OverlapSources.from_texts(
+            reference_sections=documents[reference],
+            holdout_sections=[s for f, ss in documents.items() if f != reference for s in ss],
+            run_notes=run_notes,
+            instructions="Write the deliverable in Markdown.",
+        )
+        reference_text = "\n\n".join(documents[reference])
+        sibling_text = "\n\n".join(documents[sibling])
+        blocks = reference_text.split("\n\n")
+        drafts = {
+            "reference": reference_text,
+            "reference_head": "\n\n".join(blocks[: len(blocks) // 2]),
+            "sibling": sibling_text,
+            "both": f"{reference_text}\n\n{sibling_text}",
+        }
+        measured[name] = (len(sources.house_units), len(sources.house_shingles))
+        for label, draft in drafts.items():
+            m = sources.measure(draft)
+            measured[f"{name}/{label}"] = (
+                m.house_text_recall,
+                m.copied_text_contamination,
+                m.draft_shingles,
+                m.stray_shingles,
+                tuple(u.share for u in m.house_units),
+                tuple(u.stray_shingles for u in m.copied_units),
+            )
+
+    copied = (34, 5, 7, 12, 9, 8, 22, 14, 7, 14, 16, 0)
+    pellow = "acoustic-consultancy-files/pellow-mill-facade-report"
+    corvane = "acoustic-consultancy-files/corvane-depot-night-noise-report"
+    assert measured == {
+        "coastal-survey-projects": (2, 42),
+        "coastal-survey-projects/reference": (1.0, 0.0, 162, 0, (1.0, 1.0), (0, 0)),
+        "coastal-survey-projects/reference_head": (5 / 42, 0.0, 78, 0, (1.0, 0.0), (0,)),
+        "coastal-survey-projects/sibling": (1.0, 148 / 200, 200, 148, (1.0, 1.0), (0, *copied)),
+        "coastal-survey-projects/both": (
+            1.0,
+            148 / 313,
+            313,
+            148,
+            (1.0, 1.0),
+            (0, 0, 0, *copied),
+        ),
+        "creator-campaigns": (1, 37),
+        "creator-campaigns/reference": (1.0, 0.0, 114, 0, (1.0,), (0,)),
+        "creator-campaigns/reference_head": (0.0, 0.0, 40, 0, (0.0,), ()),
+        "creator-campaigns/sibling": (1.0, 57 / 117, 117, 57, (1.0,), (15, 12, 5, 9, 5, 5, 6, 0)),
+        "creator-campaigns/both": (
+            1.0,
+            57 / 191,
+            191,
+            57,
+            (1.0,),
+            (0, 15, 12, 5, 9, 5, 5, 6, 0),
+        ),
+        # House units: the measurement-procedure paragraph, the calibration caveat and the
+        # report-purpose paragraph. The data-handling statement is Pellow Mill's alone: house
+        # text for neither holdout, and stray text in a Corvane draft that copies it.
+        pellow: (3, 136),
+        f"{pellow}/reference": (1.0, 0.0, 288, 0, (1.0, 1.0, 1.0), (0, 0, 0)),
+        f"{pellow}/reference_head": (57 / 136, 0.0, 160, 0, (1.0, 0.0, 0.0), (0,)),
+        f"{pellow}/sibling": (
+            131 / 136,
+            120 / 251,
+            251,
+            120,
+            (1.0, 27 / 32, 1.0),
+            (71, 0, 43, 6, 0),
+        ),
+        f"{pellow}/both": (
+            1.0,
+            120 / 408,
+            408,
+            120,
+            (1.0, 1.0, 1.0),
+            (0, 0, 0, 71, 0, 43, 6, 0),
+        ),
+        corvane: (3, 137),
+        f"{corvane}/reference": (1.0, 0.0, 251, 0, (1.0, 1.0, 1.0), (0, 0, 0)),
+        f"{corvane}/reference_head": (57 / 137, 0.0, 128, 0, (1.0, 0.0, 0.0), (0,)),
+        f"{corvane}/sibling": (
+            131 / 137,
+            157 / 288,
+            288,
+            157,
+            (1.0, 9 / 11, 1.0),
+            (62, 0, 41, 5, 0, 49),
+        ),
+        f"{corvane}/both": (
+            1.0,
+            157 / 408,
+            408,
+            157,
+            (1.0, 1.0, 1.0),
+            (0, 0, 0, 62, 0, 41, 5, 0, 49),
+        ),
+    }
 
 
 def test_rubric_diagnostics_label_where_each_required_group_occurs_in_the_inputs() -> None:

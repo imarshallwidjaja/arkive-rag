@@ -18,12 +18,14 @@ them in the snapshot next to the sections, pages and chunks.
 | `llm.py` | The request protocols (`StructuredRequest`, `AgentRequest`), the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Agents SDK runs, Decisions, embeddings, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
 | `compiler.py` | Reading (discovery, rendering, the transcription fidelity gate, section stitching, chunk pieces, observation cards with quote location) and binding (IDs, breadcrumbs, embeddings). `compile_corpus` composes reading, induction and binding into a `CompiledCorpus`. Its request types (`PageTranscription`, `ObserveSections`, `ConsolidateCard`) own their prompts, output schemas and reasoning efforts. |
 | `induction.py` | Induction: corpus organisation, facet binding, the glossary, blueprints and the topic guide; the validate-and-retry helper `generate_checked`; support checks; the read-only source tools of the blueprint agent. Its request types (`OrganiseCorpus`, `WriteGlossary`, `WriteBlueprint`, `WriteGuide`) own their prompts, schemas and efforts. |
+| `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what a visual transcript is and its removal (`without_visual_transcripts`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a set of exemplar documents recur (`standing_candidates`, over plain `ExemplarDocument` records). Induction's blueprint step and the evaluation harness both measure text with it. |
 | `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup). |
 | `server.py` | `TopicCatalog` (open snapshots keyed by topic), the ten MCP tools and the server instructions. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
 
 Dependencies point one way: `cli` → `server` → `snapshot`, and `cli` →
-`compiler` → `induction` → `llm`; every module uses `models`. `snapshot` and
+`compiler` → `induction` → `llm`, with `induction` → `passages`; every module
+uses `models`, and `passages` imports nothing else of the package. `snapshot` and
 `server` import neither `compiler`, `induction` nor `llm`; the CLI passes the
 query embedder in. The compiler and induction receive a `LanguageGateway`, so
 tests drive them with a deterministic fake and no network. Only `llm.py`
@@ -241,8 +243,8 @@ not confirm.
    A standing passage is house text: organisation or tool background, method
    references, reference entries, acknowledgements, disclaimers, disclosures,
    standard table headers and standing caveats. Code computes the candidates
-   (`standing_candidates`, no provider call) from the Markdown of the type's
-   exemplar sections:
+   (`standing_candidates` in `passages.py`, no provider call) from the Markdown
+   of the type's exemplar sections:
 
    - A *unit* is a paragraph, one item of a list (a list marker,
      `LIST_MARKER`, starts an item: `-`, `*`, `+`, a number followed by `.` or
@@ -765,7 +767,7 @@ whether the texts mean the same thing. The report gives each arm's input tokens,
 carrying the exemplars is visible beside the other arms.
 
 The two measures compare wording, not meaning. They reuse the build's text
-functions from `arkive_rag.induction`: `standing_units`, word 4-gram
+functions from `arkive_rag.passages`: `standing_units`, word 4-gram
 `shingles` of `fold_for_quote` text, `containment`, `STANDING_MIN_WORDS` and
 `STANDING_RECURRENCE_CONTAINMENT`, and the list-marker pattern `LIST_MARKER`.
 A visual transcript is a block quote whose first line opens with

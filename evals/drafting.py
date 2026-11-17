@@ -7,12 +7,13 @@ to one blind judge call. Agent runs go through `evals.agents.run_agent`; the jud
 `OpenAIGateway.run`.
 
 The two measures compare wording, not meaning. They share with induction's standing passages
-the unit, shingle and containment functions of `arkive_rag.induction` (`standing_units`, word
-shingles of `fold_for_quote` text, `containment`) and its thresholds (`STANDING_MIN_WORDS`,
-`STANDING_RECURRENCE_CONTAINMENT`). They differ from it in three ways: a unit loses its leading
+the unit, shingle and containment functions of `arkive_rag.passages` (`standing_units`, word
+shingles of `fold_for_quote` text, `containment`, `without_visual_transcripts`) and its
+thresholds (`STANDING_MIN_WORDS`, `STANDING_RECURRENCE_CONTAINMENT`). They differ from
+recurring-candidate discovery (`standing_candidates`) in three ways: a unit loses its leading
 list marker (`LIST_MARKER`) before it is folded; a unit is held when the union of every holdout
-section's shingles contains enough of its shingles, where induction tests each section of
-another document on its own; and no folder rule applies, where induction asks for recurrence in
+section's shingles contains enough of its shingles, where discovery tests each section of
+another document on its own; and no folder rule applies, where discovery asks for recurrence in
 another top-level folder when the exemplars span folders.
 """
 
@@ -22,7 +23,6 @@ import hashlib
 import json
 import os
 import random
-import re
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -32,17 +32,8 @@ from typing import Any, ClassVar, Literal
 import anyio
 from pydantic import BaseModel
 
+from arkive_rag import passages as _passages
 from arkive_rag.compiler import compile_corpus, discover_corpus, read_source
-from arkive_rag.induction import (
-    LIST_MARKER,
-    STANDING_MIN_WORDS,
-    STANDING_RECURRENCE_CONTAINMENT,
-    VISUAL_TRANSCRIPT_PREFIX,
-    WORD,
-    containment,
-    shingles,
-    standing_units,
-)
 from arkive_rag.llm import BudgetExceededError, Effort, LanguageGateway, OpenAIGateway, Tool
 from arkive_rag.models import DocumentInfo, ProviderError, fold_for_quote
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
@@ -178,42 +169,6 @@ def section_markdowns(snapshot: TopicSnapshot, doc_id: str) -> list[str]:
     return [snapshot.read_section(s.section_id).markdown for s in snapshot.outline(doc_id).sections]
 
 
-# Opens a fenced block, as `standing_units` reads one.
-_FENCE_OPENING = re.compile(r"\s*(`{3,}|~{3,})")
-
-
-def without_visual_transcripts(markdown: str) -> str:
-    """`markdown` without the visual transcripts the compiler writes: a block quote whose first
-    line opens with `VISUAL_TRANSCRIPT_PREFIX`, through its last `>` line. This agrees with
-    `standing_units` on what a transcript is: a prefix line inside an ordinary block quote
-    starts nothing, and a fenced block, which opens with three or more backticks or tildes and
-    closes at a line of at least as many of the same character, is kept as written."""
-    kept: list[str] = []
-    in_quote = in_transcript = False
-    fence: str | None = None
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if fence is not None:
-            if stripped.startswith(fence) and not stripped.strip(fence[0]):
-                fence = None
-            kept.append(line)
-            continue
-        if opening := _FENCE_OPENING.match(line):
-            fence = opening[1]
-            in_quote = in_transcript = False
-            kept.append(line)
-            continue
-        quote_line = stripped.startswith(">")
-        if not quote_line:
-            in_transcript = False
-        elif not in_quote:
-            in_transcript = stripped.startswith(VISUAL_TRANSCRIPT_PREFIX)
-        in_quote = quote_line
-        if not in_transcript:
-            kept.append(line)
-    return "\n".join(kept)
-
-
 # Lexical-overlap measures.
 
 Shingles = frozenset[tuple[str, ...]]
@@ -230,7 +185,7 @@ class _ProseUnit:
     @property
     def long(self) -> bool:
         """Long enough to be a house or copied unit."""
-        return self.words >= STANDING_MIN_WORDS
+        return self.words >= _passages.STANDING_MIN_WORDS
 
 
 def _prose_units(markdown: str) -> list[_ProseUnit]:
@@ -239,12 +194,14 @@ def _prose_units(markdown: str) -> list[_ProseUnit]:
     Headings, tables, fenced blocks and visual transcripts are not units. `text` stays as
     written."""
     units: list[_ProseUnit] = []
-    for unit in standing_units(markdown):
+    for unit in _passages.standing_units(markdown):
         if unit.header:
             continue
-        marker = LIST_MARKER.match(unit.text)
+        marker = _passages.LIST_MARKER.match(unit.text)
         folded = fold_for_quote(unit.text[marker.end() :] if marker else unit.text)
-        units.append(_ProseUnit(unit.text, len(WORD.findall(folded)), shingles(folded)))
+        units.append(
+            _ProseUnit(unit.text, len(_passages.WORD.findall(folded)), _passages.shingles(folded))
+        )
     return units
 
 
@@ -253,12 +210,12 @@ def _text_shingles(text: str) -> Shingles:
     visual transcripts removed, together with its prose units' shingles. Folding the whole text
     joins a line-end hyphen or dash with the next unit's first word, and a unit keeps no list
     marker, so neither form alone holds every shingle the other does."""
-    whole = shingles(fold_for_quote(without_visual_transcripts(text)))
+    whole = _passages.shingles(fold_for_quote(_passages.without_visual_transcripts(text)))
     return whole.union(*(u.grams for u in _prose_units(text)))
 
 
 def _held(grams: Shingles, holdout: Shingles) -> bool:
-    return containment(grams, holdout) >= STANDING_RECURRENCE_CONTAINMENT
+    return _passages.containment(grams, holdout) >= _passages.STANDING_RECURRENCE_CONTAINMENT
 
 
 @dataclass(frozen=True)
@@ -370,7 +327,9 @@ class OverlapSources:
             draft_shingles=len(draft_grams),
             stray_shingles=len(stray),
             house_units=tuple(
-                HouseUnitRecall(u.text[:UNIT_HEAD_CHARS], containment(u.grams, draft_grams))
+                HouseUnitRecall(
+                    u.text[:UNIT_HEAD_CHARS], _passages.containment(u.grams, draft_grams)
+                )
                 for u in self.house_units
             ),
             copied_units=tuple(
@@ -467,7 +426,7 @@ def exemplars_prompt(documents: Sequence[tuple[str, str]], run_notes: str) -> st
     """The exemplars-in-context prompt: each `(path, markdown)` document, labelled with its path
     and without visual transcripts, then the run notes."""
     blocks = [
-        f"===== DOCUMENT {path} =====\n{without_visual_transcripts(markdown).strip()}"
+        f"===== DOCUMENT {path} =====\n{_passages.without_visual_transcripts(markdown).strip()}"
         for path, markdown in documents
     ]
     return "\n\n".join([*blocks, f"RUN NOTES:\n{run_notes}"])
@@ -580,7 +539,7 @@ async def run_layer3_holdout(
         reference_sections = section_markdowns(full, reference.doc_id)
     if not reference_sections:
         raise ValueError(f"reference document {reference.doc_id} has no sections")
-    reference_markdown = without_visual_transcripts("\n\n".join(reference_sections))
+    reference_markdown = _passages.without_visual_transcripts("\n\n".join(reference_sections))
     holdout_path = output_dir / "holdout.arkive.db"
     # A worker thread: compiling may start its own event loop for agent runs, and this
     # coroutine's loop is already running.
