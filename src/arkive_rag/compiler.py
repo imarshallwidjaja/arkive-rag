@@ -23,15 +23,12 @@ import shutil
 import subprocess
 import tempfile
 import threading
-import unicodedata
-import zipfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
-from xml.etree import ElementTree
 
 import pypdfium2 as pdfium
 from PIL import Image
@@ -49,7 +46,6 @@ from arkive_rag.models import (
     CorpusDocument,
     CraftObservation,
     CuratorNote,
-    DocumentDate,
     DocumentReading,
     Facet,
     MissingDependencyError,
@@ -68,7 +64,6 @@ from arkive_rag.models import (
     UnsupportedFormatError,
     fold_for_quote,
     fold_text,
-    is_date_iso,
 )
 
 SUPPORTED_SUFFIXES: dict[str, SourceFormat] = {
@@ -663,30 +658,8 @@ def merge_tables(previous: str, continuation: str, merges_into_previous_row: boo
     return _render_rows(prev_rows + cont_rows)
 
 
-# Every line break `str.splitlines` recognises other than `\n`.
-_OTHER_LINE_BREAK = re.compile("\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
-
-
-def _unix_lines(text: str) -> str:
-    """`text` with every other line break `str.splitlines` recognises (`\\r\\n`, `\\r`,
-    `\\x0b`, `\\x0c`, `\\x1c`-`\\x1e`, `\\x85`, `\\u2028`, `\\u2029`) replaced by `\\n`, and
-    nothing else changed: text that breaks lines with `\\n` only is returned as it is, so its
-    sections, chunks and observation requests (and their cache keys) stay the same. A
-    transcription can carry any of them; section Markdown has `\\n` only, as the Markdown
-    path gives, because passage units are rejoined with `\\n` and must stay substrings of
-    their section."""
-    return _OTHER_LINE_BREAK.sub("\n", text)
-
-
-def _one_line(text: str) -> str:
-    """`text` for a one-line Markdown form (a heading, a visual label): every other line break
-    becomes a space, so it adds no line that `standing_units` could read as prose or that would
-    end a visual block; a `\\n` stays where it is, so `\\n`-only text compiles as it did."""
-    return _OTHER_LINE_BREAK.sub(" ", text)
-
-
 def _heading_text(markdown: str) -> str:
-    return _one_line(markdown).strip().lstrip("#").strip()
+    return markdown.strip().lstrip("#").strip()
 
 
 def _heading_level(block: PageBlock) -> int:
@@ -697,16 +670,15 @@ def _block_parts(block: PageBlock, page: int) -> list[Part]:
     if block.kind == "heading":
         text = f"{'#' * _heading_level(block)} {_heading_text(block.markdown)}"
         return [Part("heading", text, page, page)]
-    markdown = _unix_lines(block.markdown)
     if block.kind == "table":
-        return [Part(kind, text, page, page) for kind, text in split_table_block(markdown)]
-    text = markdown.strip()
+        return [Part(kind, text, page, page) for kind, text in split_table_block(block.markdown)]
+    text = block.markdown.strip()
     return [Part(block.kind, text, page, page)] if text else []
 
 
 def _visual_part(page: int, label: str, transcript: str) -> Part:
-    quoted = _unix_lines(transcript).strip().replace("\n", "\n> ")
-    text = f"> **[Visual \u2014 Page {page}: {_one_line(label)}]**\n> {quoted}"
+    quoted = transcript.strip().replace("\n", "\n> ")
+    text = f"> **[Visual \u2014 Page {page}: {label}]**\n> {quoted}"
     return Part("visual", text, page, page)
 
 
@@ -1137,160 +1109,6 @@ def curator_note_card(text: str) -> ObservationCard:
     )
 
 
-# Document dates.
-
-_MONTH_NAMES = (
-    *("january", "february", "march", "april", "may", "june"),
-    *("july", "august", "september", "october", "november", "december"),
-)
-_MONTH_NUMBERS = {name: number for number, name in enumerate(_MONTH_NAMES, start=1)} | {
-    name[:3]: number for number, name in enumerate(_MONTH_NAMES, start=1)
-}
-_MONTH = "(" + "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True)) + ")"
-_DAY = r"(\d{1,2})(?:st|nd|rd|th)?"
-# re.ASCII keeps every pattern below to ASCII digits, and makes IGNORECASE fold only ASCII
-# letters, so a matched month name is always a key of _MONTH_NUMBERS once lowered.
-_ISO_DAY = re.compile(r"(\d{4})-(\d{2})-(\d{2})", re.ASCII)
-_DAY_MONTH_YEAR = re.compile(rf"{_DAY} {_MONTH},? (\d{{4}})", re.ASCII | re.IGNORECASE)
-_MONTH_DAY_YEAR = re.compile(rf"{_MONTH} {_DAY},? (\d{{4}})", re.ASCII | re.IGNORECASE)
-_MONTH_YEAR = re.compile(rf"{_MONTH},? (\d{{4}})", re.ASCII | re.IGNORECASE)
-_NUMERIC_DATE = re.compile(r"(\d{1,2})([/-])(\d{1,2})\2(\d{4})", re.ASCII)
-# The whole PDF date string `D:YYYY[MM[DD[HH[mm[SS]]]]]` with an optional `Z`, `+HH'mm'` or
-# `-HH'mm'` offset (trailing apostrophe optional). The calendar date is the one written, in
-# the timestamp's own offset.
-_PDF_DATE = re.compile(
-    r"D:(\d{4})(?:(\d{2})(?:(\d{2})(?:(\d{2})(?:(\d{2})(\d{2})?)?)?)?)?"
-    r"(?:Z|[+-](\d{2})'(\d{2})'?)?",
-    re.ASCII,
-)
-# A whole W3CDTF value: a date, or a date and time with optional fractional seconds and an
-# optional `Z` or `+HH:MM`/`-HH:MM` zone. The calendar date is the one written.
-_W3C_DATE = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})"
-    r"(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-](\d{2}):(\d{2}))?)?",
-    re.ASCII,
-)
-_CORE_PROPERTIES = "docProps/core.xml"
-_DCTERMS_MODIFIED = "{http://purl.org/dc/terms/}modified"
-
-
-def _iso(year: str | int, month: str | int, day: str | int | None = None) -> str | None:
-    """`YYYY-MM-DD` (or `YYYY-MM` without a day) when the parts name a real date."""
-    value = f"{int(year):04d}-{int(month):02d}" + ("" if day is None else f"-{int(day):02d}")
-    return value if is_date_iso(value) else None
-
-
-def parse_printed_date(printed: str) -> str | None:
-    """The ISO form of a printed date in one of the unambiguous forms, else None.
-
-    After NFKC (so `19ᵗʰ` reads as `19th`) and with whitespace collapsed, the whole text must
-    be one of: `YYYY-MM-DD`; day, English month name (full or three letters) and year, the day
-    with or without an ordinal suffix; month name, day and year (`June 12, 2026`); month name
-    and year, which gives `YYYY-MM`; or `D/M/YYYY` or `D-M-YYYY` when exactly one of the first
-    two numbers exceeds 12, which makes it the day. Any other text, such as `12/02/2026`, is
-    not guessed.
-    """
-    text = " ".join(unicodedata.normalize("NFKC", printed).split())
-    if match := _ISO_DAY.fullmatch(text):
-        return _iso(match[1], match[2], match[3])
-    if match := _DAY_MONTH_YEAR.fullmatch(text):
-        return _iso(match[3], _MONTH_NUMBERS[match[2].lower()], match[1])
-    if match := _MONTH_DAY_YEAR.fullmatch(text):
-        return _iso(match[3], _MONTH_NUMBERS[match[1].lower()], match[2])
-    if match := _MONTH_YEAR.fullmatch(text):
-        return _iso(match[2], _MONTH_NUMBERS[match[1].lower()])
-    if match := _NUMERIC_DATE.fullmatch(text):
-        first, second = int(match[1]), int(match[3])
-        if (first > 12) == (second > 12):
-            return None
-        day, month = (first, second) if first > 12 else (second, first)
-        return _iso(match[4], month, day)
-    return None
-
-
-def _clock_is_valid(*parts: str | None) -> bool:
-    """True when each present part of `hour, minute, second, zone hour, zone minute` is in
-    range (a second of 60 allows a leap second)."""
-    limits = (23, 59, 60, 23, 59)
-    return all(
-        part is None or int(part) <= limit for part, limit in zip(parts, limits, strict=True)
-    )
-
-
-def _pdf_date(value: str) -> str | None:
-    found = _PDF_DATE.fullmatch(value.strip())
-    if found is None or found[2] is None:
-        return None
-    if not _clock_is_valid(found[4], found[5], found[6], found[7], found[8]):
-        return None
-    return _iso(found[1], found[2], found[3])
-
-
-def _w3c_date(value: str) -> str | None:
-    found = _W3C_DATE.fullmatch(value.strip())
-    if found is None or not _clock_is_valid(found[4], found[5], found[6], found[7], found[8]):
-        return None
-    return _iso(found[1], found[2], found[3])
-
-
-def embedded_date(source: SourceFile, data: bytes) -> str | None:
-    """The date a file's own metadata carries, read from its original bytes.
-
-    PDF: the info dictionary's `CreationDate`. Word and PowerPoint: `dcterms:modified` in
-    `docProps/core.xml` (`created` can be the template's date). Markdown has none. The whole
-    value must be in its format's date form: a missing value, or one with anything outside
-    that form, gives None. A PDF with only a year gives None and one with a year and month
-    gives `YYYY-MM`. A file whose metadata container cannot be read (a PDF that does not open,
-    an Office file that is not a zip archive, a `core.xml` that is not well-formed XML) is
-    corrupt and raises ConversionError.
-    """
-    match source.format:
-        case "md":
-            return None
-        case "pdf":
-            with _PDFIUM_LOCK:
-                try:
-                    document = pdfium.PdfDocument(data)
-                except pdfium.PdfiumError as exc:
-                    raise ConversionError(f"{source.rel_path}: cannot open PDF: {exc}") from exc
-                try:
-                    value = document.get_metadata_value("CreationDate")
-                finally:
-                    document.close()
-            return _pdf_date(value)
-        case "docx" | "pptx":
-            try:
-                with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                    if _CORE_PROPERTIES not in archive.namelist():
-                        return None
-                    core = archive.read(_CORE_PROPERTIES)
-            except zipfile.BadZipFile as exc:
-                raise ConversionError(
-                    f"{source.rel_path}: cannot read as a zip archive: {exc}"
-                ) from exc
-            try:
-                modified = ElementTree.fromstring(core).findtext(_DCTERMS_MODIFIED)
-            except ElementTree.ParseError as exc:
-                raise ConversionError(
-                    f"{source.rel_path}: {_CORE_PROPERTIES} is not well-formed XML: {exc}"
-                ) from exc
-            return None if modified is None else _w3c_date(modified)
-
-
-def document_date(source: SourceFile, data: bytes, printed: str | None) -> DocumentDate | None:
-    """A document's date and its basis, from the date it prints and its original bytes.
-
-    A printed date that parses wins. A printed date that does not parse gives None and never
-    the embedded date, which can differ from the printed one by months. Only a document that
-    prints no date takes its file's embedded date.
-    """
-    if printed is not None and printed.strip():
-        parsed = parse_printed_date(printed)
-        return None if parsed is None else DocumentDate(iso=parsed, basis="printed")
-    embedded = embedded_date(source, data)
-    return None if embedded is None else DocumentDate(iso=embedded, basis="embedded")
-
-
 def read_document(source: SourceFile, data: bytes, gateway: LanguageGateway) -> DocumentReading:
     """Read one source from `data`, the bytes read from it exactly once.
 
@@ -1343,7 +1161,6 @@ def read_document(source: SourceFile, data: bytes, gateway: LanguageGateway) -> 
         sections=sections,
         pages=pages,
         card=card,
-        date=document_date(source, data, card.doc_date),
         discarded_quotes=discarded,
     )
 
@@ -1405,7 +1222,6 @@ def bind_document(
         format=reading.format,
         title=card.title,
         doc_date=card.doc_date,
-        date=reading.date,
         deliverable_type=card.deliverable_type,
         summary=card.summary,
         facets={
@@ -1480,7 +1296,6 @@ def compile_corpus(
         facets=knowledge.facets,
         glossary=knowledge.glossary,
         blueprints=knowledge.blueprints,
-        candidate_records=knowledge.candidate_records,
         build_settings=settings,
         build_report=knowledge.report,
         documents=compiled,

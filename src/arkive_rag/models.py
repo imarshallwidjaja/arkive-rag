@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import calendar
 import hashlib
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ArkiveError(Exception):
@@ -241,29 +239,11 @@ class GuidanceDraft(_Frozen):
     citations: list[str]
 
 
-RecurringKind = Literal["standing", "conditional"]
-
-
-class PassageSelection(_Frozen):
-    """One recurring passage candidate the agent keeps, by ID, with its label and kind; a
-    `conditional` one states its condition. `holder_section_id` names the holding section
-    whose wording to store, set only when a curator note states which wording is current.
-    The text and citations come from the candidate, never from the agent. Kind, condition and
-    holder are checked by the build, after parsing, so a mismatch reaches the rerun that
-    names it."""
+class StandingPassageSelection(_Frozen):
+    """One standing passage candidate the agent keeps, by ID, with its label. The text and
+    citations come from the candidate, never from the agent."""
 
     candidate_id: str
-    label: str
-    kind: RecurringKind
-    condition: str | None
-    holder_section_id: str | None
-
-
-class HouseSectionNomination(_Frozen):
-    """An exemplar section the agent names as house matter that does not recur in another
-    exemplar. Code takes the section's text; the agent writes none."""
-
-    section_id: str
     label: str
 
 
@@ -272,8 +252,7 @@ class BlueprintDraft(_Frozen):
     outline: list[BlueprintSectionDraft]
     conventions: list[GuidanceDraft]
     pitfalls: list[GuidanceDraft]
-    passages: list[PassageSelection]
-    house_sections: list[HouseSectionNomination]
+    standing_passages: list[StandingPassageSelection]
 
 
 class GuideDraft(_Frozen):
@@ -335,66 +314,9 @@ class RenderedPage(_Frozen):
     visual_summary: str
 
 
-# `printed`: parsed from the date the document prints. `embedded`: from the file's own
-# metadata, used only when the document prints no date.
-DateBasis = Literal["printed", "embedded"]
-_DATE_ISO = re.compile(r"(\d{4})-(\d{2})(?:-(\d{2}))?", re.ASCII)
-
-
-def _date_span(value: str) -> tuple[date, date] | None:
-    """The first and last day an ISO day or month covers, or None when `value` is not a real
-    calendar date `YYYY-MM-DD` or month `YYYY-MM` written in ASCII digits."""
-    match = _DATE_ISO.fullmatch(value)
-    if match is None:
-        return None
-    year, month = int(match[1]), int(match[2])
-    try:
-        if match[3] is not None:
-            day = date(year, month, int(match[3]))
-            return day, day
-        first = date(year, month, 1)
-    except ValueError:
-        return None
-    return first, first.replace(day=calendar.monthrange(year, month)[1])
-
-
-def is_date_iso(value: str) -> bool:
-    """True for a real calendar date `YYYY-MM-DD` or month `YYYY-MM` in ASCII digits."""
-    return _date_span(value) is not None
-
-
-class DocumentDate(_Frozen):
-    """A document's date: `iso` is `YYYY-MM-DD`, or `YYYY-MM` when only a month and year
-    are known."""
-
-    iso: str
-    basis: DateBasis
-
-    @field_validator("iso")
-    @classmethod
-    def _calendar_date(cls, value: str) -> str:
-        if not is_date_iso(value):
-            raise ValueError(f"{value!r} is not a YYYY-MM-DD date or YYYY-MM month")
-        return value
-
-
-def is_strictly_newer(a: DocumentDate | None, b: DocumentDate | None) -> bool:
-    """True only when the dates show that `a` is later than `b`.
-
-    Equal dates, a month and a day within that month, and a missing date show no order, so
-    each gives False in both directions.
-    """
-    if a is None or b is None:
-        return False
-    span_a, span_b = _date_span(a.iso), _date_span(b.iso)
-    assert span_a is not None and span_b is not None, "DocumentDate validates its iso"
-    return span_a[0] > span_b[1]
-
-
 class DocumentReading(_Frozen):
     """The reading of one source. `discarded_quotes` counts observations dropped because
-    their quote was still not found in the source after one rerun. `date` is None when the
-    document prints a date that does not parse, or prints none and its file carries none."""
+    their quote was still not found in the source after one rerun."""
 
     sha256: str
     format: SourceFormat
@@ -402,7 +324,6 @@ class DocumentReading(_Frozen):
     sections: tuple[ReadSection, ...]
     pages: tuple[RenderedPage, ...]
     card: ObservationCard
-    date: DocumentDate | None
     discarded_quotes: int
 
 
@@ -466,100 +387,20 @@ class BlueprintGuidance(_Frozen):
     citations: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
-# Where a recurring passage's `text` comes from: the unit of the one holder document whose
-# date is strictly newer than every other holder's, the first holder in canonical order when
-# the holders and their dates do not show one (`arkive_rag.passages.word_candidates`), or the
-# holder a selection named because a curator note states which wording is current.
-WordingSource = Literal["newest_holder", "first_holder", "selected_holder"]
-
-
-class PassageVariant(_Frozen):
-    """Another holder's wording of a recurring passage, as it appears in `section_id` of a
-    document dated `doc_date_iso` (None when the document has no date)."""
-
-    section_id: str
-    doc_date_iso: str | None
-    text: str
-
-    @field_validator("doc_date_iso")
-    @classmethod
-    def _calendar_date(cls, value: str | None) -> str | None:
-        if value is not None and not is_date_iso(value):
-            raise ValueError(f"{value!r} is not a YYYY-MM-DD date or YYYY-MM month")
-        return value
-
-
-def _unique_citations(citations: tuple[str, ...]) -> None:
-    if len(set(citations)) != len(citations):
-        raise ValueError(f"citations repeat: {citations}")
-
-
 class StandingPassage(_Frozen):
-    """House text that recurs in exemplars of another project and applies to any deliverable
-    of the type as written. `text` is exactly as it appears in `source_section_id`; the
-    citations are every section that holds it, in canonical order."""
+    """A block of exemplar text, such as a method background, a reference entry or a
+    disclaimer, that recurs in another exemplar document and that the blueprint agent selected
+    as standing house content. `text` is exactly as it appears in the section `citations[0]`;
+    every other citation is a section of another exemplar document where it recurs."""
 
-    kind: Literal["standing"]
     label: str
     text: str
     citations: Annotated[tuple[str, ...], Field(min_length=2)]
-    source_section_id: str
-    wording_from: WordingSource
-
-    @model_validator(mode="after")
-    def _source_is_cited(self) -> Self:
-        _unique_citations(self.citations)
-        if self.source_section_id not in self.citations:
-            raise ValueError(f"source section {self.source_section_id!r} is not cited")
-        return self
-
-
-class ConditionalPassage(_Frozen):
-    """Recurring house wording that applies only when `condition` holds for the new
-    project, or whose wording names something that varies between projects. `variants` are
-    the other holders' wordings that differ from `text` after folding."""
-
-    kind: Literal["conditional"]
-    label: str
-    text: str
-    citations: Annotated[tuple[str, ...], Field(min_length=2)]
-    source_section_id: str
-    wording_from: WordingSource
-    condition: str
-    variants: tuple[PassageVariant, ...]
-
-    @model_validator(mode="after")
-    def _condition_and_sources_are_cited(self) -> Self:
-        _unique_citations(self.citations)
-        if not self.condition.strip():
-            raise ValueError("a conditional passage needs a condition")
-        sources = (self.source_section_id, *(v.section_id for v in self.variants))
-        uncited = [s for s in sources if s not in self.citations]
-        if uncited:
-            raise ValueError(f"source or variant sections {uncited} are not cited")
-        return self
-
-
-class SingleExemplarPassage(_Frozen):
-    """House text seen in one exemplar: a unit of the one cited section, whose heading path
-    is `heading_path`, exactly as it appears there."""
-
-    kind: Literal["single_exemplar"]
-    label: str
-    text: str
-    citations: Annotated[tuple[str, ...], Field(min_length=1, max_length=1)]
-    heading_path: str
-
-
-Passage = Annotated[
-    StandingPassage | ConditionalPassage | SingleExemplarPassage, Field(discriminator="kind")
-]
 
 
 class Blueprint(_Frozen):
     """How the corpus writes one recurring deliverable type. Outline, conventions and pitfalls
-    carry no project-specific values; passages are the only verbatim source text: recurring
-    ones in candidate order, then single-exemplar ones in nomination order."""
+    carry no project-specific values; standing passages are the only verbatim source text."""
 
     deliverable_type: str
     description: str
@@ -568,46 +409,7 @@ class Blueprint(_Frozen):
     outline: Annotated[tuple[BlueprintSection, ...], Field(min_length=1)]
     conventions: tuple[BlueprintGuidance, ...]
     pitfalls: tuple[BlueprintGuidance, ...]
-    passages: tuple[Passage, ...]
-
-
-# What the build did with each recurring candidate of a type, and with each unit it took
-# from a section the blueprint agent nominated as house matter.
-RecurringDisposition = Literal[
-    "selected_standing", "selected_conditional", "declined", "not_offered"
-]
-NominatedDisposition = Literal["nominated_kept", "nominated_dropped", "nominated_refused"]
-
-
-class RecurringCandidateRecord(_Frozen):
-    """A recurring candidate of `deliverable_type` and what became of it: `not_offered` when
-    the request's cap cut it, `declined` when the agent left it out. `text` is the wording
-    the request showed and a selected passage stores."""
-
-    deliverable_type: str
-    candidate_id: str
-    disposition: RecurringDisposition
-    citations: Annotated[tuple[str, ...], Field(min_length=2)]
-    text: str
-
-
-class NominatedUnitRecord(_Frozen):
-    """Unit `unit_ordinal` (1-based, among the section's text units) of a nominated house
-    section and the house-text check's verdict: kept, dropped below the support threshold,
-    or refused."""
-
-    deliverable_type: str
-    section_id: str
-    unit_ordinal: Annotated[int, Field(ge=1)]
-    disposition: NominatedDisposition
-    text: str
-
-    @property
-    def citations(self) -> tuple[str, ...]:
-        return (self.section_id,)
-
-
-CandidateRecord = RecurringCandidateRecord | NominatedUnitRecord
+    standing_passages: tuple[StandingPassage, ...]
 
 
 class BuildReport(_Frozen):
@@ -616,17 +418,14 @@ class BuildReport(_Frozen):
     The first three counts are the contracted reductions: observations discarded because
     their quote could not be located after one rerun, glossary definitions the support check
     did not confirm (stored as `definition=None`), and blueprint conventions or pitfalls it
-    did not confirm (dropped). The fourth, `passage_dispositions`, counts per deliverable type
-    what became of each recurring candidate and nominated house unit; units the house-text
-    check did not confirm (`nominated_dropped`) or refused (`nominated_refused`) are dropped.
-    `judge_refusals` counts support and binding questions the decision model refused, by
-    operation; `pruned_facet_values` and `pruned_facets` name what binding left empty.
+    did not confirm (dropped). `judge_refusals` counts support and binding questions the
+    decision model refused, by operation; `pruned_facet_values` and `pruned_facets` name what
+    binding left empty.
     """
 
     discarded_unlocated_quotes: int
     unsupported_definitions: int
     dropped_blueprint_statements: int
-    passage_dispositions: dict[str, dict[str, int]]
     judge_refusals: dict[str, int]
     pruned_facet_values: list[str]
     pruned_facets: list[str]
@@ -668,7 +467,6 @@ class CompiledDocument(_Frozen):
     format: SourceFormat
     title: str
     doc_date: str | None
-    date: DocumentDate | None
     deliverable_type: str
     summary: str
     # Facet name to the document's sorted values, in facet definition order.
@@ -693,9 +491,6 @@ class CompiledCorpus:
     facets: tuple[Facet, ...]
     glossary: tuple[GlossaryEntry, ...]
     blueprints: tuple[Blueprint, ...]
-    # Per blueprint, in blueprint order: recurring candidates in candidate order, then
-    # nominated units in nomination and unit order.
-    candidate_records: tuple[CandidateRecord, ...]
     build_settings: Mapping[str, Any]
     build_report: BuildReport
     documents: tuple[CompiledDocument, ...]
@@ -760,30 +555,17 @@ class TopicGuide(_Frozen):
 
 
 class DocumentInfo(_Frozen):
-    """`doc_date` is the date as printed, free text. `doc_date_iso` and `doc_date_basis` are
-    the document's `DocumentDate`, both None when it has none."""
-
     doc_id: str
     rel_path: str
     sha256: str
     format: str
     title: str
     doc_date: str | None
-    doc_date_iso: str | None
-    doc_date_basis: DateBasis | None
     deliverable_type: str
     summary: str
     page_count: int
     is_curator_note: bool
     facets: dict[str, list[str]]
-
-    @model_validator(mode="after")
-    def _date_with_its_basis(self) -> Self:
-        if (self.doc_date_iso is None) != (self.doc_date_basis is None):
-            raise ValueError("doc_date_iso and doc_date_basis must be both set or both None")
-        if self.doc_date_iso is not None and not is_date_iso(self.doc_date_iso):
-            raise ValueError(f"doc_date_iso {self.doc_date_iso!r} is not YYYY-MM-DD or YYYY-MM")
-        return self
 
 
 class SectionOutlineItem(_Frozen):

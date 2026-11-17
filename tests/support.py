@@ -45,12 +45,11 @@ from arkive_rag.models import (
     GlossaryEntryDraft,
     GuidanceDraft,
     GuideDraft,
-    HouseSectionNomination,
     ObservationDraft,
     OrganisationDraft,
     PageExtraction,
-    PassageSelection,
     SenseDraft,
+    StandingPassageSelection,
     StatedAttribute,
     TermDraft,
     fold_for_quote,
@@ -103,13 +102,10 @@ class FakeGateway:
     above. Organisation makes one path-bound facet from the top-level folders (named by a
     `Folders: <name>` line in a root curator note, else `project`), one content-bound facet per
     attribute with two or more values, and one deliverable type per observed type. The
-    blueprint agent calls the tools it is given and selects every passage candidate of its
-    request except `Key: value` lines (such as a `Convention:` line), labelled with the
-    heading of the candidate's first section: `conditional` when the candidate has variants,
-    else `standing`. It nominates as house sections the exemplar sections whose last heading
-    is one of `house_headings`. `judge` answers 0.1 to every predicate whose evidence ends
-    with one of `doubted` (a house-text question ends with the unit it judges); otherwise 0.9
-    when every double-quoted span of a predicate occurs in the evidence, else 0.1.
+    blueprint agent calls the tools it is given and selects every standing passage candidate
+    of its request except `Key: value` lines (such as a `Convention:` line), labelled with
+    the heading of the candidate's first section. `judge` answers 0.9 when every double-quoted
+    span of a predicate occurs in the evidence, else 0.1.
 
     Each `*_script` queues responses consumed before the deterministic answer. Every request
     is kept in `requests`, its operation name in `calls`, and judge questions in `judged`.
@@ -127,11 +123,7 @@ class FakeGateway:
         glossary_script: Sequence[GlossaryDraft] = (),
         blueprint_script: Sequence[BlueprintDraft] = (),
         guide_script: Sequence[str] = (),
-        house_headings: Sequence[str] = (),
-        doubted: Sequence[str] = (),
     ) -> None:
-        self.house_headings = tuple(house_headings)
-        self.doubted = tuple(doubted)
         self.page_script = list(page_script)
         self.observe_script = list(observe_script)
         self.organise_script = list(organise_script)
@@ -321,29 +313,15 @@ class FakeGateway:
         first = _call(tools["outline"], doc_id=dtype.exemplar_doc_ids[0])
         conventions = lines(dtype.exemplar_doc_ids, "Convention")
         pitfalls = lines(dtype.feedback_doc_ids, "Reviewer")
-        selected = []
-        for worded in request.candidates:
-            c = worded.candidate
-            if _KEY_LINE.fullmatch(c.text):
-                continue
-            label = generic_heading(
-                _call(tools["read_section"], section_id=c.citations[0])["heading_path"]
+        selected = [
+            StandingPassageSelection(
+                candidate_id=c.candidate_id,
+                label=generic_heading(
+                    _call(tools["read_section"], section_id=c.citations[0])["heading_path"]
+                ),
             )
-            varies = bool(worded.wording.variants)
-            selected.append(
-                PassageSelection(
-                    candidate_id=c.candidate_id,
-                    label=label,
-                    kind="conditional" if varies else "standing",
-                    condition=f"The project states its own {label.lower()}." if varies else None,
-                    holder_section_id=None,
-                )
-            )
-        nominated = [
-            HouseSectionNomination(section_id=s["section_id"], label=generic_heading(heading))
-            for doc_id in dtype.exemplar_doc_ids
-            for s in _call(tools["outline"], doc_id=doc_id)["sections"]
-            if (heading := s["heading_path"]).split(" > ")[-1] in self.house_headings
+            for c in request.standing_candidates
+            if not _KEY_LINE.fullmatch(c.text)
         ]
         return BlueprintDraft(
             description=f"How the collection writes a {dtype.name}.",
@@ -357,16 +335,13 @@ class FakeGateway:
             ],
             conventions=conventions,
             pitfalls=pitfalls,
-            passages=selected,
-            house_sections=nominated,
+            standing_passages=selected,
         )
 
     def judge(self, operation: str, evidence: str, predicates: Sequence[str]) -> list[float | None]:
         with self._lock:
             self.calls.append(operation)
             self.judged.append((operation, evidence, list(predicates)))
-        if self.doubted and evidence.endswith(self.doubted):
-            return [0.1] * len(predicates)
         haystack = fold_for_quote(evidence)
         return [
             0.9
@@ -583,11 +558,8 @@ class ScriptedOpenAI:
         )
 
 
-def write_pdf(
-    path: Path, pages: Sequence[Sequence[str]], *, creation_date: str | None = None
-) -> Path:
-    """Write a minimal Helvetica PDF with one text line per entry, and an info dictionary
-    holding `creation_date` (a PDF date string such as `D:20260219093000Z`) when given."""
+def write_pdf(path: Path, pages: Sequence[Sequence[str]]) -> Path:
+    """Write a minimal Helvetica PDF with one text line per entry."""
     objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b""]
     page_ids: list[int] = []
     font_id = 3
@@ -607,10 +579,6 @@ def write_pdf(
         page_ids.append(len(objects))
     kids = " ".join(f"{pid} 0 R" for pid in page_ids)
     objects[1] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode()
-    info = b""
-    if creation_date is not None:
-        objects.append(f"<< /CreationDate ({creation_date}) >>".encode("latin-1"))
-        info = b" /Info %d 0 R" % len(objects)
     body = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, obj in enumerate(objects, start=1):
@@ -619,18 +587,16 @@ def write_pdf(
     xref = len(body)
     body += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
     body += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
-    body += b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n" % (
+    body += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
         len(objects) + 1,
-        info,
         xref,
     )
     path.write_bytes(bytes(body))
     return path
 
 
-def write_docx(path: Path, paragraphs: Sequence[str], *, modified: str | None = None) -> Path:
-    """Write a minimal WordprocessingML document with one paragraph per entry, and core
-    properties whose `dcterms:modified` is `modified` (W3CDTF) when given."""
+def write_docx(path: Path, paragraphs: Sequence[str]) -> Path:
+    """Write a minimal WordprocessingML document with one paragraph per entry."""
     body = "".join(f"<w:p><w:r><w:t>{escape(text)}</w:t></w:r></w:p>" for text in paragraphs)
     ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
@@ -656,22 +622,7 @@ def write_docx(path: Path, paragraphs: Sequence[str], *, modified: str | None = 
             f'<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="{ns}">'
             f"<w:body>{body}</w:body></w:document>",
         )
-        if modified is not None:
-            archive.writestr("docProps/core.xml", core_properties(modified))
     return path
-
-
-def core_properties(modified: str) -> str:
-    """An Office `docProps/core.xml` with a template-like `created` and the given `modified`."""
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?><cp:coreProperties xmlns:cp='
-        '"http://schemas.openxmlformats.org/package/2006/metadata/core-properties"'
-        ' xmlns:dcterms="http://purl.org/dc/terms/"'
-        ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
-        '<dcterms:created xsi:type="dcterms:W3CDTF">2019-01-01T00:00:00Z</dcterms:created>'
-        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{modified}</dcterms:modified>'
-        "</cp:coreProperties>"
-    )
 
 
 def write_flat_presentation(path: Path, slides: Sequence[Sequence[str]]) -> Path:
@@ -751,36 +702,6 @@ MARKETING_CORPUS = {
         "# Spring Brief Review\n\nDeliverable: review notes\nChannel: Social\n"
         "Author: Sam Okafor\n\n## Comments\n\nReviewer: Cut the jargon from the opening line."
         "\n\nThe **CTA** was buried in paragraph three. The **ICP** was never named.\n"
-    ),
-}
-
-
-# Survey reports of three projects with printed dates. They share a standing sentence, word
-# for word; a reduction sentence whose last word changes with the project (the newest report's
-# wording wins, the older ones are its variants); and only the newest report has a data
-# handling section, house matter seen once.
-HOUSE_STANDARD = (
-    "Quillfen Geomatics carries out every survey under its quality manual and audit schedule."
-)
-REDUCTION = "Soundings are reduced to chart datum using the tide gauge records of the survey {}."
-DATA_HANDLING = (
-    "Raw sonar files stay in the studio archive for seven years after delivery, then are destroyed."
-)
-
-
-def survey_report(name: str, date: str, period: str, extra: str = "") -> str:
-    return (
-        f"# {name} Survey Report\n\nDeliverable: survey report\nDate: {date}\n\n"
-        f"## Method\n\n{HOUSE_STANDARD}\n\n{REDUCTION.format(period)}\n\n"
-        f"## Results\n\nThe {name.lower()} channel shoals by {len(name) / 10} m.\n{extra}"
-    )
-
-
-DATED_REPORTS = {
-    "p1-north/report.md": survey_report("North", "2024-03-01", "week"),
-    "p2-east/report.md": survey_report("East", "12 March 2025", "month"),
-    "p3-south/report.md": survey_report(
-        "South", "2026-01-20", "fortnight", f"\n## Data handling\n\n{DATA_HANDLING}\n"
     ),
 }
 

@@ -89,7 +89,6 @@ from tests.support import (
     response_body,
     structured_body,
     usage,
-    write_docx,
     write_pdf,
 )
 
@@ -158,8 +157,6 @@ def test_example_collection_packs_match_their_collections_and_hold_out_their_ref
                 format=source.format,
                 title=source.rel_path,
                 doc_date=None,
-                doc_date_iso=None,
-                doc_date_basis=None,
                 deliverable_type="unknown",
                 summary="",
                 page_count=0,
@@ -770,57 +767,14 @@ DRAFTING_OBLIGATIONS = {
         "comes only from the user's inputs",
         "comes only from the run notes",
     ),
-    "inputs_outrank_house_text": ("which outrank every passage", "which outrank all house wording"),
     "project_facts_take_precedence": ("This rule takes precedence", "This rule takes precedence"),
-    "standing_house_text_as_written": (
-        "Reproduce a standing passage as written",
-        "reproduce it as written",
-    ),
     "house_wording_as_written": (
         "keep their organisation names, method references and attributions as written",
-        "Keep its organisation names, method references and attributions as written",
-    ),
-    "project_part_adapted_from_inputs": (
-        "adapt or leave out only the part that belongs to one particular project",
-        "adapt or leave out only the part that belongs to one particular project",
-    ),
-    "conditional_only_when_inputs_establish_it": (
-        "only when the user's inputs establish its condition",
-        "only when the run notes establish that condition",
-    ),
-    "varying_part_from_inputs": (
-        "Take the part that varies from the inputs",
-        "Take the part that varies from the run notes",
-    ),
-    "no_result_the_inputs_do_not_give": (
-        "leave out any sentence of it that states a result the inputs do not give",
-        "leave out any sentence of it that states a result the run notes do not give",
-    ),
-    "unsettled_condition_left_out_without_note": (
-        "leave the passage out, with no note about it in the deliverable",
-        "leave it out, with no note about it in the deliverable",
-    ),
-    "single_exemplar_only_where_it_applies_and_its_section_matches": (
-        "only where it applies to the new project and the deliverable has a section with the"
-        " purpose of the section that holds it",
-        "only where it applies to the new project and the new deliverable has a section with"
-        " the purpose of the section that holds it",
-    ),
-    "single_exemplar_headings_not_copied": (
-        "Copy no heading text from its heading_path",
-        "Copy no heading of that section or of those above it",
-    ),
-    "variants_are_provenance": (
-        "variants are provenance, not alternatives to combine",
-        "the wordings are provenance, not alternatives to combine",
+        "keep its organisation names, method references and attributions as written",
     ),
     "corpus_wording_only_as_house_text": (
-        "Reuse other wording only from blueprint passages",
+        "Reuse other wording only from standing passages",
         "Reuse other wording, names, references and attributions from the documents only within",
-    ),
-    "corpus_names_only_inside_house_text": (
-        "may be reused only inside a blueprint passage of any kind",
-        "only within house wording of any of these kinds",
     ),
     "enumerations_in_full": ("list every item in full", "list every item in full"),
     "standalone": ("Write a standalone deliverable", "Write a standalone deliverable"),
@@ -835,27 +789,17 @@ SERVER_DRAFTING_RULES = """\
    - For each section whose layout matters, read one of its cited exemplar sections
      with read_section and mirror its heading levels and generic table column headers.
      Do not reuse project-specific headings or facts. Reuse other wording only from
-     blueprint passages.
+     standing passages.
    - Every fact about the user's project (its client and other parties, people, places,
      dates, quantities, budgets, targets, findings, identifiers, file names) comes only
-     from the user's inputs, which outrank every passage. This rule takes precedence
-     over the next ones.
-   - The blueprint's passages are the collection's own house text; use them without
-     commentary about where they come from, and keep their organisation names, method
-     references and attributions as written. In a passage of any kind, adapt or leave
-     out only the part that belongs to one particular project (its client, site, dates,
-     quantities or results), using the user's inputs.
-   - Reproduce a standing passage as written, apart from such a part.
-   - Include a conditional passage only when the user's inputs establish its condition.
-     Take the part that varies from the inputs, and leave out any sentence of it that
-     states a result the inputs do not give. When the inputs do not settle the
-     condition, leave the passage out, with no note about it in the deliverable.
-   - Include a single_exemplar passage only where it applies to the new project and
-     the deliverable has a section with the purpose of the section that holds it. Copy
-     no heading text from its heading_path.
-   - A passage's variants are provenance, not alternatives to combine.
-   - Names, references and attributions from the corpus may be reused only inside a
-     blueprint passage of any kind.
+     from the user's inputs. This rule takes precedence over the next one.
+   - The blueprint's standing passages are the collection's own house text. Reproduce
+     them with their wording, without commentary about where they come from, and keep
+     their organisation names, method references and attributions as written. Adapt or
+     leave out only the part of a passage that belongs to one particular project (its
+     client, site, dates, quantities or results), using the user's inputs. Names,
+     references and attributions from the corpus may be reused only when they appear in
+     a standing passage.
    - Where the user's inputs enumerate items (files, deliverables, parameters,
      results), list every item in full, never as patterns or "etc.".
    - Write a standalone deliverable: no Arkive doc_id or section_id, and no mention of
@@ -867,74 +811,22 @@ SERVER_DRAFTING_RULES = """\
 SERVER_DRAFTING_TOOL_DESCRIPTIONS = {
     "get_blueprint": (
         "The full writing blueprint for one deliverable type: section outline with cited\n"
-        "sections, conventions, reviewer pitfalls, exemplar and feedback documents, and\n"
-        "passages of the collection's house text, each exactly as in its source section.\n"
-        "Every fact about the user's project comes only from the user's inputs, which\n"
-        "outrank every passage: in any passage, adapt or leave out the part that belongs to\n"
-        "one particular project. By kind: reproduce a standing passage as written; include\n"
-        "a conditional passage only when the user's inputs establish its condition, taking\n"
-        "the varying part from the inputs, and otherwise leave it out with no note in the\n"
-        "deliverable; include a single_exemplar passage only where it applies to the new\n"
-        "project and the deliverable has a section of the same purpose as its own, copying\n"
-        "no heading text from its heading_path. Variants are provenance, not alternatives\n"
-        "to combine. The type matches ignoring case and surrounding spaces."
+        "exemplar sections, conventions, reviewer pitfalls, exemplar and feedback documents,\n"
+        "and standing passages: the collection's house text, which recurs in another exemplar\n"
+        "document, exactly as it appears in its first cited section. When drafting, keep a\n"
+        "passage's organisation names, method references and attributions as written, and\n"
+        "adapt only the part that belongs to one particular project. The type is matched\n"
+        "ignoring case and surrounding spaces."
     ),
     "read_section": (
         "Full Markdown of one section, with the IDs of its neighbouring sections.\n\n"
-        "When drafting, mirror an exemplar section's heading levels and generic table\n"
-        "column headers, but not its project-specific headings or facts. Reuse other\n"
-        "wording, names, references and attributions only inside the blueprint's passages:\n"
-        "standing ones as written, conditional ones only when the user's inputs establish\n"
-        "their condition, single_exemplar ones only where they apply to the new project and\n"
-        "the deliverable has a section of the same purpose. Every fact about the user's\n"
-        "project comes only from the user's inputs, which outrank every passage. Never cite\n"
-        "doc_id or section_id in the deliverable.\n"
+        "When drafting a new deliverable, mirror an exemplar section's heading levels and\n"
+        "generic table column headers, but not its project-specific headings or facts. Reuse\n"
+        "other wording, names, references and attributions only from the blueprint's standing\n"
+        "passages, which are house text kept as written apart from\n"
+        "their project-specific parts; take every fact about the user's project from the\n"
+        "user's inputs, and never cite doc_id or section_id in the deliverable.\n"
     ),
-}
-
-# The drafting obligations each tool description carries, sent with every turn: the phrase
-# that carries each one there.
-DESCRIPTION_OBLIGATIONS = {
-    "get_blueprint": {
-        "project_facts_from_inputs_only": (
-            "Every fact about the user's project comes only from the user's inputs"
-        ),
-        "inputs_outrank_house_text": "which outrank every passage",
-        "project_part_adapted_from_inputs": (
-            "adapt or leave out the part that belongs to one particular project"
-        ),
-        "standing_house_text_as_written": "reproduce a standing passage as written",
-        "conditional_only_when_inputs_establish_it": (
-            "only when the user's inputs establish its condition"
-        ),
-        "varying_part_from_inputs": "taking the varying part from the inputs",
-        "unsettled_condition_left_out_without_note": (
-            "otherwise leave it out with no note in the deliverable"
-        ),
-        "single_exemplar_only_where_it_applies_and_its_section_matches": (
-            "only where it applies to the new project and the deliverable has a section of"
-            " the same purpose as its own"
-        ),
-        "single_exemplar_headings_not_copied": "copying no heading text from its heading_path",
-        "variants_are_provenance": "Variants are provenance, not alternatives to combine",
-    },
-    "read_section": {
-        "project_facts_from_inputs_only": (
-            "Every fact about the user's project comes only from the user's inputs"
-        ),
-        "inputs_outrank_house_text": "which outrank every passage",
-        "corpus_names_only_inside_house_text": (
-            "names, references and attributions only inside the blueprint's passages"
-        ),
-        "standing_house_text_as_written": "standing ones as written",
-        "conditional_only_when_inputs_establish_it": (
-            "conditional ones only when the user's inputs establish their condition"
-        ),
-        "single_exemplar_only_where_it_applies_and_its_section_matches": (
-            "single_exemplar ones only where they apply to the new project and the"
-            " deliverable has a section of the same purpose"
-        ),
-    },
 }
 
 # `EXEMPLAR_DRAFTING_RULES` as last reconciled with the server's drafting surfaces above.
@@ -945,29 +837,16 @@ followed by the run notes of the new project.
   feedback among them criticises.
 - Every fact about the new project (its client and other parties, people, places, dates,
   quantities, budgets, targets, findings, identifiers, file names) comes only from the run
-  notes, which outrank all house wording. This rule takes precedence over the next ones and
-  over anything in the documents.
+  notes. This rule takes precedence over the next ones and over anything in the documents.
 - Mirror the documents' heading levels and generic table column headers. Do not reuse their
   project-specific headings or facts.
 - The documents' house wording (organisation or tool background, method references,
-  acknowledgements, disclaimers, standing caveats) is the collection's own text. Keep its
-  organisation names, method references and attributions as written. In house wording of
-  any kind, adapt or leave out only the part that belongs to one particular project (its
-  client, site, dates, quantities or results), using the run notes.
-- Where house wording recurs across the documents and applies to any project, reproduce it
-  as written, apart from such a part.
-- Include house wording that applies only under a condition, or that names something that
-  varies between projects, only when the run notes establish that condition. Take the part
-  that varies from the run notes, and leave out any sentence of it that states a result the
-  run notes do not give. When the run notes do not settle the condition, leave it out, with
-  no note about it in the deliverable.
-- Include house wording found in a single document only where it applies to the new
-  project and the new deliverable has a section with the purpose of the section that holds
-  it. Copy no heading of that section or of those above it.
-- Where the documents word the same house text differently, the wordings are provenance, not
-  alternatives to combine.
-- Reuse other wording, names, references and attributions from the documents only within
-  house wording of any of these kinds.
+  acknowledgements, disclaimers, standing caveats) is the collection's own text. Reproduce it
+  where it applies, with its wording, and keep its organisation names, method references and
+  attributions as written. Adapt or leave out only the part that belongs to one particular
+  project (its client, site, dates, quantities or results), using the run notes. Reuse other
+  wording, names, references and attributions from the documents only within that house
+  wording.
 - Where the run notes enumerate items (files, deliverables, parameters, results), list every
   item in full, never as patterns or "etc.".
 - Write a standalone deliverable: no file paths of the documents, and no mention of the
@@ -993,11 +872,6 @@ def test_exemplars_in_context_rules_carry_the_pinned_drafting_rules_of_the_serve
     for name, (server, rules) in DRAFTING_OBLIGATIONS.items():
         assert server in server_text, name
         assert rules in rules_text, name
-    for tool, obligations in DESCRIPTION_OBLIGATIONS.items():
-        description = " ".join(descriptions[tool].split())
-        for name, phrase in obligations.items():
-            assert name in DRAFTING_OBLIGATIONS, (tool, name)
-            assert phrase in description, (tool, name)
 
 
 def write_corpus(root: Path, files: dict[str, str | bytes]) -> Path:
@@ -1030,8 +904,6 @@ def reference_doc(**overrides: Any) -> DocumentInfo:
         "format": "md",
         "title": "Estuary Proposal",
         "doc_date": None,
-        "doc_date_iso": None,
-        "doc_date_basis": None,
         "deliverable_type": "proposal",
         "summary": "Estuary proposal.",
         "page_count": 1,
@@ -2418,7 +2290,7 @@ def snapshot_with(
     corpus.mkdir(parents=True)
     for rel_path in word_files:
         (corpus / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        write_docx(corpus / rel_path, ["Converted Word notes"])
+        (corpus / rel_path).write_bytes(b"word document bytes")
     pdf = write_pdf(root / "converted.pdf", [["Converted Word notes"]]).read_bytes()
     with monkeypatch.context() as patched:
         patched.setattr(compiler, "convert_office_to_pdf", lambda *args: pdf)

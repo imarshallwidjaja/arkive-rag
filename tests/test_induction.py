@@ -15,8 +15,6 @@ from arkive_rag import induction
 from arkive_rag.compiler import compile_corpus
 from arkive_rag.induction import (
     EVIDENCE_WINDOW_CHARS,
-    HOUSE_TEXT_OPERATION,
-    HOUSE_TEXT_PREDICATE,
     MAX_DELIVERABLE_TYPES,
     Checked,
     CorpusView,
@@ -39,7 +37,6 @@ from arkive_rag.models import (
     BlueprintDraft,
     BlueprintSectionDraft,
     CompiledCorpus,
-    ConditionalPassage,
     CorpusDocument,
     DeliverableTypeDraft,
     DocumentReading,
@@ -47,36 +44,18 @@ from arkive_rag.models import (
     FacetValueDraft,
     GlossaryDraft,
     GlossaryEntryDraft,
-    GuidanceDraft,
-    HouseSectionNomination,
-    NominatedUnitRecord,
     NotFoundError,
     ObservationCard,
     OrganisationDraft,
-    PassageSelection,
-    PassageVariant,
-    ProviderError,
     ReadSection,
-    RecurringCandidateRecord,
-    RecurringKind,
     RejectedOutputError,
     SenseDraft,
-    SingleExemplarPassage,
-    StandingPassage,
+    StandingPassageSelection,
     TermObservation,
 )
-from arkive_rag.passages import standing_candidates, word_candidates
+from arkive_rag.passages import standing_candidates
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
-from tests.support import (
-    BATHYMETRY_CORPUS,
-    DATA_HANDLING,
-    DATED_REPORTS,
-    HOUSE_DISCLOSURE,
-    HOUSE_STANDARD,
-    MARKETING_CORPUS,
-    REDUCTION,
-    FakeGateway,
-)
+from tests.support import BATHYMETRY_CORPUS, HOUSE_DISCLOSURE, MARKETING_CORPUS, FakeGateway
 
 
 def compile_files(
@@ -179,9 +158,6 @@ BROKEN = organisation(
             exemplar_doc_ids=["doc_001", "doc_002"],
             feedback_doc_ids=["doc_002"],
         ),
-        DeliverableTypeDraft(
-            name="  ", description="Nothing.", exemplar_doc_ids=["doc_001"], feedback_doc_ids=[]
-        ),
     ],
 )
 
@@ -200,8 +176,6 @@ def test_structurally_invalid_organisation_is_rerun_once_then_raises(tmp_path: P
     assert "unknown document ID 'doc_009'" in message
     # A feedback document of a type must not also supply its exemplar text.
     assert "'proposal': 'doc_002' is both an exemplar and a feedback document" in message
-    # A snapshot resolves a type by its fold, so a type that folds to nothing names nothing.
-    assert "deliverable type '  ' is blank" in message
     first, rerun = gateway.of_type(OrganiseCorpus)
     assert first.feedback is None and rerun.feedback is not None and "doc_009" in rerun.feedback
     assert "'doc_002' is both an exemplar and a feedback document" in rerun.feedback
@@ -553,7 +527,6 @@ def reading(markdowns: Sequence[str], terms: Sequence[TermObservation]) -> Docum
             terms=tuple(terms),
             craft=(),
         ),
-        date=None,
         discarded_quotes=0,
     )
 
@@ -651,15 +624,16 @@ def test_blueprints_cite_resolvable_sections_and_exemplars(tmp_path: Path) -> No
     # Both briefs share the convention line and the disclosure; the fake leaves the
     # `Convention:` line unselected. The single review-notes exemplar has no candidates.
     request, review_request = gateway.of_type(WriteBlueprint)
-    text = request.text()
-    assert "[candidate_01] found in doc_002_sec_003, doc_003_sec_003;" in text
-    assert "[candidate_02] found in doc_002_sec_004, doc_003_sec_004;" in text
-    assert "[candidate_03]" not in text
-    (disclosure,) = brief.passages
-    assert (disclosure.kind, disclosure.label) == ("standing", "Disclosure")
+    assert [(c.candidate_id, c.citations) for c in request.standing_candidates] == [
+        ("candidate_01", ("doc_002_sec_003", "doc_003_sec_003")),
+        ("candidate_02", ("doc_002_sec_004", "doc_003_sec_004")),
+    ]
+    (disclosure,) = brief.standing_passages
+    assert disclosure.label == "Disclosure"
     assert disclosure.text == HOUSE_DISCLOSURE.split("\n\n")[1].strip()
     assert disclosure.citations == ("doc_002_sec_004", "doc_003_sec_004")
-    assert review.passages == ()
+    assert "[candidate_02] found in doc_002_sec_004, doc_003_sec_004" in request.text()
+    assert review.standing_passages == () and review_request.standing_candidates == ()
     assert "(none: this type has one exemplar document" in review_request.text()
     assert corpus.build_report.dropped_blueprint_statements == 0
     # The agent run used its tools; its cache identity covers everything they can read.
@@ -727,8 +701,8 @@ def test_blueprint_guidance_the_judge_does_not_support_is_dropped_and_counted(
     brief = corpus.blueprints[0]
     assert (brief.conventions, brief.pitfalls) == ((), ())
     assert brief.outline
-    # Only the unsupported convention and pitfall count; recurring passages are never dropped.
-    assert brief.passages
+    # Only the unsupported convention and pitfall count; standing passages are never dropped.
+    assert brief.standing_passages
     assert corpus.build_report.dropped_blueprint_statements == 2
 
 
@@ -738,8 +712,7 @@ def test_a_blueprint_with_an_empty_outline_fails_after_one_rerun(tmp_path: Path)
         outline=[],
         conventions=[],
         pitfalls=[],
-        passages=[],
-        house_sections=[],
+        standing_passages=[],
     )
     gateway = FakeGateway(blueprint_script=[empty, empty])
 
@@ -768,7 +741,7 @@ def candidate_view(*docs: tuple[str, Sequence[str]]) -> CorpusView:
 def test_the_blueprint_request_says_why_it_lists_no_candidates() -> None:
     def request(*exemplars: str) -> str:
         dtype = DeliverableType("memo", "A memo.", exemplars, ())
-        return WriteBlueprint(dtype, (), (), (), (), (), 0, (), "0" * 64).text()
+        return WriteBlueprint(dtype, (), (), (), (), 0, (), "0" * 64).text()
 
     assert "(none: this type has one exemplar document" in request("doc_001")
     assert "(none: no block of this type's exemplars recurs" in request("doc_001", "doc_002")
@@ -788,8 +761,7 @@ def test_candidates_beyond_the_cap_keep_those_in_the_most_documents_and_the_requ
         ("p1/a.md", sentences), ("p2/b.md", sentences), ("p3/c.md", sentences[-2:])
     )
     exemplars = ("doc_001", "doc_002", "doc_003")
-    documents = exemplar_documents(view, exemplars)
-    found = standing_candidates(documents)
+    found = standing_candidates(exemplar_documents(view, exemplars))
 
     offered = induction.offered_candidates(view, found)
 
@@ -798,25 +770,13 @@ def test_candidates_beyond_the_cap_keep_those_in_the_most_documents_and_the_requ
         f"candidate_{n:02d}" for n in (*range(1, 59), 60, 61)
     ]
     dtype = DeliverableType("terms", "Terms.", exemplars, ())
-    worded = word_candidates(documents, offered)
-
-    cut = WriteBlueprint(dtype, (), (), (), (), worded, len(found), (), "0" * 64)
-    assert "(this list was cut from 61 candidates to the 60 that recur in the most" in cut.text()
-    whole = WriteBlueprint(dtype, (), (), (), (), worded, 60, (), "0" * 64)
-    assert "was cut" not in whole.text()
+    cut = WriteBlueprint(dtype, (), (), (), offered, len(found), (), "0" * 64).text()
+    assert "(this list was cut from 61 candidates to the 60 that recur in the most" in cut
+    whole = WriteBlueprint(dtype, (), (), (), found[:60], 60, (), "0" * 64).text()
+    assert "was cut" not in whole
 
 
-Selection = (
-    tuple[str, str]
-    | tuple[str, str, RecurringKind, str | None]
-    | tuple[str, str, RecurringKind, str | None, str]
-)
-
-
-def selecting(*selections: Selection, house: Sequence[tuple[str, str]] = ()) -> BlueprintDraft:
-    """A blueprint answer selecting `(candidate_id, label)` as standing, or with an explicit
-    kind and condition and optionally the holder section whose wording to take, and
-    nominating `(section_id, label)` house sections."""
+def selecting(*selections: tuple[str, str]) -> BlueprintDraft:
     return BlueprintDraft(
         description="A brief.",
         outline=[
@@ -824,21 +784,13 @@ def selecting(*selections: Selection, house: Sequence[tuple[str, str]] = ()) -> 
         ],
         conventions=[],
         pitfalls=[],
-        passages=[
-            PassageSelection(
-                candidate_id=s[0],
-                label=s[1],
-                kind=s[2] if len(s) >= 4 else "standing",
-                condition=s[3] if len(s) >= 4 else None,
-                holder_section_id=s[4] if len(s) == 5 else None,
-            )
-            for s in selections
+        standing_passages=[
+            StandingPassageSelection(candidate_id=i, label=label) for i, label in selections
         ],
-        house_sections=[HouseSectionNomination(section_id=i, label=label) for i, label in house],
     )
 
 
-def test_unknown_or_repeated_passage_selections_and_nominations_are_rerun_then_rejected(
+def test_unknown_or_repeated_standing_passage_selections_are_rerun_then_rejected(
     tmp_path: Path,
 ) -> None:
     bad = selecting(
@@ -846,15 +798,6 @@ def test_unknown_or_repeated_passage_selections_and_nominations_are_rerun_then_r
         ("candidate_02", "A"),
         ("candidate_02", "B"),
         ("candidate_01", "  "),
-        # doc_001 is the curator note and doc_004 the feedback document: neither is an
-        # exemplar of the campaign brief.
-        house=[
-            ("doc_001_sec_001", "Library"),
-            ("doc_004_sec_002", "Comments"),
-            ("doc_002_sec_002", "Audience"),
-            ("doc_002_sec_002", "Again"),
-            ("doc_003_sec_002", " "),
-        ],
     )
     good = selecting(("candidate_02", "Disclosure"))
     gateway = FakeGateway(blueprint_script=[bad, good])
@@ -866,527 +809,12 @@ def test_unknown_or_repeated_passage_selections_and_nominations_are_rerun_then_r
     assert "'candidate_09' is not a listed candidate_id" in rerun.feedback
     assert "'candidate_02' is selected twice" in rerun.feedback
     assert "'candidate_01' has a blank label" in rerun.feedback
-    for section_id in ("doc_001_sec_001", "doc_004_sec_002"):
-        assert (
-            f"house section {section_id!r} is not a section of an exemplar document of this type"
-            in rerun.feedback
-        )
-    assert "house section 'doc_002_sec_002' is listed twice" in rerun.feedback
-    assert "house section 'doc_003_sec_002' has a blank label" in rerun.feedback
-    (passage,) = corpus.blueprints[0].passages
+    (passage,) = corpus.blueprints[0].standing_passages
     assert passage.label == "Disclosure"
     assert passage.text == HOUSE_DISCLOSURE.split("\n\n")[1].strip()
-    # The convention line the answer left out is declined.
-    assert [
-        (r.candidate_id, r.disposition)
-        for r in corpus.candidate_records
-        if isinstance(r, RecurringCandidateRecord)
-    ] == [("candidate_01", "declined"), ("candidate_02", "selected_standing")]
     stubborn = FakeGateway(blueprint_script=[bad, bad])
     with pytest.raises(RejectedOutputError, match="'candidate_09' is not a listed candidate_id"):
         compile_files(tmp_path / "stubborn", MARKETING_CORPUS, stubborn)
-
-
-# Survey report sections in `DATED_REPORTS`: _001 the title block, _002 Method, _003 Results,
-# and _004 Data handling, which only the newest report has.
-NOTE = "# Reports\n\nThe layout with a data handling section is the current one."
-
-
-def test_the_blueprint_request_carries_curator_notes_dates_wordings_and_variants(
-    tmp_path: Path,
-) -> None:
-    gateway = FakeGateway()
-
-    compile_files(tmp_path / "dated", {"AGENTS.md": NOTE, **DATED_REPORTS}, gateway)
-
-    (request,) = gateway.of_type(WriteBlueprint)
-    text = request.text()
-    # Notes travel in the request as stated intent; the agent may not cite them.
-    assert f"CURATOR NOTES (stated intent; never cite them):\n### AGENTS.md\n{NOTE}\n\n" in text
-    assert "a note is not\na source" in WriteBlueprint.instructions
-    assert "outranks dates" in WriteBlueprint.instructions
-    # Each exemplar outline carries its document's date and the date's basis.
-    for doc_id, name, date in (
-        ("doc_002", "North", "2024-03-01"),
-        ("doc_003", "East", "2025-03-12"),
-        ("doc_004", "South", "2026-01-20"),
-    ):
-        assert f"{doc_id}: {name} Survey Report\nDate: {date} (printed)\n" in text
-    # Every candidate shows the wording a passage would store and why; the reduction sentence
-    # also shows the older holders' wordings with their dates.
-    holders = "found in doc_002_sec_002, doc_003_sec_002, doc_004_sec_002; wording from"
-    assert (
-        f"[candidate_01] {holders} doc_004_sec_002 (the newest dated holder)\n{HOUSE_STANDARD}"
-        f"\n\n[candidate_02] {holders} doc_004_sec_002 (the newest dated holder)\n"
-        f"{REDUCTION.format('fortnight')}\n"
-        f"Variant in doc_002_sec_002 (2024-03-01, printed):\n{REDUCTION.format('week')}\n"
-        f"Variant in doc_003_sec_002 (2025-03-12, printed):\n{REDUCTION.format('month')}"
-    ) in text
-    # Without dates no order is claimed, and the request says so.
-    undated = FakeGateway()
-    compile_files(tmp_path / "undated", MARKETING_CORPUS, undated)
-    brief_request = undated.of_type(WriteBlueprint)[0]
-    assert "doc_002: Loyalty Relaunch Brief\nDate: none known\n" in brief_request.text()
-    assert (
-        "wording from doc_002_sec_004 (the first holder, because the holders' dates do not show"
-        " which is newest)"
-    ) in brief_request.text()
-    # A note is not a source: an outline citing it is rejected and rerun.
-    cites_note = selecting().model_copy(
-        update={
-            "outline": [
-                BlueprintSectionDraft(heading="Notes", purpose="?", citations=["doc_001_sec_001"])
-            ]
-        }
-    )
-    stubborn = FakeGateway(blueprint_script=[cites_note, cites_note])
-    with pytest.raises(RejectedOutputError, match="'doc_001_sec_001' is not a citable section"):
-        compile_files(tmp_path / "cites-note", {"AGENTS.md": NOTE, **DATED_REPORTS}, stubborn)
-
-
-CONDITION = "The project names the period whose tide gauge records reduce its soundings."
-
-
-def test_a_selection_is_standing_or_conditional_and_only_a_conditional_one_has_a_condition(
-    tmp_path: Path,
-) -> None:
-    bad = selecting(
-        ("candidate_01", "Standard", "conditional", "  "),
-        ("candidate_02", "Reduction", "standing", CONDITION),
-    )
-    good = selecting(
-        ("candidate_01", "Standard", "standing", ""),
-        ("candidate_02", "Reduction", "conditional", CONDITION),
-    )
-    gateway = FakeGateway(blueprint_script=[bad, good])
-
-    corpus = compile_files(tmp_path / "rerun", DATED_REPORTS, gateway)
-
-    rerun = gateway.of_type(WriteBlueprint)[1].feedback
-    assert rerun is not None
-    # The standard sentence has no variants, so it may be made standing instead.
-    assert (
-        "passage 'candidate_01' is conditional without a condition; state the fact of the new"
-        " project that makes it apply and the part that varies, or make it standing"
-    ) in rerun
-    assert "passage 'candidate_02' is standing but has a condition" in rerun
-    standard, reduction = corpus.blueprints[0].passages
-    assert standard == StandingPassage(
-        kind="standing",
-        label="Standard",
-        text=HOUSE_STANDARD,
-        citations=("doc_001_sec_002", "doc_002_sec_002", "doc_003_sec_002"),
-        source_section_id="doc_003_sec_002",
-        wording_from="newest_holder",
-    )
-    assert reduction == ConditionalPassage(
-        kind="conditional",
-        label="Reduction",
-        text=REDUCTION.format("fortnight"),
-        citations=("doc_001_sec_002", "doc_002_sec_002", "doc_003_sec_002"),
-        source_section_id="doc_003_sec_002",
-        wording_from="newest_holder",
-        condition=CONDITION,
-        variants=(
-            PassageVariant(
-                section_id="doc_001_sec_002",
-                doc_date_iso="2024-03-01",
-                text=REDUCTION.format("week"),
-            ),
-            PassageVariant(
-                section_id="doc_002_sec_002",
-                doc_date_iso="2025-03-12",
-                text=REDUCTION.format("month"),
-            ),
-        ),
-    )
-    # The provider schema parses a mismatch, so it reaches the rerun above instead of failing
-    # as malformed output.
-    parsed = BlueprintDraft.model_validate_json(bad.model_dump_json())
-    assert parsed.passages[0].kind == "conditional"
-    stubborn = FakeGateway(blueprint_script=[bad, bad])
-    with pytest.raises(RejectedOutputError, match="conditional without a condition"):
-        compile_files(tmp_path / "stubborn", DATED_REPORTS, stubborn)
-    # The reduction sentence has variants, so it cannot be standing: the rejection offers
-    # stating the condition or leaving it out.
-    unstated = selecting(("candidate_02", "Reduction", "conditional", None))
-    varied = FakeGateway(blueprint_script=[unstated, unstated])
-    with pytest.raises(RejectedOutputError) as raised:
-        compile_files(tmp_path / "varied", DATED_REPORTS, varied)
-    assert (
-        "passage 'candidate_02' is conditional without a condition; state the fact of the new"
-        " project that makes it apply and the part that varies, or leave it out"
-    ) in str(raised.value)
-    assert "make it standing" not in str(raised.value)
-
-
-def test_a_candidate_its_holders_word_differently_cannot_be_standing(tmp_path: Path) -> None:
-    # The reduction sentence has variants: its holders word it differently.
-    standing = selecting(("candidate_01", "Standard"), ("candidate_02", "Reduction"))
-    gateway = FakeGateway(blueprint_script=[standing, standing])
-
-    with pytest.raises(RejectedOutputError) as raised:
-        compile_files(tmp_path, DATED_REPORTS, gateway)
-
-    assert (
-        "passage 'candidate_02' is standing, but its holders word it differently (it has"
-        " variants); make it conditional with a condition, or leave it out"
-    ) in str(raised.value)
-    assert "'candidate_01'" not in str(raised.value)
-    assert (
-        "A candidate listed with variants is worded differently by its holders, so it cannot be"
-        " standing."
-    ) in " ".join(WriteBlueprint.instructions.split())
-
-
-def test_a_curator_note_can_choose_which_holders_wording_a_passage_stores(
-    tmp_path: Path,
-) -> None:
-    note = "# Reports\n\nThe East report's wording of the reduction method is the current one."
-    files = {"AGENTS.md": note, **DATED_REPORTS}
-    # With the note, doc_001 is the note and the reports are doc_002 (North), doc_003 (East)
-    # and doc_004 (South).
-    bad = selecting(
-        ("candidate_01", "Standard", "standing", None, "doc_003_sec_003"),
-        ("candidate_02", "Reduction", "conditional", CONDITION, "doc_003_sec_009"),
-    )
-    good = selecting(("candidate_02", "Reduction", "conditional", CONDITION, "doc_003_sec_002"))
-    gateway = FakeGateway(blueprint_script=[bad, good])
-
-    corpus = compile_files(tmp_path / "corpus", files, gateway)
-
-    rerun = gateway.of_type(WriteBlueprint)[1].feedback
-    assert rerun is not None
-    for cid, section_id in (
-        ("candidate_01", "doc_003_sec_003"),
-        ("candidate_02", "doc_003_sec_009"),
-    ):
-        assert (
-            f"passage {cid!r}: holder_section_id {section_id!r} is not a section that holds"
-            f" {cid}; name a section it is found in that holds it in one unit"
-        ) in rerun
-    (reduction,) = corpus.blueprints[0].passages
-    assert reduction == ConditionalPassage(
-        kind="conditional",
-        label="Reduction",
-        text=REDUCTION.format("month"),
-        citations=("doc_002_sec_002", "doc_003_sec_002", "doc_004_sec_002"),
-        source_section_id="doc_003_sec_002",
-        wording_from="selected_holder",
-        condition=CONDITION,
-        variants=(
-            PassageVariant(
-                section_id="doc_002_sec_002",
-                doc_date_iso="2024-03-01",
-                text=REDUCTION.format("week"),
-            ),
-            PassageVariant(
-                section_id="doc_004_sec_002",
-                doc_date_iso="2026-01-20",
-                text=REDUCTION.format("fortnight"),
-            ),
-        ),
-    )
-    assert "holder_section_id is null, unless a curator note states which wording" in (
-        WriteBlueprint.instructions
-    )
-    # Only null means no choice: a blank holder is rejected and rerun.
-    blank = selecting(("candidate_02", "Reduction", "conditional", CONDITION, " \t"))
-    stubborn = FakeGateway(blueprint_script=[blank, blank])
-    with pytest.raises(
-        RejectedOutputError, match="passage 'candidate_02' has a blank holder_section_id"
-    ):
-        compile_files(tmp_path / "blank", files, stubborn)
-    # The snapshot stores and serves the chosen wording.
-    write_snapshot(corpus, tmp_path / "t.arkive.db")
-    with TopicSnapshot.open(tmp_path / "t.arkive.db") as snap:
-        assert snap.blueprints[0].passages == (reduction,)
-
-
-# Three dated reports: the newest one's sentence says the same as each older one, but the two
-# older ones do not say the same as each other, so they are two candidates both held by it.
-SHARED_NEWEST = (
-    "Every survey we deliver is reduced to the stated vertical datum, checked against an"
-    " independent crossline, reviewed by a second surveyor and archived with its raw files"
-    " for seven years."
-)
-SHARED_EARLY = SHARED_NEWEST.replace("stated", "declared")
-SHARED_LATE = SHARED_NEWEST.replace("raw", "source")
-
-
-def test_two_candidates_held_by_the_newest_unit_store_two_wordings(tmp_path: Path) -> None:
-    files = {
-        f"p{n}/report.md": (
-            f"# {name} Report\n\nDeliverable: survey report\nDate: {date}\n\n## Method\n\n{text}\n"
-        )
-        for n, (name, date, text) in enumerate(
-            (
-                ("North", "2024-03-01", SHARED_EARLY),
-                ("East", "2025-03-01", SHARED_LATE),
-                ("South", "2026-03-01", SHARED_NEWEST),
-            ),
-            start=1,
-        )
-    }
-    gateway = FakeGateway()
-
-    corpus = compile_files(tmp_path, files, gateway)
-
-    # The first candidate takes the newest report's unit; the second keeps its own wording.
-    assert [p.text for p in corpus.blueprints[0].passages] == [SHARED_NEWEST, SHARED_LATE]
-    (request,) = gateway.of_type(WriteBlueprint)
-    assert (
-        "[candidate_02] found in doc_002_sec_002, doc_003_sec_002; wording from doc_002_sec_002"
-        " (the first holder, because the newest holder's wording is already another"
-        f" candidate's)\n{SHARED_LATE}\n"
-    ) in request.text()
-    # A selection that names the newest holder for the second candidate too is rerun.
-    both_newest = selecting(
-        ("candidate_01", "Datum", "conditional", "The project names its datum."),
-        (
-            "candidate_02",
-            "Archive",
-            "conditional",
-            "The project names its archive.",
-            "doc_003_sec_002",
-        ),
-    )
-    stubborn = FakeGateway(blueprint_script=[both_newest, both_newest])
-    with pytest.raises(RejectedOutputError, match="passage 'candidate_02' would store the same"):
-        compile_files(tmp_path / "stubborn", files, stubborn)
-    # A fourth project holds the newest wording too. The second candidate's chosen holder is
-    # another section than the first candidate's wording, but the wording is the same, and
-    # the later candidate in candidate order is told to change, whatever the answer's order.
-    four = {
-        **files,
-        "p4/report.md": files["p3/report.md"].replace("South", "West").replace("2026", "2027"),
-    }
-    chosen_twice = selecting(
-        (
-            "candidate_02",
-            "Archive",
-            "conditional",
-            "The project names its archive.",
-            "doc_003_sec_002",
-        ),
-        ("candidate_01", "Datum", "conditional", "The project names its datum."),
-    )
-    stubborn = FakeGateway(blueprint_script=[chosen_twice, chosen_twice])
-    with pytest.raises(
-        RejectedOutputError,
-        match="passage 'candidate_02' would store the same wording as passage 'candidate_01'",
-    ):
-        compile_files(tmp_path / "four", four, stubborn)
-
-
-def test_guidance_cites_only_the_types_own_exemplar_and_feedback_sections(
-    tmp_path: Path,
-) -> None:
-    # doc_002 and doc_003 are the campaign brief's exemplars and doc_004 its feedback
-    # document; doc_004 is also the review notes' only exemplar, and they have no feedback.
-    def citing(section_id: str) -> BlueprintDraft:
-        return selecting().model_copy(
-            update={
-                "outline": [
-                    BlueprintSectionDraft(heading="Notes", purpose="?", citations=[section_id])
-                ],
-                "conventions": [GuidanceDraft(statement="Be brief.", citations=[section_id])],
-                "pitfalls": [GuidanceDraft(statement="Jargon.", citations=[section_id])],
-            }
-        )
-
-    # Outline items, conventions and pitfalls may all cite the type's feedback document, and
-    # none may cite another type's exemplar.
-    brief, review = citing("doc_004_sec_002"), citing("doc_002_sec_002")
-    gateway = FakeGateway(blueprint_script=[brief, review, review])
-
-    with pytest.raises(RejectedOutputError, match="blueprint for 'review notes'") as raised:
-        compile_files(tmp_path, MARKETING_CORPUS, gateway)
-
-    requests = gateway.of_type(WriteBlueprint)
-    assert [(r.deliverable_type.name, r.feedback is None) for r in requests] == [
-        ("campaign brief", True),
-        ("review notes", True),
-        ("review notes", False),
-    ]
-    for kind, label in (("outline", "Notes"), ("convention", "Be brief."), ("pitfall", "Jargon.")):
-        assert (
-            f"{kind} {label!r}: 'doc_002_sec_002' is not a section of this type's exemplar or"
-            " feedback documents"
-        ) in str(raised.value)
-
-
-def test_code_takes_a_nominated_sections_units_except_short_recurring_or_overlapping_ones(
-    tmp_path: Path,
-) -> None:
-    candidate = "Every survey is checked against the house quality manual before it ships."
-    shared_in_project = "The project team archives field sheets with the crew lead every evening."
-    genuine = "Personal data collected on site is deleted thirty days after the final report."
-    policy = (
-        "## Policy\n\n"
-        f"{candidate} Clients may ask for the manual at any time during the project.\n\n"
-        f"{shared_in_project}\n\n"
-        "Short policy line here.\n\n"
-        "| Policy | Owner |\n| --- | --- |\n| Data | Studio |\n\n"
-        f"{genuine}\n"
-    )
-    # Recurrence for candidates needs another project folder, so text shared within p1 is no
-    # candidate, but a nominated unit another document holds is still not single-exemplar.
-    files = {
-        "p1/a.md": (
-            f"# A\n\nDeliverable: memo\n\n## Quality\n\n{candidate}\n\n{shared_in_project}\n"
-        ),
-        "p1/b.md": f"# B\n\nDeliverable: memo\n\n## Quality\n\n{candidate}\n\n{policy}",
-        "p2/c.md": f"# C\n\nDeliverable: memo\n\n## Quality\n\n{candidate}\n",
-    }
-    gateway = FakeGateway(house_headings=("Policy",))
-
-    corpus = compile_files(tmp_path, files, gateway)
-
-    (recurring,) = [r for r in corpus.candidate_records if isinstance(r, RecurringCandidateRecord)]
-    assert recurring.text == candidate
-    # The first unit overlaps the recurring candidate; the second is held by p1/a.md; the
-    # third is short; the fourth is a table header. Only the fifth is taken.
-    nominated = [r for r in corpus.candidate_records if isinstance(r, NominatedUnitRecord)]
-    assert nominated == [
-        NominatedUnitRecord(
-            deliverable_type="memo",
-            section_id="doc_002_sec_003",
-            unit_ordinal=5,
-            disposition="nominated_kept",
-            text=genuine,
-        )
-    ]
-    house = corpus.blueprints[0].passages[-1]
-    assert house == SingleExemplarPassage(
-        kind="single_exemplar",
-        label="Policy",
-        text=genuine,
-        citations=("doc_002_sec_003",),
-        heading_path="B > Policy",
-    )
-
-
-class HouseJudge(FakeGateway):
-    """Answers the house-text check by the unit it judges: `answers` maps a unit's text to a
-    probability, None for a refusal, or an exception to raise."""
-
-    def __init__(self, answers: dict[str, float | Exception | None], **kwargs: Any) -> None:
-        super().__init__(house_headings=("Data handling",), **kwargs)
-        self.answers = answers
-
-    def judge(self, operation: str, evidence: str, predicates: Sequence[str]) -> list[float | None]:
-        answers = super().judge(operation, evidence, predicates)
-        if operation != HOUSE_TEXT_OPERATION:
-            return answers
-        answer = self.answers[evidence.split("THIS TEXT:\n")[1]]
-        if isinstance(answer, Exception):
-            raise answer
-        return [answer]
-
-
-def test_the_house_text_check_judges_each_unit_in_its_whole_section_and_drops_the_rest(
-    tmp_path: Path,
-) -> None:
-    kept, dropped, refused = (
-        DATA_HANDLING,
-        "Sonar files for the South channel survey were handed to the client on 20 January.",
-        "Survey crews log each archive transfer in the studio register before they leave.",
-    )
-    section = f"## Data handling\n\n{kept}\n\n{dropped}\n\n{refused}\n"
-    files = dict(DATED_REPORTS)
-    files["p3-south/report.md"] = files["p3-south/report.md"].replace(
-        f"## Data handling\n\n{DATA_HANDLING}\n", section
-    )
-    gateway = HouseJudge({kept: 0.9, dropped: 0.2, refused: None})
-
-    corpus = compile_files(tmp_path / "judged", files, gateway)
-
-    judged = [(e, p) for op, e, p in gateway.judged if op == HOUSE_TEXT_OPERATION]
-    # One question per unit, in one window holding the document's card as binding sees it,
-    # the heading path, the whole section and the unit itself; the question covers any
-    # project, not only the one the document reports.
-    assert len(judged) == 3
-    assert "whether the one this document reports or an earlier one" in HOUSE_TEXT_PREDICATE
-    for (evidence, predicates), unit in zip(judged, (kept, dropped, refused), strict=True):
-        assert predicates == [HOUSE_TEXT_PREDICATE]
-        assert evidence.startswith(
-            "DOCUMENT TITLE: South Survey Report\nDELIVERABLE TYPE: survey report\n"
-            f"DATE: 2026-01-20\nSUMMARY: {HOUSE_STANDARD}\nATTRIBUTES:\n"
-            "- deliverable: survey report\n- date: 2026-01-20\n"
-            "HEADING PATH: South Survey Report > Data handling\nSECTION:\n## Data handling"
-        )
-        assert f"{kept}\n\n{dropped}\n\n{refused}" in evidence
-        assert evidence.endswith(f"THIS TEXT:\n{unit}")
-    nominated = [
-        (r.unit_ordinal, r.disposition)
-        for r in corpus.candidate_records
-        if isinstance(r, NominatedUnitRecord)
-    ]
-    assert nominated == [(1, "nominated_kept"), (2, "nominated_dropped"), (3, "nominated_refused")]
-    assert [p.text for p in corpus.blueprints[0].passages if p.kind == "single_exemplar"] == [kept]
-    report = corpus.build_report
-    assert report.judge_refusals == {HOUSE_TEXT_OPERATION: 1}
-    assert report.passage_dispositions == {
-        "survey report": {
-            "nominated_dropped": 1,
-            "nominated_kept": 1,
-            "nominated_refused": 1,
-            "selected_conditional": 1,
-            "selected_standing": 1,
-        }
-    }
-    # A provider failure is no verdict: it ends the build.
-    failing = HouseJudge({kept: ProviderError("decisions unavailable"), dropped: 0.2, refused: 0.9})
-    with pytest.raises(ProviderError, match="decisions unavailable"):
-        compile_files(tmp_path / "failing", files, failing)
-    # The fake gateway doubts a unit it is told to: that unit is dropped, the others kept.
-    doubting = FakeGateway(house_headings=("Data handling",), doubted=(dropped,))
-    doubted = compile_files(tmp_path / "doubted", files, doubting)
-    assert [
-        (r.unit_ordinal, r.disposition)
-        for r in doubted.candidate_records
-        if isinstance(r, NominatedUnitRecord)
-    ] == [(1, "nominated_kept"), (2, "nominated_dropped"), (3, "nominated_kept")]
-
-
-def test_every_candidate_and_nominated_unit_gets_one_disposition(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Both candidates recur in three documents, so the cap of one keeps the first.
-    monkeypatch.setattr(induction, "MAX_STANDING_CANDIDATES", 1)
-    gateway = FakeGateway(house_headings=("Data handling",))
-
-    corpus = compile_files(tmp_path, DATED_REPORTS, gateway)
-
-    reports = ("doc_001_sec_002", "doc_002_sec_002", "doc_003_sec_002")
-    assert corpus.candidate_records == (
-        RecurringCandidateRecord(
-            deliverable_type="survey report",
-            candidate_id="candidate_01",
-            disposition="selected_standing",
-            citations=reports,
-            text=HOUSE_STANDARD,
-        ),
-        # A candidate the request never showed keeps its first holder's wording.
-        RecurringCandidateRecord(
-            deliverable_type="survey report",
-            candidate_id="candidate_02",
-            disposition="not_offered",
-            citations=reports,
-            text=REDUCTION.format("week"),
-        ),
-        NominatedUnitRecord(
-            deliverable_type="survey report",
-            section_id="doc_003_sec_004",
-            unit_ordinal=1,
-            disposition="nominated_kept",
-            text=DATA_HANDLING,
-        ),
-    )
-    assert corpus.build_report.passage_dispositions == {
-        "survey report": {"nominated_kept": 1, "not_offered": 1, "selected_standing": 1}
-    }
 
 
 def test_a_notes_only_corpus_gets_a_guide_without_citation_tokens(tmp_path: Path) -> None:

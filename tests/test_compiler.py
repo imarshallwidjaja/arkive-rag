@@ -4,7 +4,6 @@ import json
 import re
 import shutil
 import subprocess
-import zipfile
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,26 +15,20 @@ from arkive_rag.compiler import (
     FIDELITY_ATTEMPTS,
     MAX_CHUNK_CHARS,
     OBSERVE_BATCH_CHARS,
-    SUPPORTED_SUFFIXES,
     BatchSection,
     ObserveSections,
     SectionDraft,
-    SourceFile,
     assemble_sections,
     bind_document,
     compile_corpus,
     curator_note_card,
     discover_corpus,
-    document_date,
-    embedded_date,
     fidelity_anchors,
     find_furniture,
     locate_quote,
     missing_anchors,
     observation_batches,
     parse_markdown_blocks,
-    parse_printed_date,
-    read_document,
     render_pdf,
     section_pieces,
     split_table,
@@ -52,7 +45,6 @@ from arkive_rag.models import (
     CorpusDocument,
     CraftDraft,
     DeliverableTypeDraft,
-    DocumentDate,
     DocumentReading,
     Facet,
     FacetDraft,
@@ -60,7 +52,6 @@ from arkive_rag.models import (
     FacetValueDraft,
     GuidanceDraft,
     GuideDraft,
-    HouseSectionNomination,
     ObservationCard,
     ObservationDraft,
     OrganisationDraft,
@@ -73,14 +64,10 @@ from arkive_rag.models import (
     UnsafePathError,
     UnsupportedFormatError,
     VisualTranscript,
-    is_strictly_newer,
 )
-from arkive_rag.passages import without_visual_transcripts
-from arkive_rag.snapshot import TopicSnapshot, write_snapshot
 from tests.support import (
     FakeGateway,
     ScriptedOpenAI,
-    core_properties,
     write_docx,
     write_flat_presentation,
     write_pdf,
@@ -247,98 +234,6 @@ def test_sections_follow_the_heading_stack_with_overview_for_leading_text() -> N
         ("Results", 1, 3, 3),
     ]
     assert sections[2].markdown == "## Rainfall\n\nMedian."
-
-
-# Every line break `str.splitlines` recognises besides `\n`.
-LINE_BREAKS = ("\r\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
-
-
-def test_transcribed_line_breaks_become_newlines_so_a_binary_build_passage_round_trips(
-    tmp_path: Path,
-) -> None:
-    # A house paragraph whose lines a transcription separates with every other line break; the
-    # same transcription for two reports in two project folders, so the paragraph recurs.
-    lines = [
-        f"House rule line {word} applies to every survey we deliver." for word in "abcdefghijk"
-    ]
-    paragraph = lines[0] + "".join(b + line for b, line in zip(LINE_BREAKS, lines[1:], strict=True))
-    transcribed = page(
-        block("heading", f"Survey{LINE_BREAKS[-2]}Report", level=1),
-        block("paragraph", "Deliverable: survey report"),
-        block("paragraph", paragraph),
-        visuals=(
-            VisualTranscript(
-                label=f"Depth{LINE_BREAKS[1]}chart", transcript=f"Depth{LINE_BREAKS[0]}rises."
-            ),
-        ),
-    )
-    corpus_dir = tmp_path / "corpus"
-    for project in ("p1", "p2"):
-        (corpus_dir / project).mkdir(parents=True)
-        write_pdf(corpus_dir / project / "report.pdf", [["Survey Report", "House rule line"]])
-    gateway = FakeGateway(page_script=[transcribed, transcribed])
-
-    corpus = compile_corpus(corpus_dir, gateway, topic="t", title="T", max_concurrency=1)
-
-    sections = [s for d in corpus.documents for s in d.sections]
-    assert sections and all(s.markdown.splitlines() == s.markdown.split("\n") for s in sections)
-    # In a heading or visual label another line break becomes a space, so neither adds a line
-    # that units would read as prose or that would end the visual block.
-    assert sections[0].heading_path == "Survey Report"
-    assert "> **[Visual \u2014 Page 1: Depth chart]**\n> Depth\n> rises." in sections[0].markdown
-    assert without_visual_transcripts(sections[0].markdown).count("Depth") == 0
-    (passage,) = corpus.blueprints[0].passages
-    assert passage.text == "\n".join(lines) and passage.text in sections[0].markdown
-    output = tmp_path / "t.arkive.db"
-    write_snapshot(corpus, output)
-    with TopicSnapshot.open(output) as snap:
-        assert snap.blueprints[0].passages == (passage,)
-
-
-def test_a_transcription_with_newlines_only_compiles_as_before_line_breaks_were_normalised(
-    tmp_path: Path,
-) -> None:
-    # The expected values are the output of this build at commit 399aa4c, before transcribed
-    # line breaks were normalised: a `\n` in a heading or visual label stays where it is, so
-    # sections, chunks and the observation request (whose text keys the reading cache) do
-    # not change.
-    transcribed = page(
-        block("heading", "Survey\nReport", level=1),
-        block("paragraph", "Deliverable: survey report"),
-        block("heading", "## Method\nand scope\n", level=2),
-        block("paragraph", "House rule line one applies to every survey.\nLine two follows.\n"),
-        block("table", "| Item | Value |\n| --- | --- |\n| Grid | GeoTIFF |\n"),
-        visuals=(VisualTranscript(label="Chart\nof depth", transcript="Depth\nrises.\n"),),
-    )
-    corpus_dir = tmp_path / "corpus"
-    (corpus_dir / "p1").mkdir(parents=True)
-    write_pdf(corpus_dir / "p1" / "report.pdf", [["Survey Report", "House rule line"]])
-    gateway = FakeGateway(page_script=[transcribed])
-
-    (doc,) = compile_corpus(corpus_dir, gateway, topic="t", title="T").documents
-
-    method = (
-        "## Method\nand scope\n\nHouse rule line one applies to every survey.\nLine two follows."
-        "\n\n| Item | Value |\n| --- | --- |\n| Grid | GeoTIFF |\n\n"
-        "> **[Visual \u2014 Page 1: Chart\nof depth]**\n> Depth\n> rises."
-    )
-    assert [(s.heading_path, s.markdown) for s in doc.sections] == [
-        ("Survey\nReport", "# Survey\nReport\n\nDeliverable: survey report"),
-        ("Survey\nReport > Method\nand scope", method),
-    ]
-    method_crumb = "[Doc: Survey\nReport (pp. 1-1) | Section: Survey\nReport > Method\nand scope]"
-    assert [(c.breadcrumb, c.content) for c in doc.chunks] == [
-        ("[Doc: Survey\nReport (pp. 1-1) | Section: Survey\nReport]", "Deliverable: survey report"),
-        (method_crumb, "House rule line one applies to every survey.\nLine two follows."),
-        (method_crumb, "| Item | Value |\n| --- | --- |\n| Grid | GeoTIFF |"),
-        (method_crumb, "> **[Visual \u2014 Page 1: Chart\nof depth]**\n> Depth\n> rises."),
-    ]
-    (observed,) = gateway.of_type(ObserveSections)
-    assert observed.text() == (
-        "SECTIONS:\n=== Section 1: Survey\nReport (pp. 1-1) ===\n# Survey\nReport\n\n"
-        "Deliverable: survey report\n\n"
-        f"=== Section 2: Survey\nReport > Method\nand scope (pp. 1-1) ===\n{method}"
-    )
 
 
 def test_continued_table_merges_split_row_and_drops_repeated_header() -> None:
@@ -656,188 +551,6 @@ def test_fidelity_gate_fails_loudly_when_a_filename_stays_missing() -> None:
     assert gateway.transcribe_calls == [("low", ()), ("high", ("harbour_dry_depth_thresh.tif",))]
 
 
-# Document dates.
-
-
-@pytest.mark.parametrize(
-    ("printed", "iso"),
-    [
-        # Every printed date the observe step returned for the private evaluation corpus.
-        ("15 April 2026", "2026-04-15"),
-        ("15/04/2026", "2026-04-15"),
-        ("19\u1d57\u02b0 Feb 2026", "2026-02-19"),
-        ("20/11/2025", "2025-11-20"),
-        ("20/2/2026", "2026-02-20"),
-        ("21\u02e2\u1d57 October 2025", "2025-10-21"),
-        ("February 2025", "2025-02"),
-        ("June 12, 2026", "2026-06-12"),
-        # The other unambiguous forms.
-        ("2026-03-05", "2026-03-05"),
-        ("3rd  march 2026", "2026-03-03"),
-        ("Sept 2026", None),
-        ("Sep 2026", "2026-09"),
-        ("12-31-2025", "2025-12-31"),
-        # Ambiguous or not a date: never guessed.
-        ("12/02/2026", None),
-        ("02/12/2026", None),
-        ("31/13/2026", None),
-        ("30/02/2026", None),
-        ("2026-02-30", None),
-        ("12/02/26", None),
-        ("Q3 2026", None),
-        ("Spring 2026", None),
-        ("2026", None),
-        ("Issued 15 April 2026", None),
-        # Month names are ASCII English only: a dotted capital I is not an I.
-        ("19 APR\u0130L 2026", None),
-        ("APR\u0130L 2026", None),
-        ("\u0661\u0669 April 2026", None),
-    ],
-)
-def test_printed_dates_parse_only_in_unambiguous_forms(printed: str, iso: str | None) -> None:
-    assert parse_printed_date(printed) == iso
-
-
-def source_of(rel_path: str) -> SourceFile:
-    path = Path(rel_path)
-    return SourceFile(rel_path, path, SUPPORTED_SUFFIXES[path.suffix])
-
-
-def pptx_bytes(tmp_path: Path, core: str | None) -> bytes:
-    path = tmp_path / "deck.pptx"
-    with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("ppt/presentation.xml", "<p:presentation/>")
-        if core is not None:
-            archive.writestr("docProps/core.xml", core)
-    return path.read_bytes()
-
-
-def test_embedded_dates_come_from_pdf_info_and_office_core_properties(tmp_path: Path) -> None:
-    # The calendar date in the timestamp's own offset: 01:30 at +10:00 is still 20 February.
-    dated_pdf = write_pdf(tmp_path / "a.pdf", [["Text"]], creation_date="D:20260220013000+10'00'")
-    undated_pdf = write_pdf(tmp_path / "b.pdf", [["Text"]])
-    # `modified`, not the template's `created` (2019-01-01).
-    docx = write_docx(tmp_path / "a.docx", ["Text"], modified="2026-02-19T23:30:00Z")
-    bare_docx = write_docx(tmp_path / "b.docx", ["Text"])
-    pdf, deck = source_of("a.pdf"), source_of("deck.pptx")
-
-    assert embedded_date(pdf, dated_pdf.read_bytes()) == "2026-02-20"
-    assert embedded_date(pdf, undated_pdf.read_bytes()) is None
-    assert embedded_date(source_of("a.docx"), docx.read_bytes()) == "2026-02-19"
-    assert embedded_date(source_of("b.docx"), bare_docx.read_bytes()) is None
-    deck_bytes = pptx_bytes(tmp_path, core_properties("2025-11-03T08:00:00Z"))
-    assert embedded_date(deck, deck_bytes) == "2025-11-03"
-    assert embedded_date(deck, pptx_bytes(tmp_path, None)) is None
-    assert embedded_date(source_of("memo.md"), b"# Memo\n\nDate: 2026-01-01\n") is None
-
-
-@pytest.mark.parametrize(
-    ("creation_date", "iso"),
-    [
-        ("D:20260220", "2026-02-20"),
-        ("D:20260220013000Z", "2026-02-20"),
-        ("D:20260220013000-05'00", "2026-02-20"),
-        ("D:202602", "2026-02"),
-        ("D:2026", None),
-        # A valid-looking prefix with anything else after it is not a PDF date.
-        ("D:20260220nonsense", None),
-        ("D:20260220013000+10'00'junk", None),
-        ("20260220013000Z", None),
-        ("D:20260220253000Z", None),
-        ("D:20260230", None),
-    ],
-)
-def test_a_pdf_date_gives_a_date_only_when_the_whole_value_is_a_pdf_date(
-    tmp_path: Path, creation_date: str, iso: str | None
-) -> None:
-    pdf = write_pdf(tmp_path / "a.pdf", [["Text"]], creation_date=creation_date)
-    assert embedded_date(source_of("a.pdf"), pdf.read_bytes()) == iso
-
-
-@pytest.mark.parametrize(
-    ("modified", "iso"),
-    [
-        ("2026-02-19", "2026-02-19"),
-        ("2026-02-19T23:30Z", "2026-02-19"),
-        ("2026-02-19T23:30:00.125+10:00", "2026-02-19"),
-        # No zone: the written calendar date.
-        ("2026-02-19T23:30:00", "2026-02-19"),
-        (" 2026-02-19T23:30:00Z\n", "2026-02-19"),
-        # A valid-looking prefix with anything else after it is not a W3CDTF value.
-        ("2026-02-19garbage", None),
-        ("2026-02-19T23:30:00Zjunk", None),
-        ("2026-02-19T24:00:00Z", None),
-        ("2026-02", None),
-        ("yesterday", None),
-        ("", None),
-    ],
-)
-def test_an_office_modified_date_gives_a_date_only_when_the_whole_value_is_w3cdtf(
-    tmp_path: Path, modified: str, iso: str | None
-) -> None:
-    deck = pptx_bytes(tmp_path, core_properties(modified))
-    assert embedded_date(source_of("deck.pptx"), deck) == iso
-
-
-def test_corrupt_embedded_metadata_is_a_conversion_error_naming_the_file(tmp_path: Path) -> None:
-    no_modified = core_properties("2026-02-19").replace("dcterms:modified", "dcterms:other")
-    assert embedded_date(source_of("deck.pptx"), pptx_bytes(tmp_path, no_modified)) is None
-
-    with pytest.raises(ConversionError, match=r"^p/deck\.pptx: docProps/core\.xml is not"):
-        embedded_date(source_of("p/deck.pptx"), pptx_bytes(tmp_path, "<cp:coreProperties>"))
-    with pytest.raises(ConversionError, match=r"^p/memo\.docx: cannot read as a zip archive"):
-        embedded_date(source_of("p/memo.docx"), b"not a zip archive")
-    with pytest.raises(ConversionError, match=r"^p/scan\.pdf: cannot open PDF"):
-        embedded_date(source_of("p/scan.pdf"), b"not a pdf")
-
-
-def test_a_printed_date_wins_and_an_unparsed_one_never_falls_back_to_the_embedded_date(
-    tmp_path: Path,
-) -> None:
-    pdf = write_pdf(tmp_path / "a.pdf", [["Text"]], creation_date="D:20250701000000Z").read_bytes()
-    source, memo = source_of("a.pdf"), source_of("memo.md")
-
-    assert document_date(source, pdf, "15/04/2026") == DocumentDate(
-        iso="2026-04-15", basis="printed"
-    )
-    assert document_date(source, pdf, "12/02/2026") is None
-    assert document_date(source, pdf, None) == DocumentDate(iso="2025-07-01", basis="embedded")
-    assert document_date(source, pdf, "  ") == DocumentDate(iso="2025-07-01", basis="embedded")
-    assert document_date(memo, b"# Memo", None) is None
-    assert document_date(memo, b"# Memo", "February 2025") == DocumentDate(
-        iso="2025-02", basis="printed"
-    )
-
-
-def test_reading_a_document_that_prints_a_non_english_month_gives_no_date() -> None:
-    text = "# Memo\n\nDate: 19 APR\u0130L 2026\n\nBody text.\n"
-    reading = read_document(source_of("memo.md"), text.encode(), FakeGateway())
-    assert (reading.card.doc_date, reading.date) == ("19 APR\u0130L 2026", None)
-
-
-def test_dates_order_documents_only_where_they_show_an_order() -> None:
-    def day(iso: str) -> DocumentDate:
-        return DocumentDate(iso=iso, basis="printed")
-
-    later, earlier = day("2026-04-15"), day("2026-02-19")
-    assert is_strictly_newer(later, earlier) and not is_strictly_newer(earlier, later)
-    assert is_strictly_newer(day("2026-04"), earlier)
-    # Equal dates, a month and a day inside it, and a missing date give no order either way.
-    for a, b in [(later, day("2026-04-15")), (day("2026-04"), later), (later, None)]:
-        assert not is_strictly_newer(a, b) and not is_strictly_newer(b, a)
-    # A month is compared by the days it covers: equal in its first and last day, newer than
-    # the day before it starts, older than the day after it ends.
-    for edge in ("2026-02-01", "2026-02-28"):
-        assert not is_strictly_newer(day("2026-02"), day(edge))
-        assert not is_strictly_newer(day(edge), day("2026-02"))
-    assert is_strictly_newer(day("2026-02"), day("2026-01-31"))
-    assert is_strictly_newer(day("2026-03-01"), day("2026-02"))
-    assert is_strictly_newer(day("2025-01"), day("2024-12"))
-    for invalid in ("2026-13", "\u0662\u0660\u0662\u0666-04-15", "2026-0\uff14"):
-        with pytest.raises(ValueError, match="not a YYYY-MM-DD date"):
-            day(invalid)
-
-
 # Binding.
 
 
@@ -868,7 +581,6 @@ def reading_of(drafts: Sequence[SectionDraft], title: str) -> DocumentReading:
             terms=(),
             craft=(),
         ),
-        date=None,
         discarded_quotes=0,
     )
 
@@ -1087,8 +799,7 @@ MEMO_BLUEPRINT = BlueprintDraft(
         GuidanceDraft(statement="State areas in hectares.", citations=["doc_001_sec_001"])
     ],
     pitfalls=[],
-    passages=[],
-    house_sections=[HouseSectionNomination(section_id="doc_001_sec_001", label="Field safety")],
+    standing_passages=[],
 )
 _TOKEN = re.compile(r"\[doc_\d+:doc_\d+_sec_\d+\]")
 
@@ -1120,9 +831,7 @@ def formats(api: ScriptedOpenAI, start: int = 0) -> list[str]:
 
 
 MEMO_CORPUS = {
-    "p1/2024-memo.md": (
-        "# Results\n\nSeagrass at 59,494 ha.\n\nEvery survey follows the house field safety plan."
-    ),
+    "p1/2024-memo.md": "# Results\n\nSeagrass at 59,494 ha.",
     "p1/AGENTS.md": "Memo is final.",
     "p2/proposal.md": "# Scope\n\nA follow-up survey.",
 }
@@ -1142,9 +851,8 @@ def test_unchanged_corpus_rebuilds_from_the_cache_without_provider_requests(
     assert (second.documents, second.guide_markdown) == (first.documents, first.guide_markdown)
     assert (second.facets, second.blueprints) == (first.facets, first.blueprints)
     # Every operation of all three passes was made once: two observations, organisation, one
-    # binding judgement per citable document, one blueprint agent run with its support check
-    # and the house-text check of its nominated section's one unit, the guide, and the
-    # embeddings.
+    # binding judgement per citable document, one blueprint agent run and its support check,
+    # the guide, and the embeddings.
     assert formats(api) == [
         "GuideDraft",
         "ObservationDraft",
@@ -1152,7 +860,7 @@ def test_unchanged_corpus_rebuilds_from_the_cache_without_provider_requests(
         "OrganisationDraft",
         "final_output",
     ]
-    assert len(api.requests("/decisions")) == 4 and len(api.requests("/embeddings")) == 1
+    assert len(api.requests("/decisions")) == 3 and len(api.requests("/embeddings")) == 1
     efforts = {
         b["text"]["format"]["name"]: b["reasoning"]["effort"] for b in api.requests("/responses")
     }
@@ -1163,11 +871,6 @@ def test_unchanged_corpus_rebuilds_from_the_cache_without_provider_requests(
         "GuideDraft": "medium",
     }
     assert first.blueprints[0].conventions[0].statement == "State areas in hectares."
-    (house,) = first.blueprints[0].passages
-    assert (house.kind, house.text) == (
-        "single_exemplar",
-        "Every survey follows the house field safety plan.",
-    )
     assert first.build_settings["efforts"]["write_blueprint"] == "medium"
     assert first.build_settings["model"] == "gpt-6.1-sol"
 
