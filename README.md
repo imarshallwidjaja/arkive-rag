@@ -49,18 +49,8 @@ default); it fails if `OPENAI_AGENTS_DISABLE_TRACING` is set to `1` or `true`
 
 The build reads the corpus and produces filter facets, a cited glossary and
 blueprints for recurring deliverable types. A blueprint includes an outline,
-conventions, reviewer pitfalls and passages of house text, each of one kind:
-`standing` (recurring text that applies as written), `conditional` (recurring
-text that applies only under a stated condition, with the other exemplars'
-wordings as variants) or `single_exemplar` (house text seen in one exemplar).
-A recurring passage takes the newest dated exemplar's wording only when every
-exemplar that holds it holds it in exactly one unit, the documents' dates show
-which is newest, the newest holds it in one section, and that wording is not
-already another passage's; otherwise it keeps the first exemplar's wording, and
-a curator note that states which wording is current can choose another
-exemplar's. `inspect` prints the facet names and
-values, glossary, blueprints, and what the build did with every passage
-candidate. See the
+conventions, reviewer pitfalls and standing passages of house text. `inspect`
+prints the facet names and values, glossary and blueprints. See the
 [build pipeline](docs/architecture.md#build-pipeline) for the induction and
 validation rules. `search` and `grep` take repeated `--filter FACET=VALUE`
 (a canonical value or an alias; several facets combine with AND), and the MCP
@@ -69,22 +59,20 @@ An `AGENTS.md` anywhere in the corpus is a curator note: it guides induction,
 appears in the topic guide and is searchable. The guide, glossary and
 blueprints never cite it; an agent answering a question from a note cites it
 like any other document. With `--cache`, rebuilding an unchanged corpus makes
-no provider calls. Snapshots use schema `4.0`; a snapshot of any other
-version, `3.0` included, is refused at open. Rebuild older snapshots from
-their corpus.
+no provider calls. Snapshots use schema `3.0`. Rebuild older snapshots from
+their corpus. An earlier build of schema `3.0` may have blueprint rows without
+standing passages; those rows are refused as malformed at open and the
+snapshot must also be rebuilt.
 
 The MCP server has ten tools. `get_topic_guide` returns the guide, curator
 notes, facets, glossary terms and a summary of each blueprint;
 `get_blueprint(topic, deliverable_type)` returns one blueprint in full. Its
 instructions tell a drafting agent to follow the blueprint, take every
-project-specific fact from the user's inputs (which outrank every passage),
-reproduce a standing passage as written without commentary on its origin,
-include a conditional passage only when the user's inputs establish its
-condition (otherwise leave it out, with no note about it in the draft),
-include a single-exemplar passage where the draft has a section of the same
-purpose, adapt or leave out only the part of any passage that belongs to one
-particular project, and reuse corpus names and references only inside a
-blueprint passage.
+project-specific fact from the user's inputs, reproduce the standing passages
+word for word without commentary on their origin (adapting or leaving out a
+passage that holds a project fact the user did not give, since the user's
+inputs take precedence), and reuse corpus names and references only from
+those passages.
 
 ## Private corpora, snapshots and eval packs
 
@@ -97,9 +85,8 @@ private store such as a private Git LFS or DVC repository, or a private bucket:
 - snapshots, named `<topic>-<corpus_fingerprint[:12]>.arkive.db`.
 
 `arkive-rag inspect` prints the snapshot's `corpus_fingerprint`, the
-`arkive_version` that wrote it, its facets, glossary, blueprints, passage
-candidate dispositions, build settings and build report, and the `sha256` of
-every source document. The
+`arkive_version` that wrote it, its facets, glossary, blueprints, build
+settings and build report, and the `sha256` of every source document. The
 fingerprint depends only on source paths and bytes, so you can check at any
 time that a snapshot, a corpus folder and an eval pack belong together.
 `.gitignore` excludes `*.arkive.db` and `*.eval.local.json`.

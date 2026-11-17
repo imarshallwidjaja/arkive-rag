@@ -18,7 +18,7 @@ them in the snapshot next to the sections, pages and chunks.
 | `llm.py` | The request protocols (`StructuredRequest`, `AgentRequest`), the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Agents SDK runs, Decisions, embeddings, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
 | `compiler.py` | Reading (discovery, rendering, the transcription fidelity gate, section stitching, chunk pieces, observation cards with quote location) and binding (IDs, breadcrumbs, embeddings). `compile_corpus` composes reading, induction and binding into a `CompiledCorpus`. Its request types (`PageTranscription`, `ObserveSections`, `ConsolidateCard`) own their prompts, output schemas and reasoning efforts. |
 | `induction.py` | Induction: corpus organisation, facet binding, the glossary, blueprints and the topic guide; the validate-and-retry helper `generate_checked`; support checks; the read-only source tools of the blueprint agent. Its request types (`OrganiseCorpus`, `WriteGlossary`, `WriteBlueprint`, `WriteGuide`) own their prompts, schemas and efforts. |
-| `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what a visual transcript is and its removal (`without_visual_transcripts`), word 4-gram `shingles` and `containment` with their thresholds, which units of a set of exemplar documents recur (`standing_candidates`, over plain `ExemplarDocument` records), which wording each recurring candidate takes (`word_candidates`, `holder_wording`, `holding_sections`), which units of the nominated sections may be house text seen once (`house_units`), and whether a text is a unit a passage may store (`is_passage_unit`). Induction's blueprint step and the evaluation harness both measure text with it. |
+| `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what a visual transcript is and its removal (`without_visual_transcripts`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a set of exemplar documents recur (`standing_candidates`, over plain `ExemplarDocument` records). Induction's blueprint step and the evaluation harness both measure text with it. |
 | `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup). |
 | `server.py` | `TopicCatalog` (open snapshots keyed by topic), the ten MCP tools and the server instructions. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
@@ -114,16 +114,7 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    joined part spans both pages. A continued table loses its repeated header
    rows, and when `merges_into_previous_row` is set, its first row is merged
    cell by cell into the row cut by the page break. Visual transcripts become
-    quoted `[Visual — Page N: label]` blocks in the section. Every other line
-    break `str.splitlines` recognises in a transcribed block (`\r\n`, `\r`,
-    `\x0b`, `\x0c`, `\x1c` to `\x1e`, `\x85`, U+2028, U+2029) becomes `\n`,
-    except in a heading or visual label, where it becomes a space so the
-    heading or the visual block stays one line; nothing else changes, so
-    section Markdown has `\n` line breaks only, as from a Markdown
-   source: a passage unit, rejoined with `\n`, then stays a substring of its
-   section. A transcription that already breaks lines with `\n` only gives the
-   same sections, chunks and observation requests (and so the same reading
-   cache keys) as before this normalisation.
+   quoted `[Visual — Page N: label]` blocks in the section.
 5. **Chunk pieces.** `section_pieces` packs paragraphs and callouts into prose
    pieces of up to 1,800 characters, splitting an oversized paragraph at
    sentence ends. A table up to 2,400 characters is one `table` piece; a larger
@@ -164,47 +155,6 @@ deterministically, keeping a fenced code block as one literal paragraph, and
 they have no page images for `view_page`. A document with no text raises
 `ConversionError`.
 
-The card's date is free text as the document prints it. The reading also
-records the document's date as `DocumentDate` (`iso`, `basis`), which code
-computes from that text and the original source bytes with no provider call
-(`document_date`), so the observe request and its cached responses are the
-same as without it:
-
-- `parse_printed_date` reads the printed date after NFKC, with whitespace
-  collapsed, when the whole text is one unambiguous form: `YYYY-MM-DD`; day,
-  English month name (full or three letters) and year, the day with or
-  without an ordinal suffix (`19ᵗʰ Feb 2026`, `21ˢᵗ October 2025`); month
-  name, day and year (`June 12, 2026`); month name and year, which gives
-  `YYYY-MM`; or `D/M/YYYY` or `D-M-YYYY` when exactly one of the first two
-  numbers exceeds 12. Digits are ASCII and month names are ASCII English,
-  matched without regard to ASCII case. Any other text, such as `12/02/2026`
-  or a month name with a non-ASCII letter, is not guessed.
-- `embedded_date` reads the file's own metadata from the original bytes, not
-  from the converted PDF: a PDF's info-dictionary `CreationDate`, as the
-  calendar date in the timestamp's own offset; a Word or PowerPoint file's
-  `dcterms:modified` in `docProps/core.xml` (its `created` can be the
-  template's date), as the calendar date written. The whole value must be in
-  its format's date form: `D:YYYY[MM[DD[HH[mm[SS]]]]]` with an optional `Z`,
-  `+HH'mm'` or `-HH'mm'` offset (trailing apostrophe optional) for a PDF,
-  where a year alone gives none and a year and month give `YYYY-MM`; a W3CDTF
-  date, or date and time with optional fractional seconds and an optional `Z`
-  or `+HH:MM`/`-HH:MM` zone, for Office. Markdown, an Office file without
-  `core.xml` or without `modified`, and a value with anything outside its
-  form (`D:20260220nonsense`, `2026-02-19garbage`) give none. Metadata that
-  cannot be read at all is corrupt and raises `ConversionError` naming the
-  file: a PDF that does not open, an Office file that is not a zip archive,
-  or a `core.xml` that is not well-formed XML.
-- A printed date that parses wins (basis `printed`). A printed date that does
-  not parse gives no date at all, never the embedded one, because embedded
-  dates can differ from printed ones by months. Only a document that prints
-  no date takes its embedded date (basis `embedded`).
-
-`is_strictly_newer` orders two dates only where they show an order: it
-compares the days each date covers (a `YYYY-MM` date covers its whole
-month), and one is newer only when it starts after the other ends. Equal
-dates, a `YYYY-MM` date and a day in that month, and a missing date give no
-order in either direction.
-
 ### Induction
 
 `induce(documents, notes, gateway)` receives the readings with their IDs and
@@ -216,12 +166,11 @@ bounds them together. Results are gathered in submission order, and the first
 failure of any task cancels the tasks not yet started. Every generating step
 goes through
 `generate_checked`: run, validate, rerun once with the rejections appended to
-the request, then raise `RejectedOutputError`. Only four outcomes reduce the
+the request, then raise `RejectedOutputError`. Only three outcomes reduce the
 output without failing, and the build report counts each: an observation
 whose quote is still unlocated after its rerun, a glossary definition the
-support check does not confirm, a blueprint convention or pitfall it does
-not confirm, and a unit of a nominated house section that the house-text
-check does not confirm or refuses.
+support check does not confirm, and a blueprint convention or pitfall it does
+not confirm.
 
 1. **Organise** (`organise_corpus`, medium effort). The request holds the
    folder tree, the curator notes and every citable document's card. The
@@ -275,64 +224,27 @@ check does not confirm or refuses.
    at most 12 turns per recurring deliverable type). The agent reads the
    citable documents through three read-only tools, `outline`,
    `read_section` and `grep`, which refuse an argument that is not a string;
-   its request lists the curator notes (stated intent that outranks the
-   agent's inference and, where a note says which layout or wording is
-   current, outranks dates; a note is never citable, and the tools cannot
-   read notes), the exemplars' outlines each with the document's date and
-   its basis (`printed` or `embedded`, or `none known`), the feedback
-   documents and, as leads the agent must verify in the source before using,
-   the craft observations located in those documents (aspect, statement,
-   section ID), in sorted order, and the type's recurring passage candidates
-   (below), each with the wording a passage would store and the other
-   holders' differing wordings with their dates. It returns a description, a
-   section outline (heading, purpose, citations), conventions and reviewer
-   pitfalls (statement, citations), stated without project-specific values,
-   the passages it selects (candidate ID, label, kind, for a conditional
-   one its condition, and `holder_section_id`, set only when a curator note
-   states which wording or which document's wording is current) and the
-   house sections it nominates (section ID and label). When exemplars differ in layout, the outline describes the newest
-   dated exemplar's layout as the current one; with dates that do not order
-   the exemplars it claims no order. The blueprint's exemplar documents are
-   the organisation step's exemplars of the type. Validation requires a
-   non-empty outline; citations that resolve to citable sections of the
-   type's own documents (outline items, conventions and pitfalls cite
-   sections of its exemplar or feedback documents, nothing else); passage
-   selections that
-   name a listed candidate, each at most once, with a non-blank label, a
-   condition on every `conditional` selection and none on a `standing` one
-   (the output schema accepts both combinations, so a mismatch reaches the
-   rerun); no `standing` selection of a candidate with variants, since its
-   holders word it differently; a `holder_section_id` that is null, or one
-   of the candidate's holding sections with exactly one holder unit (a blank
-   one is rejected); no two selections whose wording folds alike
-   (`fold_for_quote`), whatever their source sections, checked in candidate
-   order so the later candidate is the one told to change; and house
-   sections that are
-   sections of the type's exemplar documents, each listed once with a
-   non-blank label. `check_blueprint` then asks the Decisions API
-   whether the cited sections support each convention and pitfall;
-   unsupported or refused ones are dropped and counted.
+   its request lists the exemplars' outlines, the feedback documents and,
+   as leads the agent must verify in the source before using, the craft
+   observations located in those documents (aspect, statement, section ID),
+   in sorted order, and the type's standing passage candidates (below). It
+   returns a description, a section outline (heading, purpose, citations),
+   conventions and reviewer pitfalls (statement, citations), stated without
+   project-specific values, and the standing passages it selects (candidate
+   ID and label). The blueprint's exemplar documents are the organisation
+   step's exemplars of the type. Validation requires a non-empty outline,
+   citations of the outline, conventions and pitfalls that resolve to
+   citable sections, and standing passage selections that name a listed
+   candidate, each at most once, with a non-blank label. `check_blueprint`
+   then asks the Decisions API whether the cited sections support each
+   convention and pitfall; unsupported or refused ones are dropped and
+   counted.
 
-   A blueprint's passages have one of three kinds:
-
-   - `standing`: recurring house text that applies to any deliverable of the
-     type as written, such as organisation or tool background, method
-     references, reference entries, acknowledgements, disclaimers,
-     disclosures, standard table headers and standing caveats.
-   - `conditional`: recurring wording that applies only when something
-     about the new project holds, or that names something that varies
-     between projects. Its `condition` is one sentence that states the fact
-     of the new project, as the user's inputs would state it, that makes the
-     passage apply, and names the part that varies. It carries its
-     `variants`.
-   - `single_exemplar`: house text seen in one exemplar, taken from a
-     nominated section, with that section's `heading_path`.
-
-   A recurring passage (`standing` or `conditional`) stores `text`, its
-   `citations` (every holding section), `source_section_id` (the section
-   whose unit supplied `text`) and `wording_from`. Code computes the
-   candidates (`standing_candidates` in `passages.py`, no provider call) from
-   the Markdown of the type's exemplar sections:
+   A standing passage is house text: organisation or tool background, method
+   references, reference entries, acknowledgements, disclaimers, disclosures,
+   standard table headers and standing caveats. Code computes the candidates
+   (`standing_candidates` in `passages.py`, no provider call) from the Markdown
+   of the type's exemplar sections:
 
    - A *unit* is a paragraph, one item of a list (a list marker,
      `LIST_MARKER`, starts an item: `-`, `*`, `+`, a number followed by `.` or
@@ -375,68 +287,21 @@ check does not confirm or refuses.
    canonical order with their IDs, and the request says how many were found
    and how many it lists. A type with one
    exemplar, or with no recurring unit, has no candidates, and the request
-   says which. A stored passage takes its text, citations and variants from
-   the candidate, in candidate order, so it is exemplar text by construction.
-
-   A candidate's identity (its ID, canonical order and citations) never
-   depends on dates; its wording does (`word_candidates`). Its *holder
-   units* are, for each section it cites, the units of that section that say
-   the same thing as the candidate's first unit; a section that holds the
-   candidate's 4-grams only across several units has none. Candidates are
-   worded in canonical order. The wording is the newest holder's
-   (`wording_from: newest_holder`) only when every holding section has
-   exactly one holder unit, every two holding documents' dates are ordered
-   (`is_strictly_newer`: equal dates, a month against a day of that month and
-   a missing date show no order), the newest document holds the candidate in
-   one section, and that unit's folded text is not already an earlier
-   candidate's wording, from whatever section; otherwise it is the first
-   holder's (`first_holder`), as discovery found it, and the request states
-   which of those four reasons applies. When a curator note makes another
-   holder's wording current, the selection names that section and the
-   passage stores its unit (`selected_holder`). The *variants* are the other
-   holder units that word it differently, each with its section ID and
-   document date: for prose, a different folded text; for a table header,
-   a different folded header row or a different alignment (left, right,
-   centre or none) of a separator cell, so a padded separator row and a
-   compact one word it alike. The request shows them for every candidate; only a `conditional`
-   passage stores and serves them.
-
-   A nominated house section yields `single_exemplar` passages by code, not
-   by the agent (`house_units`): its prose units of at least 8 words, except
-   a unit with containment of at least 0.5 (`HOUSE_OVERLAP_CONTAINMENT`)
-   either way with any holder unit of any recurring candidate of the type, a
-   unit that a section of another exemplar document holds at 0.8, and a unit
-   whose folded text equals one already taken from the nominated sections.
-   There is no size cap on a nominated section. Each kept unit then gets one
-   `check_house_text` question to the Decisions API, whose single evidence
-   window holds the document's card as binding sees it (title, deliverable
-   type, printed date, summary and stated attributes), the heading path, the
-   whole section and the unit: "This text states no fact about a particular
-   project, whether the one this document reports or an earlier one (its
-   client, site, dates, quantities or results), and it could appear
-   unchanged in another document of the same kind." Below 0.5
-   the unit is dropped (`nominated_dropped`); refused, it is dropped
-   (`nominated_refused`) and counted among the refusals; a provider failure
-   ends the build.
-
-   The build records what became of every candidate and nominated unit (the
-   snapshot's `blueprint_candidates` table): one row per deliverable type and
-   candidate ID, `selected_standing`, `selected_conditional`, `declined`
-   (offered but not selected) or `not_offered` (cut by the cap), and one row
-   per deliverable type, section and unit ordinal of a nominated section,
-   `nominated_kept`, `nominated_dropped` or `nominated_refused`. The build
-   report counts the dispositions per type (`passage_dispositions`).
+   says which. A stored passage takes its text and citations from the
+   candidate, in candidate order, so it is exemplar text by construction. When
+   holders' wording differs within the recurrence threshold, the stored text
+   uses the first holder in canonical document order.
 
    What recurrence proves is limited. The code checks that the text of one
    exemplar section recurs in another exemplar document, under a different
    top-level folder when the exemplars span folders. It cannot know that two
    folders are different projects, or that a recurring sentence is free of
    project facts: two projects for one client can share the client's name.
-   The agent is instructed to leave out candidates that only state one
-   project's facts and to mark wording that varies as `conditional`, and the
-   drafting instructions let the user's inputs outrank every passage. The
-   outline, conventions and pitfalls stay generic, and passages are the only
-   source text a blueprint holds.
+   The agent is instructed to leave out candidates specific to one project,
+   client, place, period or result, and the drafting instructions let the
+   user's inputs take precedence over a passage. The outline, conventions
+   and pitfalls stay generic, and standing passages are the only source text
+   a blueprint holds.
 5. **Guide** (`write_guide`, medium effort). A cited Markdown overview from
    the cards, the bound facets, the glossary terms, the blueprint summaries
    and the curator notes. Every bracketed `[doc...]` token must have the exact
@@ -461,10 +326,8 @@ dimensions.
 
 `build` prints the usage line and the build report. The build report has
 `discarded_unlocated_quotes`, `unsupported_definitions`,
-`dropped_blueprint_statements`, `passage_dispositions` (per deliverable type,
-the count of each candidate and nominated-unit disposition), `judge_refusals`
-(per Decisions operation, `check_house_text` included), `pruned_facet_values`
-and `pruned_facets`.
+`dropped_blueprint_statements`, `judge_refusals` (per Decisions operation),
+`pruned_facet_values` and `pruned_facets`.
 
 ## Provider calls
 
@@ -576,25 +439,21 @@ model that has no price is refused when the gateway is constructed.
 foreign_key_check` and `PRAGMA integrity_check`, fsyncs, and renames it over
 the output, then fsyncs the directory. A replaced snapshot keeps its file
 mode. A failed build leaves any previous snapshot untouched, and SQLite or
-file-system failures raise `SnapshotIntegrityError`. Before it creates the
-file, it runs on every blueprint the same check `TopicSnapshot.open` runs
-(`check_stored_blueprint`, below), so a build never publishes a snapshot its
-reader refuses.
+file-system failures raise `SnapshotIntegrityError`.
 
-Tables (schema version `4.0`):
+Tables (schema version `3.0`):
 
 | Table | Contents |
 | --- | --- |
 | `corpus_meta` | `schema_version`, `topic`, `title`, `created_at`, `corpus_fingerprint`, `arkive_version`, `embedding_model`, `embedding_dimensions`, `guide_markdown`, `build_settings` (JSON: the model IDs and the effort of each operation) and `build_report` (JSON, as printed by `build`). |
 | `curator_notes` | Verbatim `AGENTS.md` files with their path. |
-| `documents` | One row per source file: `doc_id`, `ordinal`, `rel_path`, `sha256`, `format`, `title`, `doc_date` (as printed), `doc_date_iso` (`YYYY-MM-DD` or `YYYY-MM`) and `doc_date_basis` (`printed` or `embedded`; both null when the document has no date), `deliverable_type`, `summary`, `page_count`, `is_curator_note`. |
+| `documents` | One row per source file: `doc_id`, `ordinal`, `rel_path`, `sha256`, `format`, `title`, `doc_date`, `deliverable_type`, `summary`, `page_count`, `is_curator_note`. |
 | `facets` | Name, order, description and binding (`path` or `content`). |
 | `facet_values` | Each facet's values with their order, description and folders (JSON). |
 | `facet_aliases` | Every folded form of a value, the canonical value included, keyed by facet and folded alias, so a form that would name two values cannot be stored. |
 | `document_facets` | Document-to-value assignments, with foreign keys to `documents` and `facet_values`. |
 | `glossary` | One validated `GlossaryEntry` JSON document per row. |
-| `blueprints` | One validated `Blueprint` JSON document per row, its `passages` each of kind `standing`, `conditional` or `single_exemplar`. |
-| `blueprint_candidates` | What the build did with each recurring candidate and nominated house unit of a blueprint: the deliverable type (a foreign key to `blueprints`), either a `candidate_id` or a `section_id` (a foreign key to `sections`) with a `unit_ordinal`, the disposition, the citations (JSON) and the text. |
+| `blueprints` | One validated `Blueprint` JSON document per row. |
 | `sections`, `pages`, `chunks` | Section Markdown with heading path and pages; native text, visual summary and WebP per page; chunk content, breadcrumb and float32 embedding. |
 | `chunks_fts` | FTS5 over NFKC-normalised chunk content and breadcrumb (`porter unicode61 remove_diacritics 2`). |
 
@@ -606,9 +465,11 @@ so it is the content address of the corpus a snapshot was built from
 
 `TopicSnapshot.open` uses a read-only SQLite URI with the path
 percent-encoded, so names containing `%`, `?` or `#` open the right file. It
-refuses any schema version other than `4.0`, naming the file's version and the
-one it reads; a snapshot of an earlier version, `3.0` included, is rebuilt from
-its corpus. Every
+refuses any schema version other than `3.0`, naming the file's version and the
+one it reads; a `2.0` snapshot is rebuilt from its corpus. Schema `3.0` alone
+does not establish compatibility: a snapshot from an earlier build of this
+version whose blueprint rows lack standing passages is refused at open as a
+malformed blueprint row and must be rebuilt from its corpus. Every
 `corpus_meta` key and every table is required, and `open` runs `PRAGMA
 foreign_key_check`, so a dangling facet assignment or alias is refused. Each
 facet value must have its canonical alias row. A snapshot is a build output
@@ -616,37 +477,18 @@ that may be truncated or damaged: any decoding or cross-table failure while
 it opens, and any SQLite error from a later read, is `SnapshotIntegrityError`
 naming the file. `open` recomputes the fingerprint from the
 `documents` table and raises `SnapshotIntegrityError` when the recorded one
-differs. Each document row must carry a real calendar date in
-`doc_date_iso` (`YYYY-MM-DD` or `YYYY-MM`, ASCII digits) and a basis of `printed` or
-`embedded`, with the basis null exactly when the date is null. It validates
-every glossary, blueprint and blueprint candidate row through its model (a
-passage's kind rules included: a recurring passage cites its source section
-and, if conditional, a non-blank condition and its variants' sections; a
-single-exemplar passage cites exactly one section) and checks
-(`check_stored_blueprint`) that every cited section belongs to a citable
-document of the snapshot, that a blueprint's deliverable type is not blank
-once folded and its exemplar and feedback documents are citable, never
-repeated and never both, that every passage has a non-blank label, that
-every passage and candidate row cites only sections of its blueprint's
-exemplar documents, that a recurring passage cites at least two of them,
-that a passage's text is a unit of its source section that can recur
-(`is_passage_unit`: at least 8 words, or a table header row of at least two
-columns) and occurs in that section's Markdown byte for byte, and a
-single-exemplar passage's heading path is its section's, that every variant
-is such a unit of its section and carries its document's `doc_date_iso`,
-that no two passages of a blueprint store text that folds alike
-(`fold_for_quote`), that a `first_holder` passage's source is its first
-citation and a `newest_holder` one's is a document dated strictly newer
-than every other holding document, that the selected candidate rows
-(`selected_standing`, `selected_conditional`, `nominated_kept`) match the
-blueprint's passages one to one, in order, by kind, citations and text, and
-that no two blueprints have deliverable types with the same
-`fold_facet_label` form (`get_blueprint` resolves a type by that form). It
+differs. It validates every glossary and blueprint row through its model and
+checks that every cited section belongs to a citable document of the
+snapshot, that every blueprint exemplar and feedback document is one, that
+every standing passage cites sections of at least two of its blueprint's
+exemplar documents and no other section, and that no two blueprints have
+deliverable types with the same `fold_facet_label` form (`get_blueprint`
+resolves a type by that form). It
 loads the facets, aliases and document-to-facets map once, with chunk
 metadata and the embedding matrix. `list_topics` and `arkive-rag inspect`
 report the fingerprint and version; `inspect` also prints the facets,
-glossary, blueprints, the blueprint candidate rows (`blueprint_candidates`),
-build settings, build report and each document's `sha256`.
+glossary, blueprints, build settings, build report and each document's
+`sha256`.
 
 ## Private corpus and eval versioning
 
@@ -717,20 +559,12 @@ tools:
   outline, conventions, pitfalls or passages, which keeps it small for
   question answering.
 - `get_blueprint(topic, deliverable_type)`: one full `Blueprint` (outline,
-  conventions, pitfalls, exemplar and feedback documents, passages). Each
-  passage has its `kind`, `label`, `text` and `citations`; a recurring one
-  (`standing` or `conditional`) also its `source_section_id` and
-  `wording_from`, a `conditional` one its `condition` and `variants`, and a
-  `single_exemplar` one its `heading_path`. The type matches after
-  `fold_facet_label`, so case and surrounding spaces do not matter; an
-  unknown type is a `NotFoundError` that names the valid types. No tool
-  serves the blueprint candidate rows; `arkive-rag inspect` prints them.
+  conventions, pitfalls, exemplar and feedback documents, standing
+  passages). The type matches after `fold_facet_label`, so case and
+  surrounding spaces do not matter; an unknown type is a `NotFoundError`
+  that names the valid types.
 - `list_documents`, `get_document_outline`, `search`, `grep`,
   `read_section`, `view_page` and `lookup_glossary`.
-
-`list_documents` and `get_document_outline` give each document its printed
-`doc_date` with `doc_date_iso` and `doc_date_basis`; `arkive-rag inspect`
-prints the same three fields per document.
 
 `list_documents`, `search` and `grep` take `filters: dict[str, str] | None`.
 `view_page` returns the caption as text content and the page as `image/webp`
@@ -746,29 +580,16 @@ pitfalls; mirrors a cited exemplar section's heading levels and table column
 headers where layout matters, not its project-specific headings; takes
 every fact about the user's project (its client and other parties, people,
 places, dates, quantities, budgets, targets, findings, identifiers, file
-names) only from the user's inputs, which outrank every passage; treats
-the blueprint's passages as the collection's own house text, used without
-commentary about their origin: reproduces a `standing` passage as written,
-keeping its organisation names, method references and attributions;
-includes a `conditional` passage only when the user's inputs establish its
-condition, taking the varying part from the inputs and leaving out any
-sentence of it that states a result the inputs do not give, and, when the
-inputs do not settle the condition, leaves the passage out with no note
-about it in the deliverable; in a passage of any kind, adapts or leaves out
-only the part that belongs to one particular project, using the user's
-inputs; includes a `single_exemplar` passage only where it applies to the
-new project and the deliverable has a section with the purpose of the
-section that holds it, copying no heading text from its heading path; treats
-variants as provenance, not alternatives to combine; reuses names,
-references and attributions from the corpus only inside a blueprint passage
-of any kind; lists every item the user's inputs enumerate in full; and
-leaves out Arkive document and section IDs. The `get_blueprint` and
-`read_section` descriptions, sent with every turn, state briefly that
-every fact about the user's project comes only from the user's inputs,
-which outrank every passage, and how each kind is used. A test checks
-every obligation against the instructions and the evaluation harness's
-exemplars-in-context rules, and checks against each description the
-obligations assigned to that description.
+names) only from the user's inputs, which take precedence over a passage;
+treats the standing passages as the collection's own house text, reproducing
+them with their wording, without commentary about their origin, and keeping
+their organisation names, method references and attributions as written,
+while adapting or leaving out only the part of a passage that belongs to one
+particular project (its client, site, dates, quantities or results); reuses
+names, references and attributions from the corpus only when a standing
+passage holds them; lists every item the user's inputs enumerate in full;
+and leaves out Arkive document and section IDs. The `read_section` and
+`get_blueprint` descriptions say the same.
 
 Over `streamable-http` the server has no authentication, so `serve` refuses a
 host other than `127.0.0.1`, `localhost` or `::1` unless `--allow-nonlocal` is
@@ -1086,7 +907,7 @@ acronyms, one acronym with two meanings, tool names, stated attributes,
 exact numbers and filenames. Each also has one standing section that recurs
 across projects: every coastal proposal ends with the same standard terms,
 and every campaign brief ends with the same disclosure, so their blueprints
-have recurring passage candidates to select. They are built with the ordinary
+have standing passage candidates to select. They are built with the ordinary
 `arkive-rag build` command; the snapshots are not tracked.
 
 `evals/example_packs/<collection>.eval.json` is the eval pack of each
@@ -1180,11 +1001,9 @@ non-interactively, on several topics at once. It needs Docker and
   answer names every facet of its topics (read from the served snapshots,
   because facets are induced per build), an optional requirement that the
   answer reproduces a standing passage (`answer_reproduces_standing_passage_of`,
-  a topic: the passages of kind `standing` come from the blueprint that the
-  last completed `get_blueprint` call on that topic returned, because passages
-  and deliverable types are induced per build; a conditional or
-  single-exemplar passage does not count, since the drafting rules do not
-  require it in every draft; a passage counts when its text, or
+  a topic: the passages come from the blueprint that the last completed
+  `get_blueprint` call on that topic returned, because passages and
+  deliverable types are induced per build; a passage counts when its text, or
   its first 12 words for a longer one, appears in the answer as words after
   `fold_for_quote`; when that blueprint holds no standing passage the
   scenario fails a separate check, `precondition: blueprint has a standing

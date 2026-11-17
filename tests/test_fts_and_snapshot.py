@@ -16,15 +16,11 @@ from numpy.typing import NDArray
 from arkive_rag import __version__
 from arkive_rag.compiler import compile_corpus
 from arkive_rag.models import (
-    CompiledCorpus,
-    ConditionalPassage,
     InvalidFilterError,
     NotFoundError,
     ProviderError,
     SearchHit,
-    SingleExemplarPassage,
     SnapshotIntegrityError,
-    StandingPassage,
     UnsafePathError,
 )
 from arkive_rag.snapshot import (
@@ -35,14 +31,7 @@ from arkive_rag.snapshot import (
     build_fts5_query,
     write_snapshot,
 )
-from tests.support import (
-    BATHYMETRY_CORPUS,
-    DATED_REPORTS,
-    MARKETING_CORPUS,
-    FakeGateway,
-    compile_snapshot,
-    write_pdf,
-)
+from tests.support import BATHYMETRY_CORPUS, MARKETING_CORPUS, FakeGateway, compile_snapshot
 
 FTS_BATTERY = [
     "Sentinel-2",
@@ -461,17 +450,15 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     ):
         snap._db.execute("DELETE FROM chunks")
 
-    for version in ("2.0", "3.0"):
-        stale = tmp_path / f"stale-{version}.arkive.db"
-        shutil.copy(path, stale)
-        with sqlite3.connect(stale) as db:
-            db.execute("UPDATE corpus_meta SET value = ? WHERE key = 'schema_version'", (version,))
-        db.close()
-        with pytest.raises(
-            SnapshotIntegrityError,
-            match=rf"schema version '{version}'; Arkive \S+ reads schema 4\.0 only, so rebuild",
-        ):
-            TopicSnapshot.open(stale)
+    stale = tmp_path / "stale.arkive.db"
+    shutil.copy(path, stale)
+    with sqlite3.connect(stale) as db:
+        db.execute("UPDATE corpus_meta SET value = '2.0' WHERE key = 'schema_version'")
+    db.close()
+    with pytest.raises(
+        SnapshotIntegrityError, match=r"schema version '2\.0'; Arkive \S+ reads schema 3\.0 only"
+    ):
+        TopicSnapshot.open(stale)
     with pytest.raises(SnapshotIntegrityError, match="does not exist"):
         TopicSnapshot.open(tmp_path / "absent.arkive.db")
     garbage = tmp_path / "garbage.arkive.db"
@@ -490,10 +477,10 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
     write_snapshot(corpus, output)
 
     with TopicSnapshot.open(output) as snap:
+        assert SCHEMA_VERSION == "3.0"
         assert tuple(snap.facets) == corpus.facets
         assert tuple(snap.glossary) == corpus.glossary
         assert tuple(snap.blueprints) == corpus.blueprints
-        assert tuple(snap.candidate_records) == corpus.candidate_records
         assert snap.build_settings == dict(corpus.build_settings)
         assert snap.build_report == corpus.build_report
         assert snap.guide_markdown == corpus.guide_markdown
@@ -519,8 +506,7 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
         ("glossary", "entry_json", "doc_002_sec_002", "doc_001_sec_001", "cites 'doc_001_sec_001'"),
         ("blueprints", "blueprint_json", '"doc_002"', '"doc_001"', "names document 'doc_001'"),
         ("blueprints", "blueprint_json", '"outline"', '"sketch"', "row is malformed"),
-        # doc_003_sec_004 is cited only by the campaign brief's standing passage (and its
-        # candidate record, which the passage check reaches first).
+        # doc_003_sec_004 is cited only by the campaign brief's standing passage.
         (
             "blueprints",
             "blueprint_json",
@@ -533,8 +519,8 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
             "blueprint_json",
             '"doc_003_sec_004"',
             '"doc_004_sec_001"',
-            "has a passage 'Disclosure' citing 'doc_004_sec_001', which is not a section of"
-            " the blueprint's exemplars",
+            "standing passage citing 'doc_004_sec_001', which is not a section of the"
+            " blueprint's exemplars",
         ),
         # Both citations then name doc_002: a passage must recur in another exemplar.
         (
@@ -552,58 +538,9 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
             '" Review NOTES"',
             "blueprints ' Review NOTES' and 'review notes' have the same deliverable type",
         ),
-        # Without dates the passage's wording is its first citation's.
-        (
-            "blueprints",
-            "blueprint_json",
-            '"source_section_id":"doc_002_sec_004"',
-            '"source_section_id":"doc_003_sec_004"',
-            "first_holder passage 'Disclosure' whose wording is not from its first citation",
-        ),
-        (
-            "blueprints",
-            "blueprint_json",
-            '"feedback_doc_ids":["doc_004"]',
-            '"feedback_doc_ids":["doc_004","doc_002"]',
-            "names a document twice among its exemplar and feedback documents",
-        ),
-        (
-            "blueprints",
-            "blueprint_json",
-            '"label":"Disclosure"',
-            '"label":" "',
-            "has a standing passage with a blank label",
-        ),
-        # Candidate records name a blueprint by its row's type.
-        (
-            "blueprints",
-            "blueprint_json",
-            '"campaign brief"',
-            '"campaign briefs"',
-            "blueprint row 'campaign brief' holds the blueprint of 'campaign briefs'",
-        ),
-        # doc_004 is the review notes, the brief's feedback document.
-        (
-            "blueprint_candidates",
-            "citations_json",
-            '"doc_003_sec_003"',
-            '"doc_004_sec_002"',
-            "has a candidate record 'candidate_01' citing 'doc_004_sec_002', which is not a"
-            " section of the blueprint's exemplars",
-        ),
-        # The brief stores one passage, from the second record; a selected first record
-        # leaves two selected records for one passage.
-        (
-            "blueprint_candidates",
-            "disposition",
-            "declined",
-            "selected_standing",
-            "has 1 passages that do not match its 2 selected candidate records",
-        ),
-        ("blueprint_candidates", "disposition", "declined", "kept", "row is malformed"),
     ],
 )
-def test_glossary_blueprint_and_candidate_rows_are_validated_when_a_snapshot_opens(
+def test_glossary_and_blueprint_rows_are_validated_when_a_snapshot_opens(
     tmp_path: Path, table: str, column: str, old: str, new: str, message: str
 ) -> None:
     corpus_dir = tmp_path / "corpus"
@@ -621,183 +558,6 @@ def test_glossary_blueprint_and_candidate_rows_are_validated_when_a_snapshot_ope
     assert changed == 1
     with pytest.raises(SnapshotIntegrityError, match=message):
         TopicSnapshot.open(output)
-
-
-def dated_reports_snapshot(root: Path) -> tuple[CompiledCorpus, Path]:
-    """`DATED_REPORTS` compiled with its data handling section nominated as house matter: a
-    standing, a conditional and a single-exemplar passage, in that order."""
-    corpus_dir = root / "corpus"
-    for rel_path, text in DATED_REPORTS.items():
-        (corpus_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (corpus_dir / rel_path).write_text(text, encoding="utf-8")
-    gateway = FakeGateway(house_headings=("Data handling",))
-    corpus = compile_corpus(corpus_dir, gateway, topic="reports", title="Reports")
-    output = root / "reports.arkive.db"
-    write_snapshot(corpus, output)
-    return corpus, output
-
-
-def test_passages_of_every_kind_and_their_candidate_records_round_trip(tmp_path: Path) -> None:
-    corpus, output = dated_reports_snapshot(tmp_path)
-
-    with TopicSnapshot.open(output) as snap:
-        assert SCHEMA_VERSION == "4.0"
-        assert tuple(snap.blueprints) == corpus.blueprints
-        assert tuple(snap.candidate_records) == corpus.candidate_records
-        (blueprint,) = snap.blueprints
-    standing, conditional, single = blueprint.passages
-    assert isinstance(standing, StandingPassage) and standing.wording_from == "newest_holder"
-    assert isinstance(conditional, ConditionalPassage)
-    assert [(v.section_id, v.doc_date_iso) for v in conditional.variants] == [
-        ("doc_001_sec_002", "2024-03-01"),
-        ("doc_002_sec_002", "2025-03-12"),
-    ]
-    assert isinstance(single, SingleExemplarPassage)
-    assert single.heading_path == "South Survey Report > Data handling"
-    assert [r.disposition for r in snap.candidate_records] == [
-        "selected_standing",
-        "selected_conditional",
-        "nominated_kept",
-    ]
-
-
-@pytest.mark.parametrize(
-    ("table", "column", "old", "new", "message"),
-    [
-        # The conditional passage's wording, from the newest report, is not in that section.
-        (
-            "blueprints",
-            "blueprint_json",
-            "fortnight.",
-            "fortnights.",
-            "passage 'Method' whose text is not a unit of 'doc_003_sec_002'",
-        ),
-        # A part of the standing unit is in its section, but it is not the unit.
-        (
-            "blueprints",
-            "blueprint_json",
-            " under its quality manual and audit schedule.",
-            "",
-            "passage 'Method' whose text is not a unit of 'doc_003_sec_002'",
-        ),
-        (
-            "blueprints",
-            "blueprint_json",
-            "survey week.",
-            "survey weeks.",
-            "passage 'Method' whose variant is not a unit of 'doc_001_sec_002'",
-        ),
-        (
-            "blueprints",
-            "blueprint_json",
-            '"doc_date_iso":"2024-03-01"',
-            '"doc_date_iso":"2024-03-02"',
-            "variant in 'doc_001_sec_002' is dated '2024-03-02', not as its document",
-        ),
-        # The newest report's date no longer makes it the newest holder.
-        (
-            "documents",
-            "doc_date_iso",
-            "2026-01-20",
-            "2023-01-20",
-            "newest_holder passage 'Method' whose source document is not dated strictly newer",
-        ),
-        (
-            "documents",
-            "doc_date_iso",
-            "2026-01-20",
-            "2025-03",
-            "newest_holder passage 'Method' whose source document is not dated strictly newer",
-        ),
-        (
-            "blueprints",
-            "blueprint_json",
-            '"heading_path":"South Survey Report > Data handling"',
-            '"heading_path":"South Survey Report > Results"',
-            "single-exemplar passage 'Data handling' whose heading path is not that of"
-            " 'doc_003_sec_004'",
-        ),
-        # A single-exemplar passage cites exactly one section.
-        (
-            "blueprints",
-            "blueprint_json",
-            '["doc_003_sec_004"]',
-            '["doc_003_sec_004","doc_003_sec_003"]',
-            "row is malformed",
-        ),
-        (
-            "blueprints",
-            "blueprint_json",
-            '"condition":"The project states its own method."',
-            '"condition":" "',
-            "row is malformed",
-        ),
-        # A recurring passage's source must be one of its citations.
-        (
-            "blueprints",
-            "blueprint_json",
-            '"source_section_id":"doc_003_sec_002"',
-            '"source_section_id":"doc_003_sec_003"',
-            "row is malformed",
-        ),
-        (
-            "blueprint_candidates",
-            "text",
-            "Raw sonar",
-            "Cooked sonar",
-            "has 3 passages that do not match its 3 selected candidate records",
-        ),
-    ],
-)
-def test_passage_kinds_and_their_records_are_checked_against_the_exemplars_at_open(
-    tmp_path: Path, table: str, column: str, old: str, new: str, message: str
-) -> None:
-    _, output = dated_reports_snapshot(tmp_path)
-    with sqlite3.connect(output) as db:
-        changed = db.execute(
-            f"UPDATE {table} SET {column} = replace({column}, ?, ?) WHERE instr({column}, ?)",
-            (old, new, old),
-        ).rowcount
-    db.close()
-
-    assert changed == 1
-    with pytest.raises(SnapshotIntegrityError, match=message):
-        TopicSnapshot.open(output)
-
-
-def test_a_build_never_writes_a_snapshot_whose_blueprints_opening_would_refuse(
-    tmp_path: Path,
-) -> None:
-    corpus, _ = dated_reports_snapshot(tmp_path / "built")
-    (blueprint,) = corpus.blueprints
-    standing = blueprint.passages[0]
-    # The text occurs in its section, but it is part of a unit, not a unit.
-    clipped = standing.model_copy(update={"text": standing.text.removesuffix(" schedule.")})
-    broken = {
-        "has a blank deliverable type": blueprint.model_copy(update={"deliverable_type": " "}),
-        "whose text is not a unit of 'doc_003_sec_002'": blueprint.model_copy(
-            update={"passages": (clipped, *blueprint.passages[1:])}
-        ),
-        # Two passages, whatever their sources and labels, never store the same wording.
-        "has passages 'Method' and 'Again' that store the same wording": blueprint.model_copy(
-            update={
-                "passages": (
-                    standing,
-                    standing.model_copy(update={"label": "Again"}),
-                    *blueprint.passages[1:],
-                )
-            }
-        ),
-    }
-    output = tmp_path / "out" / "reports.arkive.db"
-
-    for message, bad in broken.items():
-        with pytest.raises(SnapshotIntegrityError, match=message):
-            write_snapshot(replace(corpus, blueprints=(bad,)), output)
-
-    assert not output.parent.exists() or list(output.parent.iterdir()) == []
-    write_snapshot(corpus, output)
-    TopicSnapshot.open(output).close()
 
 
 def test_guide_summarises_blueprints_and_one_blueprint_is_read_in_full_by_folded_type(
@@ -829,7 +589,9 @@ def test_guide_summarises_blueprints_and_one_blueprint_is_read_in_full_by_folded
         },
     ]
     assert brief.outline and brief.conventions
-    assert [p.citations for p in brief.passages] == [("doc_002_sec_004", "doc_003_sec_004")]
+    assert [p.citations for p in brief.standing_passages] == [
+        ("doc_002_sec_004", "doc_003_sec_004")
+    ]
 
 
 def test_glossary_lookup_by_term_alias_list_and_miss(tmp_path: Path) -> None:
@@ -853,37 +615,6 @@ def test_glossary_lookup_by_term_alias_list_and_miss(tmp_path: Path) -> None:
     assert by_alias.matches == by_term.matches
     assert len(by_term.matches[0].senses) == 2
     assert (miss.query, miss.matches, miss.terms) == ("net promoter score", [], [])
-
-
-def test_document_dates_are_stored_with_their_basis_and_served_with_the_documents(
-    tmp_path: Path,
-) -> None:
-    corpus_dir = tmp_path / "corpus"
-    files = {
-        "a/printed.md": "# Printed\n\nDate: 19\u1d57\u02b0 Feb 2026\n\nBody text.\n",
-        "b/ambiguous.md": "# Ambiguous\n\nDate: 12/02/2026\n\nBody text.\n",
-        "c/undated.md": "# Undated\n\nBody text.\n",
-    }
-    for rel_path, text in files.items():
-        (corpus_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (corpus_dir / rel_path).write_text(text, encoding="utf-8")
-    (corpus_dir / "d").mkdir()
-    write_pdf(corpus_dir / "d/scan.pdf", [["Scan"]], creation_date="D:20250701120000Z")
-    corpus = compile_corpus(corpus_dir, FakeGateway(), topic="dated", title="Dated")
-    output = tmp_path / "dated.arkive.db"
-    write_snapshot(corpus, output)
-
-    with TopicSnapshot.open(output) as snap:
-        dates = [
-            (d.rel_path, d.doc_date, d.doc_date_iso, d.doc_date_basis)
-            for d in snap.list_documents()
-        ]
-    assert dates == [
-        ("a/printed.md", "19\u1d57\u02b0 Feb 2026", "2026-02-19", "printed"),
-        ("b/ambiguous.md", "12/02/2026", None, None),
-        ("c/undated.md", None, None, None),
-        ("d/scan.pdf", None, "2025-07-01", "embedded"),
-    ]
 
 
 @pytest.mark.parametrize(
@@ -914,32 +645,6 @@ def test_document_dates_are_stored_with_their_basis_and_served_with_the_document
         ),
         ("DROP TABLE chunks_fts", "lacks the tables chunks_fts"),
         ("UPDATE documents SET page_count = 'many' WHERE ordinal = 1", "not a valid snapshot"),
-        (
-            "UPDATE documents SET doc_date_iso = '2026-02-30', doc_date_basis = 'printed'",
-            "is not YYYY-MM-DD or YYYY-MM",
-        ),
-        (
-            "UPDATE documents SET doc_date_iso = '15 April 2026', doc_date_basis = 'printed'",
-            "is not YYYY-MM-DD or YYYY-MM",
-        ),
-        # ISO dates are ASCII digits only.
-        (
-            "UPDATE documents SET doc_date_iso = '\u0662\u0660\u0662\u0666-04-15',"
-            " doc_date_basis = 'printed'",
-            "is not YYYY-MM-DD or YYYY-MM",
-        ),
-        (
-            "UPDATE documents SET doc_date_iso = '2026-04', doc_date_basis = 'guessed'",
-            "doc_date_basis",
-        ),
-        (
-            "UPDATE documents SET doc_date_iso = '2026-04-15' WHERE ordinal = 1",
-            "both set or both None",
-        ),
-        (
-            "UPDATE documents SET doc_date_basis = 'embedded' WHERE ordinal = 1",
-            "both set or both None",
-        ),
         ("UPDATE facet_values SET folders_json = '{' WHERE ordinal = 1", "facet row is malformed"),
     ],
 )

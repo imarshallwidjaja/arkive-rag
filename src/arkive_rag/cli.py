@@ -137,7 +137,6 @@ def inspect(snapshot: Path) -> None:
                 "facets": [f.model_dump() for f in snap.facets],
                 "glossary": [e.model_dump() for e in snap.glossary],
                 "blueprints": [b.model_dump() for b in snap.blueprints],
-                "blueprint_candidates": [r.model_dump() for r in snap.candidate_records],
                 "documents": [
                     {**o.document.model_dump(exclude={"summary"}), "sections": len(o.sections)}
                     for o in outlines
