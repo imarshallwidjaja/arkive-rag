@@ -1961,13 +1961,16 @@ def write_glossary(
 # Step 6: guide.
 
 GUIDE_INSTRUCTIONS = """\
-You write the orientation guide for a knowledge base that AI agents will search.
-Using only the material given, describe in Markdown: what the collection holds and
-how it is organised (its facets), what each deliverable type covers, recurring
-methods, terms and results, and the caveats or gaps the curator notes record.
-Cite every factual claim with the exact section citation tokens from the
-catalog, written as [doc_a1b2c3d4e5:doc_a1b2c3d4e5_sec_001]. Use no other
-citation form. Keep the guide under 16,000 characters.
+You write a concise high-level orientation guide (target 4,000 to 8,000 characters,
+about 600 to 1,200 words, and strictly under 12,000 characters) for a knowledge base
+that AI agents will search. Synthesise themes and patterns across the collection rather
+than cataloguing individual documents or projects one by one (agents use list_documents
+and search for individual items). Using only the material given, describe in Markdown:
+what the collection holds and how it is organised (its facets), what each deliverable
+type covers, recurring methods and domain conventions, and the caveats or gaps the
+curator notes record. Cite representative factual claims with exact section citation
+tokens from the catalog, written as [doc_a1b2c3d4e5:doc_a1b2c3d4e5_sec_001] (1 to 3
+representative citations per point, never exhaustive lists). Use no other citation form.
 """
 
 
@@ -2164,9 +2167,12 @@ def write_guide(gateway: LanguageGateway, request: WriteGuide, view: CorpusView)
         if length > MAX_GUIDE_MARKDOWN_CHARS or size > MAX_GUIDE_MARKDOWN_BYTES:
             return Checked.reject(
                 [
-                    f"the guide has {length} characters ({size} bytes as a JSON string);"
-                    f" keep it under {MAX_GUIDE_MARKDOWN_CHARS} characters and"
-                    f" {MAX_GUIDE_MARKDOWN_BYTES} bytes"
+                    f"the guide has {length} characters ({size} bytes as a JSON string), which"
+                    f" exceeds the hard limit of {MAX_GUIDE_MARKDOWN_CHARS} characters and"
+                    f" {MAX_GUIDE_MARKDOWN_BYTES} bytes; shorten it substantially to under"
+                    " 8,000 characters (~1,000 words) by synthesising high-level patterns with"
+                    " 1-2 representative citations per point instead of listing individual"
+                    " documents or projects"
                 ]
             )
         bad = invalid_citations(draft.guide_markdown, view)
