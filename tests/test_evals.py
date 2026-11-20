@@ -35,7 +35,7 @@ from arkive_rag.models import (
     fold_for_quote,
 )
 from arkive_rag.passages import shingles
-from arkive_rag.server import INSTRUCTIONS, TopicCatalog, create_mcp_server
+from arkive_rag.server import INSTRUCTIONS, TopicCatalog, create_mcp_server, server_instructions
 from arkive_rag.snapshot import DRAFTING_GUIDANCE, TopicSnapshot
 from evals import agents as eval_agents
 from evals import drafting
@@ -845,21 +845,18 @@ def test_exemplars_prompt_labels_documents_by_path_without_visuals_and_ends_with
 # descriptions. A change to any of them changes the arm under test, so it fails here and is
 # made, with these pins, as a deliberate before/after change.
 PINNED_SERVER_INSTRUCTIONS = """\
-Arkive serves curated reference collections ("topics").
-1. Call list_topics when the topic slug or its facets are unknown. Facets filter a topic
-   (client, project, author and the like): list_documents, search, grep and prepare_draft
-   accept `filters`, a mapping from facet name to one value or alias; facets combine with AND.
-2. Answering questions: prefer targeted search or grep (default limits) over broad listings,
-   read_section for context, get_topic_guide for scope and curator notes, lookup_glossary for
-   unclear terms, and view_page when a chart, map or layout matters. Cite doc_id, section_id
-   and pages. Check whether a proposal or draft differs from a delivered report or final
-   memorandum: treat the delivered final deliverable as authoritative while noting provisional
-   proposal or earlier-draft values when relevant. When search and grep find no evidence for a
-   requested fact or mechanism, say that the corpus does not establish it and stop searching
-   rather than inferring an answer from adjacent workflows.
-3. Drafting a deliverable: call prepare_draft with the user's full project_inputs, never
-   summarised, and follow the drafting_guidance, exemplars, lessons and curator_notes it
-   returns. Use read_section for an outline entry it did not include.
+Arkive serves reference collections ("topics").
+1. Call list_topics only when more than one topic is served or a topic's facets are unknown.
+   Facets filter list_documents, search, grep and prepare_draft (`filters` combine with AND).
+2. Answering questions: start with targeted search or grep; use read_section only when a hit
+   needs surrounding context, get_topic_guide for scope or curator notes, lookup_glossary for
+   terms, and view_page for charts, maps or visual layout. Cite doc_id, section_id and pages,
+   and answer as soon as the evidence is sufficient. Delivered final reports and memoranda
+   outrank provisional proposals or earlier drafts; note both when they differ. When search
+   and grep find no evidence, state that the corpus does not establish it and stop.
+3. Drafting: call prepare_draft with the user's full project_inputs, follow its
+   drafting_guidance, exemplars, lessons and curator_notes, and read_section for omitted
+   sections.
 """
 
 PINNED_SERVER_TOOLS = (
@@ -901,16 +898,12 @@ PINNED_DRAFTING_GUIDANCE = """\
 # The drafting guidance of the server's tool descriptions, as the server publishes them.
 SERVER_DRAFTING_TOOL_DESCRIPTIONS = {
     "prepare_draft": (
-        "Everything needed to draft one new deliverable from the user's inputs: up to three\n"
-        "prior exemplars ranked against them, each with its complete outline and as much whole\n"
-        "section text as fits, other candidates, reviewer lessons, curator notes and drafting\n"
-        "guidance, with provenance (dates, version families, recurrence counts). Pass the\n"
-        "user's full inputs as project_inputs. deliverable_type is optional and matched\n"
-        "ignoring case; an unknown type lists the valid ones. Works without OPENAI_API_KEY."
+        "Assemble ranked exemplars, outlines, section text, reviewer lessons, curator notes\n"
+        "and drafting guidance for a new deliverable. Pass the user's full inputs verbatim as\n"
+        "project_inputs; optional deliverable_type matches ignoring case."
     ),
     "read_section": (
-        "Markdown of one section, with the IDs of its neighbouring sections. A section too\n"
-        "long for one result comes in parts: pass next_offset as offset for the next part."
+        "Markdown of one section with neighbour IDs (pass next_offset for further parts)."
     ),
 }
 
@@ -1395,8 +1388,11 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
             missing = await call("read_section", topic="bathymetry", section_id="nope")
             return sorted(by_name), grep, page, missing, server_instructions
 
-    names, grep, page, missing, server_instructions = anyio.run(run)
-    assert server_instructions == INSTRUCTIONS
+    names, grep, page, missing, init_instructions = anyio.run(run)
+    with TopicCatalog([snapshot_path]) as cat:
+        assert init_instructions == server_instructions(cat)
+    assert init_instructions.startswith(INSTRUCTIONS)
+    assert "Served topic: 'bathymetry'" in init_instructions
     assert with_server_instructions("Answer.", "  ") == "Answer."
     assert names == list(PINNED_SERVER_TOOLS)
     assert isinstance(grep, str) and "330.9" in grep
@@ -1638,7 +1634,9 @@ def test_layer2_does_not_judge_or_credit_unfinished_runs(
     requests = api.requests("/responses")
     assert len(requests) == runs and api.request_count == runs
     # Like an MCP host, only the Arkive arm sees the server's initialize instructions.
-    mcp_instructions = f"{QA_INSTRUCTIONS}\n\nMCP SERVER INSTRUCTIONS:\n{INSTRUCTIONS.strip()}"
+    with TopicCatalog([snapshot_path]) as cat:
+        expected = server_instructions(cat).strip()
+    mcp_instructions = f"{QA_INSTRUCTIONS}\n\nMCP SERVER INSTRUCTIONS:\n{expected}"
     assert [r["instructions"] for r in requests] == [QA_INSTRUCTIONS, mcp_instructions] * len(cases)
     rows = cast(list[dict[str, Any]], result["rows"])
     assert [r["status"] for r in rows] == ["incomplete"] * runs

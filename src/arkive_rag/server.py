@@ -41,21 +41,18 @@ from arkive_rag.snapshot import (
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 INSTRUCTIONS = """\
-Arkive serves curated reference collections ("topics").
-1. Call list_topics when the topic slug or its facets are unknown. Facets filter a topic
-   (client, project, author and the like): list_documents, search, grep and prepare_draft
-   accept `filters`, a mapping from facet name to one value or alias; facets combine with AND.
-2. Answering questions: prefer targeted search or grep (default limits) over broad listings,
-   read_section for context, get_topic_guide for scope and curator notes, lookup_glossary for
-   unclear terms, and view_page when a chart, map or layout matters. Cite doc_id, section_id
-   and pages. Check whether a proposal or draft differs from a delivered report or final
-   memorandum: treat the delivered final deliverable as authoritative while noting provisional
-   proposal or earlier-draft values when relevant. When search and grep find no evidence for a
-   requested fact or mechanism, say that the corpus does not establish it and stop searching
-   rather than inferring an answer from adjacent workflows.
-3. Drafting a deliverable: call prepare_draft with the user's full project_inputs, never
-   summarised, and follow the drafting_guidance, exemplars, lessons and curator_notes it
-   returns. Use read_section for an outline entry it did not include.
+Arkive serves reference collections ("topics").
+1. Call list_topics only when more than one topic is served or a topic's facets are unknown.
+   Facets filter list_documents, search, grep and prepare_draft (`filters` combine with AND).
+2. Answering questions: start with targeted search or grep; use read_section only when a hit
+   needs surrounding context, get_topic_guide for scope or curator notes, lookup_glossary for
+   terms, and view_page for charts, maps or visual layout. Cite doc_id, section_id and pages,
+   and answer as soon as the evidence is sufficient. Delivered final reports and memoranda
+   outrank provisional proposals or earlier drafts; note both when they differ. When search
+   and grep find no evidence, state that the corpus does not establish it and stop.
+3. Drafting: call prepare_draft with the user's full project_inputs, follow its
+   drafting_guidance, exemplars, lessons and curator_notes, and read_section for omitted
+   sections.
 """
 
 
@@ -128,22 +125,33 @@ def _as_tool_errors() -> Iterator[None]:
         raise ToolError(str(exc)) from exc
 
 
+def server_instructions(catalog: TopicCatalog) -> str:
+    """Server initialize instructions; names the served topic inline when there is only one."""
+    if len(catalog.snapshots) != 1:
+        return INSTRUCTIONS
+    sole = catalog.snapshots[0]
+    facets = ", ".join(f.name for f in sole.facets) or "none"
+    types = ", ".join(t.deliverable_type for t in sole.type_summaries()[:20]) or "none"
+    return (
+        f"{INSTRUCTIONS}Served topic: {sole.topic!r} (facets: {facets};"
+        f" deliverable_types: {types}).\n"
+    )
+
+
 def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None = None) -> MCPServer:
-    server = MCPServer(name="arkive-rag", instructions=INSTRUCTIONS, version=__version__)
+    server = MCPServer(
+        name="arkive-rag", instructions=server_instructions(catalog), version=__version__
+    )
 
     @server.tool()
     def list_topics(offset: int = 0) -> Annotated[CallToolResult, TopicPage]:
-        """List the topics this server serves, with their facets, allowed facet values and
-        deliverable types (the first 50 of each; omitted_* counts the rest). Pass next_offset
-        as offset for the next page of topics."""
+        """List served topics, their facets/values and deliverable types (paged by offset)."""
         with _as_tool_errors():
             return _structured(topic_page(catalog.snapshots, offset))
 
     @server.tool()
     def get_topic_guide(topic: str) -> Annotated[CallToolResult, TopicGuide]:
-        """Cited overview of a topic: its scope, curator notes, facet definitions, glossary
-        terms and its deliverable types with document and feedback counts. Notes, facet values
-        and terms that do not fit are counted in its omitted_* fields."""
+        """Topic overview, curator notes, facet definitions, glossary terms and type counts."""
         with _as_tool_errors():
             return _structured(catalog.get(topic).guide())
 
@@ -154,12 +162,9 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
         deliverable_type: str | None = None,
         filters: dict[str, str] | None = None,
     ) -> Annotated[CallToolResult, DraftPacket]:
-        """Everything needed to draft one new deliverable from the user's inputs: up to three
-        prior exemplars ranked against them, each with its complete outline and as much whole
-        section text as fits, other candidates, reviewer lessons, curator notes and drafting
-        guidance, with provenance (dates, version families, recurrence counts). Pass the
-        user's full inputs as project_inputs. deliverable_type is optional and matched
-        ignoring case; an unknown type lists the valid ones. Works without OPENAI_API_KEY."""
+        """Assemble ranked exemplars, outlines, section text, reviewer lessons, curator notes
+        and drafting guidance for a new deliverable. Pass the user's full inputs verbatim as
+        project_inputs; optional deliverable_type matches ignoring case."""
         with _as_tool_errors():
             return _structured(
                 catalog.get(topic).prepare_draft(
@@ -171,9 +176,7 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def list_documents(
         topic: str, filters: dict[str, str] | None = None, limit: int = 50, offset: int = 0
     ) -> Annotated[CallToolResult, DocumentPage]:
-        """One page of a topic's documents in path order, with their deliverable type,
-        feedback role and version family. `filters` maps facet names to one value or alias
-        each; several facets combine with AND. Pass next_offset as offset for the next page."""
+        """Paged documents in path order with type, feedback role and version family."""
         with _as_tool_errors():
             return _structured(
                 catalog.get(topic).list_documents_page(filters=filters, limit=limit, offset=offset)
@@ -183,8 +186,7 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def get_document_outline(
         topic: str, doc_id: str, offset: int = 0
     ) -> Annotated[CallToolResult, DocumentOutline]:
-        """Document metadata and one page of its section outline with page ranges. Pass
-        next_offset as offset for the next page of a long outline."""
+        """Document metadata and section outline with page ranges (paged by offset)."""
         with _as_tool_errors():
             return _structured(catalog.get(topic).outline(doc_id, offset=offset))
 
@@ -192,9 +194,7 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def search(
         topic: str, query: str, filters: dict[str, str] | None = None, top_k: int = 5
     ) -> Annotated[CallToolResult, list[SearchHit]]:
-        """Hybrid keyword and semantic search over chunks, optionally restricted by facet
-        `filters`, with at most three chunks per version family unless fewer hits remain.
-        Needs OPENAI_API_KEY on the server."""
+        """Hybrid keyword and semantic chunk search, diversified by version family."""
         with _as_tool_errors():
             snapshot = catalog.get(topic)
             if embed_query is None:
@@ -209,8 +209,7 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def grep(
         topic: str, pattern: str, filters: dict[str, str] | None = None, max_matches: int = 12
     ) -> Annotated[CallToolResult, list[GrepMatch]]:
-        """Case-insensitive literal search for exact strings, numbers and filenames,
-        optionally restricted by facet `filters`; at most 50 matches."""
+        """Case-insensitive literal search for exact strings, numbers and filenames (max 50)."""
         with _as_tool_errors():
             return _structured(
                 catalog.get(topic).grep(pattern, filters=filters, max_matches=max_matches)
@@ -220,15 +219,13 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def read_section(
         topic: str, section_id: str, offset: int = 0
     ) -> Annotated[CallToolResult, SectionReadView]:
-        """Markdown of one section, with the IDs of its neighbouring sections. A section too
-        long for one result comes in parts: pass next_offset as offset for the next part."""
+        """Markdown of one section with neighbour IDs (pass next_offset for further parts)."""
         with _as_tool_errors():
             return _structured(catalog.get(topic).read_section(section_id, offset=offset))
 
     @server.tool()
     def view_page(topic: str, doc_id: str, page_number: int) -> list[TextContent | ImageContent]:
-        """Rendered page image (WebP) with its visual summary and native text; text too long
-        for one result is cut and says how much it left out."""
+        """Rendered page image (WebP) with visual summary and native text."""
         with _as_tool_errors():
             page = catalog.get(topic).view_page(doc_id, page_number)
         caption = page_caption(page)
@@ -242,11 +239,8 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     def lookup_glossary(
         topic: str, query: str | None = None, offset: int = 0
     ) -> Annotated[CallToolResult, GlossaryLookup]:
-        """The topic's glossary, one page from `offset`. Without `query`, each term with
-        whether a sense has a definition. With `query`, the full entries whose term or alias
-        contains it: each sense has section citations. A null definition means no definition
-        was established from its cited evidence; it does not prove the corpus never defines
-        the term."""
+        """Glossary terms (no query) or matching entries with section citations (null definition
+        means unestablished from cited text, not absent from the corpus)."""
         with _as_tool_errors():
             return _structured(catalog.get(topic).lookup_glossary(query, offset=offset))
 
