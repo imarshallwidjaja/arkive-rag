@@ -1,0 +1,1049 @@
+{
+  "format": "arkive-eval-pack/3",
+  "name": "example-structural-monitoring-consultancy",
+  "description": "Fictional eval pack for the structural-monitoring-consultancy example collection (Marrick Instrumentation, 126 files of strain monitoring work for five clients from 2023 to 2026: vibrating-wire and fibre Bragg grating installation reports, proposals, drafts, review registers and site records). Every name, value and file in it is invented.",
+  "corpus_fingerprint": "2b52eb369ddeb399a7ed6c82c60dba977c856877f0b39cf0829b95fd26a4c392",
+  "retrieval_cases": [
+    {
+      "case_id": "greyscar_final_alarm_levels",
+      "category": "exact_identifiers",
+      "query": "MI-IR-2505 amber and red alarm levels in the final issue",
+      "required_groups": [
+        [
+          "120"
+        ],
+        [
+          "170"
+        ]
+      ],
+      "expected_docs": [
+        "doc_9f0e5aae8b"
+      ]
+    },
+    {
+      "case_id": "outer_jetty_interrogator_serial",
+      "category": "exact_identifiers",
+      "query": "Which installation used interrogator PF4-2043?",
+      "required_groups": [
+        [
+          "PF4-2043"
+        ],
+        [
+          "Outer Jetty"
+        ]
+      ],
+      "expected_docs": [
+        "doc_fd5001f976"
+      ]
+    },
+    {
+      "case_id": "ls8_reference_grating_sensitivity",
+      "category": "exact_identifiers",
+      "query": "LS-8 strain-free reference grating temperature sensitivity pm/°C certificate value",
+      "required_groups": [
+        [
+          "9.7"
+        ]
+      ],
+      "expected_docs": [
+        "doc_9911ec1cd2"
+      ]
+    },
+    {
+      "case_id": "protecting_seals_and_porpoises",
+      "category": "conceptual_paraphrase",
+      "query": "how do we keep seals and porpoises safe when divers or pile driving work near the instrumented jetty",
+      "required_groups": [
+        [
+          "hydrophone"
+        ],
+        [
+          "500 m"
+        ]
+      ],
+      "expected_docs": [
+        "doc_fd5001f976"
+      ]
+    },
+    {
+      "case_id": "uncorrected_frequency_criticism",
+      "category": "conceptual_paraphrase",
+      "query": "reviewer told the author not to present raw vibrating wire frequencies without correcting for temperature",
+      "required_groups": [
+        [
+          "thermistor"
+        ],
+        [
+          "reference datum"
+        ]
+      ],
+      "expected_docs": [
+        "doc_2be7f8036a"
+      ]
+    },
+    {
+      "case_id": "instruments_left_after_monitoring",
+      "category": "conceptual_paraphrase",
+      "query": "what was done with the gauges and the logger once the cable tunnel monitoring was closed",
+      "required_groups": [
+        [
+          "abandoned in place"
+        ],
+        [
+          "CR16-0451"
+        ]
+      ],
+      "expected_docs": [
+        "doc_44c1ed6e27"
+      ]
+    },
+    {
+      "case_id": "greyscar_final_versus_drafts",
+      "category": "disambiguation_and_structure",
+      "query": "Greyscar spillway FBG report final v1.0 alarm levels after the QA review",
+      "required_groups": [
+        [
+          "Final v1.0"
+        ],
+        [
+          "85%"
+        ]
+      ],
+      "expected_docs": [
+        "doc_9f0e5aae8b"
+      ]
+    },
+    {
+      "case_id": "hatch_end_vibrating_wire_baseline",
+      "category": "disambiguation_and_structure",
+      "query": "Hatch End substation strain gauge thermistor correction and reference datum",
+      "required_groups": [
+        [
+          "Hatch End"
+        ],
+        [
+          "thermistor"
+        ]
+      ],
+      "expected_docs": [
+        "doc_0d99fcfbd3"
+      ]
+    },
+    {
+      "case_id": "mill_lane_revised_fee",
+      "category": "disambiguation_and_structure",
+      "query": "Mill Lane retaining wall proposal v1.0 revised fixed fee",
+      "required_groups": [
+        [
+          "19,980"
+        ]
+      ],
+      "expected_docs": [
+        "doc_3b4d040a4e"
+      ]
+    },
+    {
+      "case_id": "ellery_peak_strain_chart",
+      "category": "visual_only",
+      "query": "Ellery retaining wall Figure 2 peak strain change per gauge during stage 3 excavation",
+      "required_groups": [
+        [
+          "142"
+        ]
+      ],
+      "expected_docs": [
+        "doc_5f3103b23f"
+      ]
+    }
+  ],
+  "qa_cases": [
+    {
+      "case_id": "ellery_largest_peak_change",
+      "kind": "lookup",
+      "question": "In Figure 2 of the Ellery retaining wall installation report, which gauge shows the largest peak strain change during stage 3 excavation, and how large is it?",
+      "ground_truth_facts": [
+        "Gauge EW-05 shows the largest peak change in Figure 2: -142 microstrain (compression).",
+        "The value appears only in the drawn chart, not in the report text."
+      ],
+      "required_groups": [
+        [
+          "EW-05"
+        ],
+        [
+          "142"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_5f3103b23f",
+          "pages": [
+            3,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "case_id": "marlow_decommissioning",
+      "kind": "lookup",
+      "question": "What happened to the Marlow cable tunnel strain gauges and datalogger when monitoring ended?",
+      "ground_truth_facts": [
+        "On 14 March 2025 the nine gauges were abandoned in place with their cables cut back and sealed.",
+        "The Corlen CR-16 datalogger CR16-0451 was recovered and returned to Marrick stock."
+      ],
+      "required_groups": [
+        [
+          "abandoned in place",
+          "left in place"
+        ],
+        [
+          "CR16-0451"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_44c1ed6e27",
+          "pages": [
+            2,
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "case_id": "ls8_arrays_by_project",
+      "kind": "multi_document",
+      "question": "Which Marrick projects installed Lumenstrand LS-8 fibre Bragg grating arrays in 2024 and 2025, and how many gratings did each installation have?",
+      "ground_truth_facts": [
+        "Askern Viaduct (September 2024): six arrays, 48 gratings.",
+        "Greyscar Dam spillway (June 2025): three arrays, 24 gratings.",
+        "Kessick Outer Jetty (September 2025): four arrays, 32 gratings."
+      ],
+      "required_groups": [
+        [
+          "Askern"
+        ],
+        [
+          "48"
+        ],
+        [
+          "Greyscar"
+        ],
+        [
+          "24"
+        ],
+        [
+          "Outer Jetty"
+        ],
+        [
+          "32"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_4957546a24",
+          "pages": [
+            2,
+            2
+          ]
+        },
+        {
+          "doc_id": "doc_9f0e5aae8b",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_fd5001f976",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "ostrand_substation_vibrating_wire_gauges",
+      "kind": "aggregation",
+      "question": "How many vibrating-wire strain gauge installation reports has Marrick issued for Ostrand Energy Networks substations, and how many gauges did they install in total?",
+      "ground_truth_facts": [
+        "Three reports: Fenwick 275 kV substation (12 gauges), Brigg Lane 132 kV substation (10 gauges) and Hatch End 132 kV substation (14 gauges).",
+        "36 gauges in total."
+      ],
+      "required_groups": [
+        [
+          "3",
+          "three"
+        ],
+        [
+          "36"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_e68a6a418f",
+          "pages": [
+            2,
+            2
+          ]
+        },
+        {
+          "doc_id": "doc_e3d4844246",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_0d99fcfbd3",
+          "pages": [
+            2,
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "case_id": "greyscar_alarm_levels_across_versions",
+      "kind": "conflict",
+      "question": "What amber and red alarm levels does the Greyscar Dam spillway FBG installation report set?",
+      "ground_truth_facts": [
+        "The issued report, v1.0 of 8 July 2025, sets amber at 60% and red at 85% of the 200 µε allowable change: 120 and 170 µε.",
+        "Drafts v0.8 and v0.9 set 75% and 100% (150 and 200 µε); the QA disposition register replaced them with the FBG house rule."
+      ],
+      "required_groups": [
+        [
+          "60%",
+          "60 %",
+          "60 per cent"
+        ],
+        [
+          "85%",
+          "85 %",
+          "85 per cent"
+        ],
+        [
+          "75%",
+          "75 %",
+          "v0.8",
+          "v0.9",
+          "draft"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_9f0e5aae8b",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_e151cff5f7",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_6dbe7f96e4",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_4329fae0a3",
+          "pages": [
+            1,
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "case_id": "mill_lane_fee_across_versions",
+      "kind": "conflict",
+      "question": "What fixed fee did Marrick quote for monitoring the Mill Lane retaining wall?",
+      "ground_truth_facts": [
+        "The revised proposal v1.0 of 21 October 2024 quotes GBP 19,980 excluding VAT.",
+        "It replaces v0.9 of 7 October 2024, which quoted GBP 21,760; the council took over traffic management."
+      ],
+      "required_groups": [
+        [
+          "19,980"
+        ],
+        [
+          "21,760",
+          "v0.9"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_3b4d040a4e",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_7f9804e1ce",
+          "pages": null
+        }
+      ]
+    },
+    {
+      "case_id": "adhesive_creep_correction",
+      "kind": "abstention",
+      "question": "What correction does Marrick apply for adhesive creep in bonded FBG gratings when reporting strain after the baseline?",
+      "ground_truth_facts": [
+        "The collection does not describe any adhesive creep correction; FBG strain is corrected only by SFR temperature compensation against the 72-hour baseline."
+      ],
+      "required_groups": [
+        [
+          "does not",
+          "not stated",
+          "no record",
+          "not available",
+          "cannot find",
+          "not in",
+          "no mention",
+          "no reference",
+          "not mentioned",
+          "not documented",
+          "does not mention",
+          "no adhesive creep"
+        ]
+      ]
+    },
+    {
+      "case_id": "sfr_and_tarp_meanings",
+      "kind": "vocabulary",
+      "question": "What do SFR and TARP mean in Marrick monitoring reports?",
+      "ground_truth_facts": [
+        "SFR means strain-free reference grating: the eighth grating of an LS-8 array, free in a loose tube, used for temperature compensation.",
+        "TARP means trigger action response plan, which handles amber and red alarm readings."
+      ],
+      "required_groups": [
+        [
+          "strain-free reference",
+          "strain free reference"
+        ],
+        [
+          "trigger action response plan"
+        ]
+      ],
+      "source_anchors": [
+        {
+          "doc_id": "doc_9f0e5aae8b",
+          "pages": null
+        },
+        {
+          "doc_id": "doc_9911ec1cd2",
+          "pages": null
+        }
+      ]
+    }
+  ],
+  "holdouts": [
+    {
+      "holdout_id": "tallow-cross-fbg-installation-report",
+      "included_paths": [
+        "AGENTS.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-installation-report.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-meeting-minutes.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-method-statement-v0.8.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-method-statement-v0.9.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-method-statement-v1.0.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-monitoring-bulletin-2025-04.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-commissioning-log.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-installation-report-v0.8.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-installation-report-v0.9.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-installation-report-v1.0.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-proposal.md",
+        "active/m2505-halverton-greyscar-spillway/prisma-fi-4-calibration-pf4-1876.md",
+        "active/m2505-halverton-greyscar-spillway/qa-disposition-register.docx",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-client-letter-alarm-review.docx",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-incident-note.md",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-installation-report.md",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-monitoring-bulletin-2025-06.md",
+        "active/m2511-corrib-vale-quarry-road-embankment/m2511-meeting-minutes.md",
+        "active/m2511-corrib-vale-quarry-road-embankment/m2511-proposal.md",
+        "active/m2511-corrib-vale-quarry-road-embankment/m2511-scoping-note.md",
+        "active/m2514-kessick-dry-dock-gate/m2514-calibration-record.pdf",
+        "active/m2514-kessick-dry-dock-gate/m2514-installation-report.md",
+        "active/m2514-kessick-dry-dock-gate/m2514-monitoring-bulletin-2025-08.md",
+        "active/m2514-kessick-dry-dock-gate/m2514-qa-checklist.md",
+        "active/m2517-northbray-carrick-footbridge/m2517-client-email.md",
+        "active/m2517-northbray-carrick-footbridge/m2517-meeting-minutes.docx",
+        "active/m2517-northbray-carrick-footbridge/m2517-proposal.md",
+        "active/m2517-northbray-carrick-footbridge/m2517-scoping-note.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-client-email.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-meeting-minutes.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-proposal.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-scoping-note.md",
+        "active/m2522-kessick-outer-jetty/authority-comment-log.pdf",
+        "active/m2522-kessick-outer-jetty/m2522-commissioning-log.md",
+        "active/m2522-kessick-outer-jetty/m2522-installation-report.md",
+        "active/m2522-kessick-outer-jetty/m2522-monitoring-bulletin-2025-10.md",
+        "active/m2522-kessick-outer-jetty/m2522-proposal.md",
+        "active/m2526-halverton-brindle-weir/m2526-installation-report.pdf",
+        "active/m2526-halverton-brindle-weir/m2526-monitoring-bulletin-2025-11.md",
+        "active/m2526-halverton-brindle-weir/m2526-qa-checklist.md",
+        "active/m2529-corrib-vale-old-quay-bridge/m2529-incident-note.md",
+        "active/m2529-corrib-vale-old-quay-bridge/m2529-proposal.md",
+        "active/m2529-corrib-vale-old-quay-bridge/m2529-scoping-note.md",
+        "active/m2603-halverton-cold-fell-dam/m2603-meeting-minutes.md",
+        "active/m2603-halverton-cold-fell-dam/m2603-proposal.docx",
+        "active/m2603-halverton-cold-fell-dam/m2603-scoping-note-v0.8.md",
+        "active/m2603-halverton-cold-fell-dam/m2603-scoping-note-v1.0.md",
+        "active/m2606-ostrand-hatch-end-substation/m2606-commissioning-log.md",
+        "active/m2606-ostrand-hatch-end-substation/m2606-incident-note.md",
+        "active/m2606-ostrand-hatch-end-substation/m2606-installation-report.docx",
+        "active/m2606-ostrand-hatch-end-substation/m2606-monitoring-bulletin-2026-03.md",
+        "active/m2608-northbray-ellery-retaining-wall/m2608-client-email.md",
+        "active/m2608-northbray-ellery-retaining-wall/m2608-commissioning-log.md",
+        "active/m2608-northbray-ellery-retaining-wall/m2608-installation-report.pdf",
+        "active/m2611-corrib-vale-brackenford-footbridge/m2611-proposal.md",
+        "active/m2611-corrib-vale-brackenford-footbridge/m2611-scoping-note.md",
+        "active/m2617-kessick-east-pontoon/m2617-proposal.md",
+        "active/m2617-kessick-east-pontoon/m2617-scoping-note.md",
+        "archive/m2301-northbray-holme-cutting/m2301-client-letter.md",
+        "archive/m2301-northbray-holme-cutting/m2301-commissioning-log.md",
+        "archive/m2301-northbray-holme-cutting/m2301-installation-report.md",
+        "archive/m2301-northbray-holme-cutting/m2301-scoping-note.md",
+        "archive/m2304-halverton-staddle-dam/m2304-calibration-record.md",
+        "archive/m2304-halverton-staddle-dam/m2304-installation-report.docx",
+        "archive/m2304-halverton-staddle-dam/m2304-meeting-minutes.md",
+        "archive/m2304-halverton-staddle-dam/m2304-monitoring-bulletin-2023-09.md",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-incident-note.md",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-installation-report.pdf",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-meeting-minutes.md",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-proposal.md",
+        "archive/m2310-ostrand-marlow-cable-tunnel/m2310-decommissioning-statement.docx",
+        "archive/m2310-ostrand-marlow-cable-tunnel/m2310-installation-report.md",
+        "archive/m2310-ostrand-marlow-cable-tunnel/m2310-monitoring-bulletin-2024-02.md",
+        "archive/m2312-corrib-vale-ashby-culvert/m2312-commissioning-log.md",
+        "archive/m2312-corrib-vale-ashby-culvert/m2312-installation-report.md",
+        "archive/m2312-corrib-vale-ashby-culvert/m2312-qa-checklist.md",
+        "archive/m2312-corrib-vale-ashby-culvert/peer-check-sheet.md",
+        "archive/m2316-kessick-crane-rail-beam/m2316-client-letter.md",
+        "archive/m2316-kessick-crane-rail-beam/m2316-proposal.md",
+        "archive/m2316-kessick-crane-rail-beam/m2316-scoping-note.md",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-client-letter.md",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-meeting-minutes.md",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-proposal.docx",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-scoping-note.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-incident-note.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-installation-report.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-monitoring-bulletin-2024-08.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-proposal.md",
+        "archive/m2409-northbray-askern-viaduct/AGENTS.md",
+        "archive/m2409-northbray-askern-viaduct/m2409-commissioning-log.md",
+        "archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline-report.docx",
+        "archive/m2409-northbray-askern-viaduct/m2409-meeting-minutes.md",
+        "archive/m2409-northbray-askern-viaduct/m2409-proposal.md",
+        "archive/m2409-northbray-askern-viaduct/prisma-fi-4-calibration-pf4-1876.md",
+        "archive/m2411-kessick-ro-ro-ramp/m2411-calibration-record.md",
+        "archive/m2411-kessick-ro-ro-ramp/m2411-installation-report.md",
+        "archive/m2411-kessick-ro-ro-ramp/m2411-qa-checklist.md",
+        "archive/m2414-ostrand-fenwick-substation/m2414-client-email.md",
+        "archive/m2414-ostrand-fenwick-substation/m2414-commissioning-log.md",
+        "archive/m2414-ostrand-fenwick-substation/m2414-installation-report.docx",
+        "archive/m2414-ostrand-fenwick-substation/m2414-proposal.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-client-letter.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-proposal-v0.9.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-proposal-v1.0.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-scoping-note.md",
+        "archive/m2421-halverton-ryecroft-pumping-station/m2421-meeting-minutes.md",
+        "archive/m2421-halverton-ryecroft-pumping-station/m2421-proposal.md",
+        "archive/m2421-halverton-ryecroft-pumping-station/m2421-scoping-note.md",
+        "fee-schedule-2024.md",
+        "fee-schedule-2025.md",
+        "fee-schedule-2026.md",
+        "installation-report-qa-checklist.md",
+        "instrument-stock-list-2026-01.md",
+        "reference/equipment/corlen-cr-16-datalogger.md",
+        "reference/equipment/geovane-vw-4200-strain-gauge.md",
+        "reference/equipment/lumenstrand-ls-8-fbg-array.md",
+        "reference/equipment/prisma-fi-4-interrogator.md",
+        "reference/regulatory/harbour-works-licence-conditions.md",
+        "reference/regulatory/rail-asset-protection-requirements.pdf",
+        "reference/regulatory/reservoir-safety-supervising-engineer-duties.md",
+        "reference/regulatory/working-near-live-hv-plant.md",
+        "standard-terms-of-engagement.md"
+      ],
+      "held_out_markers": [
+        "m2614",
+        "tallow-cross"
+      ],
+      "reference_doc_id": "doc_3a34b8f880",
+      "instructions": "You are Maren Lisk, Senior Engineer at Marrick Instrumentation, writing the fibre Bragg grating installation and baseline report for the Tallow Cross 132 kV substation. Write the complete report in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Marrick Instrumentation documents, follow their house structure, method and wording. Return only the report.",
+      "run_notes": "- our ref: MI-IR-2614; issue date 24 March 2026; Issue 1, final\n- client: Ostrand Energy Networks; contact Ms Delphine Okonkwo-Hart\n- author: Maren Lisk; checker: Priya Venn; approver: Callum Draycott\n- site: Tallow Cross 132 kV substation; T2 transformer stays in service throughout\n- why: Harrowby Developments building a sheet-piled basement 14 m east of the compound fence\n- arrays: 2 x Lumenstrand LS-8, 16 gratings (14 bonded + 2 SFR); serials LS8-2614-01, -02; gratings 1.2 m apart\n- TX-A = transformer T2 plinth, east face; TX-B = cable tunnel portal, east wall\n- interrogator: Prisma FI-4 PF4-2291 in the relay room cabinet; 110 V auxiliary supply via fused spur fitted by Ostrand's electricians; 8 h UPS; 4G router outside the compound fence\n- install: 9 Mar TX-A (permit PTW-TC-0311); 10 Mar TX-B (PTW-TC-0312); 11 Mar conduit, cabinet, commissioning (PTW-TC-0313); all under Ostrand permits to work\n- fibre leads dielectric, so no bonding or earthing near live plant; armoured conduit to the cabinet\n- baseline window: 13 Mar 2026 00:00 to 16 Mar 2026 00:00; 4,320 readings per grating\n- T2 load 41-68% during the baseline; plinth surface up to +6 °C each afternoon; compensated residual within ±1.1 µε\n- baseline wavelengths: TX-A-1 1529.8371 nm sd 0.7; TX-A-2 1534.6773 nm sd 0.9; TX-A-3 1539.3976 nm sd 0.8; TX-A-4 1543.4224 nm sd 0.9; TX-A-5 1548.0537 nm sd 1.0; TX-A-6 1552.3459 nm sd 0.4; TX-A-7 1557.3574 nm sd 0.9; TX-A-8 1561.5755 nm (SFR); TX-B-1 1530.1016 nm sd 0.6; TX-B-2 1534.3521 nm sd 0.7; TX-B-3 1538.6371 nm sd 0.7; TX-B-4 1543.4900 nm sd 0.9; TX-B-5 1548.3121 nm sd 0.5; TX-B-6 1552.7570 nm sd 0.8; TX-B-7 1556.7341 nm sd 0.4; TX-B-8 1561.1832 nm (SFR)\n- designer's allowable strain change (Ostrand asset protection engineer): TX-A 180 µε; TX-B 220 µε\n- alarms to: Ms Okonkwo-Hart, Ostrand control room at Hessle, Marrick duty engineer\n- commissioning: return loss TX-A 47 dB, TX-B 45 dB; peak width 0.21 / 0.24 nm; SFRs free; conduit sealed; alarm test message received 12 Mar 2026 15:10\n- maintenance access needs an Ostrand permit to work and an authorised person on site\n",
+      "exemplar_paths": [
+        "archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline-report.docx",
+        "active/m2505-halverton-greyscar-spillway/m2505-installation-report-v1.0.md",
+        "active/m2522-kessick-outer-jetty/m2522-installation-report.md",
+        "active/m2505-halverton-greyscar-spillway/qa-disposition-register.docx"
+      ],
+      "rubric": [
+        {
+          "check_id": "report_identity_kept",
+          "category": "project_facts",
+          "description": "Carries the MI-IR-2614 reference and the client contact.",
+          "require_groups": [
+            [
+              "MI-IR-2614"
+            ],
+            [
+              "Okonkwo-Hart"
+            ]
+          ]
+        },
+        {
+          "check_id": "instruments_kept",
+          "category": "project_facts",
+          "description": "Names the interrogator serial and both arrays.",
+          "require_groups": [
+            [
+              "PF4-2291"
+            ],
+            [
+              "TX-A"
+            ],
+            [
+              "TX-B"
+            ]
+          ]
+        },
+        {
+          "check_id": "baseline_window_kept",
+          "category": "project_facts",
+          "description": "States the baseline window from 13 to 16 March 2026.",
+          "require_groups": [
+            [
+              "13 March 2026",
+              "13/03/2026",
+              "2026-03-13",
+              "13 Mar 2026",
+              "13 to 16 March 2026",
+              "13-16 March 2026",
+              "13–16 March 2026",
+              "13 to 16 Mar 2026"
+            ],
+            [
+              "16 March 2026",
+              "16/03/2026",
+              "2026-03-16",
+              "16 Mar 2026"
+            ]
+          ]
+        },
+        {
+          "check_id": "substation_context_kept",
+          "category": "project_facts",
+          "description": "Records the third-party basement, the permits to work and the dielectric fibre near live plant.",
+          "require_groups": [
+            [
+              "Harrowby"
+            ],
+            [
+              "permit"
+            ],
+            [
+              "dielectric"
+            ]
+          ]
+        },
+        {
+          "check_id": "house_alarm_rule_applied",
+          "category": "methodology_and_house_style",
+          "description": "Applies the FBG house rule (amber 60%, red 85%) to the run-note allowables: 108/153 µε and 132/187 µε.",
+          "require_groups": [
+            [
+              "108"
+            ],
+            [
+              "153"
+            ],
+            [
+              "132"
+            ],
+            [
+              "187"
+            ]
+          ]
+        },
+        {
+          "check_id": "house_temperature_compensation",
+          "category": "methodology_and_house_style",
+          "description": "Describes SFR temperature compensation with the certificate sensitivity of 9.7 pm/°C.",
+          "require_groups": [
+            [
+              "strain-free reference",
+              "SFR"
+            ],
+            [
+              "9.7"
+            ]
+          ]
+        },
+        {
+          "check_id": "house_baseline_rule",
+          "category": "methodology_and_house_style",
+          "description": "States the house rule that the baseline is the mean of 72 hours of stable readings.",
+          "require_groups": [
+            [
+              "72 hours",
+              "72-hour",
+              "72 h"
+            ]
+          ]
+        },
+        {
+          "check_id": "house_reliance_clause",
+          "category": "methodology_and_house_style",
+          "description": "Carries the house reliance clause naming the client.",
+          "require_groups": [
+            [
+              "sole use"
+            ],
+            [
+              "Ostrand Energy Networks"
+            ]
+          ]
+        },
+        {
+          "check_id": "no_superseded_draft_values",
+          "category": "anti_contamination",
+          "description": "Does not apply the superseded draft sensitivity or the vibrating-wire alarm rule: no 75%/100% levels (135/165 µε) and no compensation at 10.8 pm/°C. Contrasting those values with the house values is allowed.",
+          "forbid_any": [
+            "135 µε",
+            "165 µε",
+            "135µε",
+            "165µε",
+            "| 135 |",
+            "| 165 |",
+            "set at 75%",
+            "75% (amber)",
+            "100% (red)",
+            "Amber, 75%",
+            "Red, 100%",
+            "alarm at 75%",
+            "action at 100%",
+            "10.8 pm/°C from the",
+            "compensated using 10.8 pm",
+            "applied 10.8 pm"
+          ]
+        },
+        {
+          "check_id": "no_vibrating_wire_method",
+          "category": "anti_contamination",
+          "description": "Does not borrow the vibrating-wire instruments or thermistor correction.",
+          "forbid_any": [
+            "VW-4200",
+            "Corlen",
+            "CR-16",
+            "thermistor",
+            "gauge factor"
+          ]
+        },
+        {
+          "check_id": "no_over_water_protocol",
+          "category": "anti_contamination",
+          "description": "Does not carry the Outer Jetty marine mammal protocol into a land substation.",
+          "forbid_any": [
+            "marine mammal",
+            "hydrophone",
+            "mitigation zone"
+          ]
+        },
+        {
+          "check_id": "no_borrowed_site_values",
+          "category": "anti_contamination",
+          "description": "Does not carry over another project's site or interrogator.",
+          "forbid_any": [
+            "Askern",
+            "Greyscar",
+            "Outer Jetty",
+            "PF4-1876",
+            "PF4-2043",
+            "Hatch End",
+            "Fenwick",
+            "Brigg Lane"
+          ]
+        }
+      ]
+    },
+    {
+      "holdout_id": "brackenford-footbridge-proposal",
+      "included_paths": [
+        "AGENTS.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-installation-report.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-meeting-minutes.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-method-statement-v0.8.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-method-statement-v0.9.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-method-statement-v1.0.md",
+        "active/m2503-northbray-wendle-tunnel/m2503-monitoring-bulletin-2025-04.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-commissioning-log.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-installation-report-v0.8.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-installation-report-v0.9.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-installation-report-v1.0.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-proposal.md",
+        "active/m2505-halverton-greyscar-spillway/prisma-fi-4-calibration-pf4-1876.md",
+        "active/m2505-halverton-greyscar-spillway/qa-disposition-register.docx",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-client-letter-alarm-review.docx",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-incident-note.md",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-installation-report.md",
+        "active/m2508-ostrand-brigg-lane-substation/m2508-monitoring-bulletin-2025-06.md",
+        "active/m2511-corrib-vale-quarry-road-embankment/m2511-meeting-minutes.md",
+        "active/m2511-corrib-vale-quarry-road-embankment/m2511-proposal.md",
+        "active/m2511-corrib-vale-quarry-road-embankment/m2511-scoping-note.md",
+        "active/m2514-kessick-dry-dock-gate/m2514-calibration-record.pdf",
+        "active/m2514-kessick-dry-dock-gate/m2514-installation-report.md",
+        "active/m2514-kessick-dry-dock-gate/m2514-monitoring-bulletin-2025-08.md",
+        "active/m2514-kessick-dry-dock-gate/m2514-qa-checklist.md",
+        "active/m2517-northbray-carrick-footbridge/m2517-client-email.md",
+        "active/m2517-northbray-carrick-footbridge/m2517-meeting-minutes.docx",
+        "active/m2517-northbray-carrick-footbridge/m2517-proposal.md",
+        "active/m2517-northbray-carrick-footbridge/m2517-scoping-note.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-client-email.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-meeting-minutes.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-proposal.md",
+        "active/m2520-ostrand-kelso-road-cable-bridge/m2520-scoping-note.md",
+        "active/m2522-kessick-outer-jetty/authority-comment-log.pdf",
+        "active/m2522-kessick-outer-jetty/m2522-commissioning-log.md",
+        "active/m2522-kessick-outer-jetty/m2522-installation-report.md",
+        "active/m2522-kessick-outer-jetty/m2522-monitoring-bulletin-2025-10.md",
+        "active/m2522-kessick-outer-jetty/m2522-proposal.md",
+        "active/m2526-halverton-brindle-weir/m2526-installation-report.pdf",
+        "active/m2526-halverton-brindle-weir/m2526-monitoring-bulletin-2025-11.md",
+        "active/m2526-halverton-brindle-weir/m2526-qa-checklist.md",
+        "active/m2529-corrib-vale-old-quay-bridge/m2529-incident-note.md",
+        "active/m2529-corrib-vale-old-quay-bridge/m2529-proposal.md",
+        "active/m2529-corrib-vale-old-quay-bridge/m2529-scoping-note.md",
+        "active/m2603-halverton-cold-fell-dam/m2603-meeting-minutes.md",
+        "active/m2603-halverton-cold-fell-dam/m2603-proposal.docx",
+        "active/m2603-halverton-cold-fell-dam/m2603-scoping-note-v0.8.md",
+        "active/m2603-halverton-cold-fell-dam/m2603-scoping-note-v1.0.md",
+        "active/m2606-ostrand-hatch-end-substation/m2606-commissioning-log.md",
+        "active/m2606-ostrand-hatch-end-substation/m2606-incident-note.md",
+        "active/m2606-ostrand-hatch-end-substation/m2606-installation-report.docx",
+        "active/m2606-ostrand-hatch-end-substation/m2606-monitoring-bulletin-2026-03.md",
+        "active/m2608-northbray-ellery-retaining-wall/m2608-client-email.md",
+        "active/m2608-northbray-ellery-retaining-wall/m2608-commissioning-log.md",
+        "active/m2608-northbray-ellery-retaining-wall/m2608-installation-report.pdf",
+        "active/m2614-ostrand-tallow-cross-substation/m2614-commissioning-log.md",
+        "active/m2614-ostrand-tallow-cross-substation/m2614-installation-report.md",
+        "active/m2614-ostrand-tallow-cross-substation/m2614-proposal.md",
+        "active/m2617-kessick-east-pontoon/m2617-proposal.md",
+        "active/m2617-kessick-east-pontoon/m2617-scoping-note.md",
+        "archive/m2301-northbray-holme-cutting/m2301-client-letter.md",
+        "archive/m2301-northbray-holme-cutting/m2301-commissioning-log.md",
+        "archive/m2301-northbray-holme-cutting/m2301-installation-report.md",
+        "archive/m2301-northbray-holme-cutting/m2301-scoping-note.md",
+        "archive/m2304-halverton-staddle-dam/m2304-calibration-record.md",
+        "archive/m2304-halverton-staddle-dam/m2304-installation-report.docx",
+        "archive/m2304-halverton-staddle-dam/m2304-meeting-minutes.md",
+        "archive/m2304-halverton-staddle-dam/m2304-monitoring-bulletin-2023-09.md",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-incident-note.md",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-installation-report.pdf",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-meeting-minutes.md",
+        "archive/m2307-kessick-berth-3-quay-wall/m2307-proposal.md",
+        "archive/m2310-ostrand-marlow-cable-tunnel/m2310-decommissioning-statement.docx",
+        "archive/m2310-ostrand-marlow-cable-tunnel/m2310-installation-report.md",
+        "archive/m2310-ostrand-marlow-cable-tunnel/m2310-monitoring-bulletin-2024-02.md",
+        "archive/m2312-corrib-vale-ashby-culvert/m2312-commissioning-log.md",
+        "archive/m2312-corrib-vale-ashby-culvert/m2312-installation-report.md",
+        "archive/m2312-corrib-vale-ashby-culvert/m2312-qa-checklist.md",
+        "archive/m2312-corrib-vale-ashby-culvert/peer-check-sheet.md",
+        "archive/m2316-kessick-crane-rail-beam/m2316-client-letter.md",
+        "archive/m2316-kessick-crane-rail-beam/m2316-proposal.md",
+        "archive/m2316-kessick-crane-rail-beam/m2316-scoping-note.md",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-client-letter.md",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-meeting-minutes.md",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-proposal.docx",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-scoping-note.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-incident-note.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-installation-report.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-monitoring-bulletin-2024-08.md",
+        "archive/m2405-northbray-tarran-bridge/m2405-proposal.md",
+        "archive/m2409-northbray-askern-viaduct/AGENTS.md",
+        "archive/m2409-northbray-askern-viaduct/m2409-commissioning-log.md",
+        "archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline-report.docx",
+        "archive/m2409-northbray-askern-viaduct/m2409-meeting-minutes.md",
+        "archive/m2409-northbray-askern-viaduct/m2409-proposal.md",
+        "archive/m2409-northbray-askern-viaduct/prisma-fi-4-calibration-pf4-1876.md",
+        "archive/m2411-kessick-ro-ro-ramp/m2411-calibration-record.md",
+        "archive/m2411-kessick-ro-ro-ramp/m2411-installation-report.md",
+        "archive/m2411-kessick-ro-ro-ramp/m2411-qa-checklist.md",
+        "archive/m2414-ostrand-fenwick-substation/m2414-client-email.md",
+        "archive/m2414-ostrand-fenwick-substation/m2414-commissioning-log.md",
+        "archive/m2414-ostrand-fenwick-substation/m2414-installation-report.docx",
+        "archive/m2414-ostrand-fenwick-substation/m2414-proposal.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-client-letter.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-proposal-v0.9.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-proposal-v1.0.md",
+        "archive/m2418-corrib-vale-mill-lane-wall/m2418-scoping-note.md",
+        "archive/m2421-halverton-ryecroft-pumping-station/m2421-meeting-minutes.md",
+        "archive/m2421-halverton-ryecroft-pumping-station/m2421-proposal.md",
+        "archive/m2421-halverton-ryecroft-pumping-station/m2421-scoping-note.md",
+        "fee-schedule-2024.md",
+        "fee-schedule-2025.md",
+        "fee-schedule-2026.md",
+        "installation-report-qa-checklist.md",
+        "instrument-stock-list-2026-01.md",
+        "reference/equipment/corlen-cr-16-datalogger.md",
+        "reference/equipment/geovane-vw-4200-strain-gauge.md",
+        "reference/equipment/lumenstrand-ls-8-fbg-array.md",
+        "reference/equipment/prisma-fi-4-interrogator.md",
+        "reference/regulatory/harbour-works-licence-conditions.md",
+        "reference/regulatory/rail-asset-protection-requirements.pdf",
+        "reference/regulatory/reservoir-safety-supervising-engineer-duties.md",
+        "reference/regulatory/working-near-live-hv-plant.md",
+        "standard-terms-of-engagement.md"
+      ],
+      "held_out_markers": [
+        "m2611",
+        "brackenford"
+      ],
+      "reference_doc_id": "doc_bc7d033de2",
+      "instructions": "You are Maren Lisk, Senior Engineer at Marrick Instrumentation, writing the proposal for fibre Bragg grating monitoring of the Brackenford footbridge stay anchorages. Write the complete proposal in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Marrick Instrumentation documents, follow their house structure and wording, including the team members' standard CV paragraphs. Return only the proposal.",
+      "run_notes": "- our ref: MI-PR-2611; date 2 February 2026; validity 90 days\n- client: Corrib Vale County Council; FAO Mr Aled Whitcombe\n- prepared by: Maren Lisk\n- bridge: Brackenford footbridge, single-pylon cable-stayed, over the River Brack; 4 back-stays\n- why: 2025 inspection found stay forces 8-12% below design; Kelda Stressing Ltd to re-tension each back-stay in 4 jacking steps\n- designer: Arden Lowe Associates; allowable strain change 160 µε at each back-stay anchorage; wants live readings during every step\n- approach: our standard FBG scope; one LS-8 array around each back-stay anchorage block (4 arrays, 32 gratings); one Prisma FI-4 in a cabinet at the east abutment; our engineer sits with the Kelda supervisor, compensated strain refreshed every 10 s\n- programme: install + baseline 2-9 March 2026; re-tension back-stays 1 and 2 on 14-15 March, 3 and 4 on 21-22 March (closure weekends); monitoring and monthly bulletins 6 months\n- team: Maren Lisk (project manager, 8 days); Dr Ines Halloran CEng MIStructE (fibre-optic sensing lead, 2 days; use her full CV paragraph from our earlier proposals); Tobias Achterberg (field, 9 days); Callum Draycott (director, 1 day)\n- relevant experience to cite: Kessick Outer Jetty (Port of Kessick, report Oct 2025); Greyscar Dam spillway (Halverton Water Authority, Jul 2025); Askern Viaduct (Northbray Rail Infrastructure, Oct 2024)\n- fee: 2026 rates; interrogator and telemetry 75 days; expenses GBP 940; fixed fee GBP 24,600 excluding VAT\n- power: our own battery and solar unit unless the council offers a supply\n- terms: Corrib Vale Highways Framework (Lot 3) call-off; payment within 30 days\n",
+      "exemplar_paths": [
+        "archive/m2409-northbray-askern-viaduct/m2409-proposal.md",
+        "active/m2505-halverton-greyscar-spillway/m2505-proposal.md",
+        "active/m2522-kessick-outer-jetty/m2522-proposal.md",
+        "active/m2529-corrib-vale-old-quay-bridge/m2529-proposal.md",
+        "archive/m2402-halverton-lockwood-reservoir/m2402-proposal.docx"
+      ],
+      "rubric": [
+        {
+          "check_id": "fee_kept",
+          "category": "project_facts",
+          "description": "States the GBP 24,600 fixed fee.",
+          "require_groups": [
+            [
+              "24,600"
+            ]
+          ]
+        },
+        {
+          "check_id": "proposal_identity_kept",
+          "category": "project_facts",
+          "description": "Carries the MI-PR-2611 reference and the client contact.",
+          "require_groups": [
+            [
+              "MI-PR-2611"
+            ],
+            [
+              "Whitcombe"
+            ]
+          ]
+        },
+        {
+          "check_id": "programme_kept",
+          "category": "project_facts",
+          "description": "Gives both re-tensioning closure weekends.",
+          "require_groups": [
+            [
+              "14 and 15 March",
+              "14-15 March",
+              "14 March",
+              "14 to 15 March",
+              "14–15 Mar",
+              "14/03/2026",
+              "2026-03-14"
+            ],
+            [
+              "21 and 22 March",
+              "21-22 March",
+              "21 March",
+              "21 to 22 March",
+              "21–22 Mar",
+              "21/03/2026",
+              "2026-03-21"
+            ]
+          ]
+        },
+        {
+          "check_id": "designer_allowable_kept",
+          "category": "project_facts",
+          "description": "Carries the designer and the 160 µε allowable change.",
+          "require_groups": [
+            [
+              "Arden Lowe"
+            ],
+            [
+              "160"
+            ]
+          ]
+        },
+        {
+          "check_id": "specialist_cv_supplemented",
+          "category": "supplemental_sections",
+          "description": "Includes Dr Ines Halloran's standard CV paragraph, which only an earlier reservoir proposal holds.",
+          "require_groups": [
+            [
+              "Halloran"
+            ],
+            [
+              "Strathmore"
+            ],
+            [
+              "British Society for Strain Measurement",
+              "bonded optical gauges"
+            ]
+          ]
+        },
+        {
+          "check_id": "house_proposal_structure",
+          "category": "methodology_and_house_style",
+          "description": "Keeps the house assumptions and exclusions section and the 90-day validity.",
+          "require_groups": [
+            [
+              "Assumptions and exclusions",
+              "Assumptions & exclusions"
+            ],
+            [
+              "90 days",
+              "90-day",
+              "ninety days"
+            ]
+          ]
+        },
+        {
+          "check_id": "house_fbg_approach",
+          "category": "methodology_and_house_style",
+          "description": "States the FBG approach: SFR compensation and alarm levels at 60% and 85%.",
+          "require_groups": [
+            [
+              "strain-free reference",
+              "SFR"
+            ],
+            [
+              "60%",
+              "60 %"
+            ],
+            [
+              "85%",
+              "85 %"
+            ]
+          ]
+        },
+        {
+          "check_id": "client_framework_terms",
+          "category": "methodology_and_house_style",
+          "description": "Applies the Corrib Vale Highways Framework call-off terms.",
+          "require_groups": [
+            [
+              "Lot 3"
+            ]
+          ]
+        },
+        {
+          "check_id": "no_borrowed_proposal_values",
+          "category": "anti_contamination",
+          "description": "Does not carry over another proposal's site, fee, client contact or an older rate.",
+          "forbid_any": [
+            "Lockwood",
+            "30,810",
+            "Carrick",
+            "Mill Lane",
+            "Rowan Peake",
+            "1,080"
+          ]
+        },
+        {
+          "check_id": "no_vibrating_wire_scope",
+          "category": "anti_contamination",
+          "description": "Does not propose the vibrating-wire instruments.",
+          "forbid_any": [
+            "VW-4200",
+            "Corlen"
+          ]
+        }
+      ]
+    }
+  ]
+}
