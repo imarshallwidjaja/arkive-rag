@@ -140,7 +140,8 @@ PACKET_MARGIN_BYTES = 512
 # considered so extra outlines never crowd out the closest exemplar's prose.
 PACKET_NOTES_BYTES = 6_000
 PACKET_LESSONS_BYTES = 6_000
-PACKET_MIN_INLINE_BYTES = 18_000
+PACKET_MIN_INLINE_BYTES = 16_000
+EXEMPLAR_OUTLINE_MAX_BYTES = 8_000
 OTHER_CANDIDATE_SUMMARY_CHARS = 300
 # A document summary in a listing is cut to this length; full outlines keep `SUMMARY_CHARS`.
 LIST_SUMMARY_CHARS = 240
@@ -2037,8 +2038,6 @@ class TopicSnapshot:
         candidates = [self._candidate(d, scores) for d in others][:MAX_OTHER_CANDIDATES]
         recurrence: dict[str, FamilyRecurrence | None] = {}
         entry_bytes: dict[str, int] = {}
-        # Outline entries shown per exemplar; an exemplar not listed shows its whole outline.
-        outline: dict[str, int] = {}
         bodies: dict[str, str] = {}
         visuals: dict[str, int] = {}
         included: dict[str, str] = {}
@@ -2077,9 +2076,58 @@ class TopicSnapshot:
                     recurrence[s.section_id] = self._recurrence(s.section_id, ids, family_total)
                     entry_bytes[s.section_id] = _json_bytes(entry(s)) + 1
 
+        def prioritized_sections(doc: DocumentInfo) -> list[_SectionRow]:
+            """Sections of `doc` ordered so structural, recurring, input-matched and boundary
+            sections survive when a huge document's outline is capped."""
+            rows = self._doc_sections[doc.doc_id]
+            if not rows:
+                return []
+            top_level = min(s.level for s in rows)
+            nonempty = [s for s in rows if bodies[s.section_id]]
+            bounds = {
+                s.section_id
+                for s in [*nonempty[:BOUNDARY_SECTIONS], *nonempty[-BOUNDARY_SECTIONS:]]
+            }
+            hits = sorted(
+                (
+                    s
+                    for s in nonempty
+                    if section_rank.get(s.section_id, MATCHED_CHUNK_RANKS + 1)
+                    <= MATCHED_CHUNK_RANKS
+                ),
+                key=lambda s: section_rank[s.section_id],
+            )[:MATCHED_SECTIONS]
+            hit_ids = {s.section_id for s in hits}
+            high = [
+                s
+                for s in rows
+                if s.level <= top_level + 1
+                or s.section_id in bounds
+                or s.section_id in hit_ids
+                or recurrence[s.section_id] is not None
+            ]
+            seen = {s.section_id for s in high}
+            return [*high, *(s for s in rows if s.section_id not in seen)]
+
+        def select_outline(doc: DocumentInfo, cap_bytes: int) -> list[_SectionRow]:
+            rows = self._doc_sections[doc.doc_id]
+            if sum(entry_bytes[s.section_id] for s in rows) <= cap_bytes:
+                return list(rows)
+            kept_ids: set[str] = set()
+            used = 0
+            for s in prioritized_sections(doc):
+                cost = entry_bytes[s.section_id]
+                if used + cost <= cap_bytes:
+                    kept_ids.add(s.section_id)
+                    used += cost
+            return [s for s in rows if s.section_id in kept_ids]
+
+        # Outline rows shown per exemplar (defaults to all rows until step 3).
+        shown_rows: dict[str, list[_SectionRow]] = {}
+
         def exemplar(doc: DocumentInfo) -> DraftExemplar:
             sections = self._doc_sections[doc.doc_id]
-            keep = outline.get(doc.doc_id, len(sections))
+            kept = shown_rows.get(doc.doc_id, sections)
             family = [m for m in self._families[doc.family_id] if m != doc.doc_id]
             shown_family = family[:MAX_FAMILY_DOC_IDS]
             return DraftExemplar(
@@ -2096,8 +2144,8 @@ class TopicSnapshot:
                 version_status=doc.version_status,
                 family_doc_ids=shown_family,
                 omitted_family_members=len(family) - len(shown_family),
-                sections=[entry(s) for s in sections[:keep]],
-                omitted_outline_sections=len(sections) - keep,
+                sections=[entry(s) for s in kept],
+                omitted_outline_sections=len(sections) - len(kept),
             )
 
         def packet() -> DraftPacket:
@@ -2125,15 +2173,18 @@ class TopicSnapshot:
             candidates[:] = [self._candidate(d, scores) for d in [*demoted, *others]][
                 :MAX_OTHER_CANDIDATES
             ]
-            outline.pop(demoted[0].doc_id, None)
+            shown_rows.pop(demoted[0].doc_id, None)
             recount()
 
-        def outline_bytes(doc: DocumentInfo) -> int:
-            return sum(entry_bytes[s.section_id] for s in self._doc_sections[doc.doc_id])
+        def capped_outline(doc: DocumentInfo) -> list[_SectionRow]:
+            return select_outline(doc, EXEMPLAR_OUTLINE_MAX_BYTES)
+
+        def outline_bytes(rows: Sequence[_SectionRow]) -> int:
+            return sum(entry_bytes[s.section_id] for s in rows)
 
         # 1. The envelope.
         recount()
-        outline.update({d.doc_id: 0 for d in chosen})
+        shown_rows.update({d.doc_id: [] for d in chosen})
         while len(chosen) > 1 and measured() > budget:
             demote()
         while candidates and measured() > budget:
@@ -2158,8 +2209,9 @@ class TopicSnapshot:
         admit(all_notes, notes, PACKET_NOTES_BYTES)
         admit(all_lessons, lessons, PACKET_LESSONS_BYTES)
 
-        # 3. Outlines, the last exemplar giving way first; when more than one exemplar is
-        # chosen, reserve room for inline section Markdown unless all their bodies already fit.
+        # 3. Outlines: when more than one exemplar is chosen, an oversized exemplar caps its
+        # outline to `EXEMPLAR_OUTLINE_MAX_BYTES` so one 50+ page document cannot evict all
+        # sibling exemplars, and `inline_need` reserves space for inline section Markdown.
         def inline_need(docs: Sequence[DocumentInfo]) -> int:
             total_bodies = sum(
                 _json_bytes(bodies[s.section_id])
@@ -2169,24 +2221,28 @@ class TopicSnapshot:
             )
             return min(PACKET_MIN_INLINE_BYTES, total_bodies)
 
-        while (
-            len(chosen) > 1
-            and size + sum(map(outline_bytes, chosen)) + inline_need(chosen) > budget
+        while len(chosen) > 1 and (
+            size + sum(outline_bytes(capped_outline(d)) for d in chosen) + inline_need(chosen)
+            > budget
         ):
             demote()
+            shown_rows.update({d.doc_id: [] for d in chosen})
             size = measured()
-        if chosen:
-            first_sections = self._doc_sections[chosen[0].doc_id]
-            room = budget - size - sum(outline_bytes(d) for d in chosen[1:])
-            keep = 0
-            for s in first_sections:
-                if entry_bytes[s.section_id] > room:
-                    break
-                room -= entry_bytes[s.section_id]
-                keep += 1
-            outline.clear()
-            if keep < len(first_sections):
-                outline[chosen[0].doc_id] = keep
+        if len(chosen) > 1:
+            for d in chosen:
+                shown_rows[d.doc_id] = capped_outline(d)
+            # Expand any capped outline back to full if the remaining outline room permits.
+            used_outlines = sum(outline_bytes(shown_rows[d.doc_id]) for d in chosen)
+            extra = budget - size - inline_need(chosen) - used_outlines
+            for d in chosen:
+                full = self._doc_sections[d.doc_id]
+                delta = outline_bytes(full) - outline_bytes(shown_rows[d.doc_id])
+                if 0 < delta <= extra:
+                    shown_rows[d.doc_id] = list(full)
+                    extra -= delta
+        elif chosen:
+            room = max(0, budget - size)
+            shown_rows[chosen[0].doc_id] = select_outline(chosen[0], room)
         size = measured()
         # 4. Whole sections, priced by the bytes each adds.
         first = chosen[0] if chosen else None
@@ -2194,8 +2250,7 @@ class TopicSnapshot:
         taken_back: list[Callable[[], None]] = []
 
         def outlined(doc: DocumentInfo) -> list[_SectionRow]:
-            sections = self._doc_sections[doc.doc_id]
-            return sections[: outline.get(doc.doc_id, len(sections))]
+            return shown_rows.get(doc.doc_id, list(self._doc_sections[doc.doc_id]))
 
         def nonblank(doc: DocumentInfo) -> list[_SectionRow]:
             return [s for s in outlined(doc) if bodies[s.section_id]]

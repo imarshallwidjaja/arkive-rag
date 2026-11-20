@@ -866,17 +866,22 @@ document counts, all before any embedding; a type matches after
   own words. The envelope fits first, without outlines, notes or lessons: the
   later exemplars move to the candidates, then candidates are dropped from
   the end, and at most eight candidates are kept, moved exemplars first. Then
-  curator notes and lessons come in, each up to 6,000 bytes. Then, while the
-  exemplars' complete outlines do not fit, the last exemplar moves to the
-  candidates; a first exemplar left alone keeps as many outline entries as
-  fit, counting the entries cut in `omitted_outline_sections`, so every
-  exemplar after the first has its complete outline. Section text is then
+  curator notes and lessons come in, each up to 6,000 bytes. Then outlines are
+  fitted while reserving at least 16,000 bytes (`PACKET_MIN_INLINE_BYTES`) for
+  inline section Markdown when more than one exemplar is chosen: an oversized
+  exemplar caps its initial outline at 8,000 bytes
+  (`EXEMPLAR_OUTLINE_MAX_BYTES`, keeping top-level, recurring, input-matched
+  and boundary entries first and counting omitted rows in
+  `omitted_outline_sections`) so a 50+ page document does not evict sibling
+  exemplars, and any remaining outline headroom expands capped outlines in rank
+  order; if the capped outlines still exceed the budget, the last exemplar
+  moves to the candidates. Section text is then
   packed whole, never cut, each addition kept only while the packet fits:
   the first exemplar's input-matched sections (at most six), sections with
   recurring units, and first and last two sections; up to two supplemental
-  sections; the rest of the first exemplar; then the other exemplars'
-  input-matched sections, recurring sections that show a unit no included
-  section shows yet, and first and last two sections; then the rest of them.
+  sections; the other exemplars' input-matched sections and recurring sections
+  that show a unit no included section shows yet; the rest of the first
+  exemplar; then the other exemplars' boundary and remaining sections.
   A section that does not fit is skipped, its entry kept, and counted in
   `omitted_sections`; later, smaller ones may still fit. The packet is
   serialized a handful of times, not once per section: the envelope and the

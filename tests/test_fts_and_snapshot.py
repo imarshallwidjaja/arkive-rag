@@ -1249,12 +1249,13 @@ def test_an_outline_too_long_for_the_packet_is_cut_and_says_so(tmp_path: Path) -
         packet = snap.prepare_draft("Schedule of rates clauses.", None)
 
     assert fits_response(packet)
-    # The second exemplar's outline did not fit beside the first, so it is a candidate.
-    (first,) = packet.exemplars
+    # An oversized first exemplar caps its outline (`EXEMPLAR_OUTLINE_MAX_BYTES`) so the
+    # second exemplar still fits beside it with its complete outline.
+    first, second = packet.exemplars
     assert first.doc_id == document_id("a/schedule.md")
     assert first.omitted_outline_sections > 0
     assert len(first.sections) + first.omitted_outline_sections == 401
-    assert [c.doc_id for c in packet.other_candidates] == [document_id("b/schedule.md")]
+    assert second.doc_id == document_id("b/schedule.md") and second.omitted_outline_sections == 0
 
 
 def test_outlines_give_way_from_the_last_exemplar_after_notes_and_lessons(
@@ -1310,14 +1311,16 @@ def test_outlines_give_way_from_the_last_exemplar_after_notes_and_lessons(
         elapsed = time.perf_counter() - started
 
     assert fits_response(packet) and fits_response(long)
-    # Notes and lessons came first; the outlines of three, then two exemplars did not fit
-    # beside them, so the last ones gave way and the first keeps its complete outline.
+    # Notes and lessons came first; capping oversized outlines (`EXEMPLAR_OUTLINE_MAX_BYTES`)
+    # keeps two exemplars while reserving 16 KB for inline section Markdown, and demotes the
+    # third exemplar to the head of `other_candidates`.
     assert packet.curator_notes and packet.lessons
-    (first,) = packet.exemplars
-    assert (len(first.sections), first.omitted_outline_sections) == (76, 0)
-    # The moved exemplars lead the other candidates, which stay at most eight.
-    moved = {document_id(f"{c}/report.md") for c in "abc"} - {first.doc_id}
-    assert {c.doc_id for c in packet.other_candidates[:2]} == moved
+    first, second = packet.exemplars
+    assert len(first.sections) + first.omitted_outline_sections == 76
+    assert len(second.sections) + second.omitted_outline_sections == 76
+    assert any(s.included for s in first.sections) and any(s.included for s in second.sections)
+    moved = {document_id(f"{c}/report.md") for c in "abc"} - {first.doc_id, second.doc_id}
+    assert {c.doc_id for c in packet.other_candidates[:1]} == moved
     assert len(packet.other_candidates) == MAX_OTHER_CANDIDATES
     # Packing measures the packet a handful of times, not once per section.
     assert drafts <= 8
