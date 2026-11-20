@@ -876,9 +876,12 @@ PINNED_DRAFTING_GUIDANCE = """\
 - Take every fact, measurement, date, quantity, parameter, personnel list and deliverable
   file name for the new work only from the user's inputs. Enumerate listed items in full and
   never invent unstated measurements or results.
-- Reuse and adapt the exemplars' domain methodology explanations, equations, literature
-  references, generic table structures and technical caveats wherever the user's inputs use
-  the same method, instrument, sensor or workflow.
+- Reproduce the collection's house wording (organisation and tool background, standard
+  methodology explanations, equations, literature references, generic table column headers,
+  acknowledgements, legal disclaimers and standing technical caveats) with its established
+  wording, organisation names and attributions where it applies, adapting or omitting only
+  parts specific to an earlier project. Do not rewrite established house prose or disclaimers
+  from scratch.
 - Treat each exemplar's date, facets and deliverable_type and each section's
   family_recurrence (exemplar_doc_ids and corpus_family_count) as factual provenance. A
   clause shared across several independent version families is established house text; a

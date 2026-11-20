@@ -135,9 +135,12 @@ without would write written your"""
 # The packet is measured once at the end; the running estimate of its size before that is
 # exact for everything but its counters' digits, which this margin covers.
 PACKET_MARGIN_BYTES = 512
-# The curator notes and the lessons each take at most this many bytes of the packet.
+# The curator notes and the lessons each take at most this many bytes of the packet, and
+# outlines leave at least `PACKET_MIN_INLINE_BYTES` for section Markdown when >1 exemplar is
+# considered so extra outlines never crowd out the closest exemplar's prose.
 PACKET_NOTES_BYTES = 6_000
 PACKET_LESSONS_BYTES = 6_000
+PACKET_MIN_INLINE_BYTES = 18_000
 OTHER_CANDIDATE_SUMMARY_CHARS = 300
 # A document summary in a listing is cut to this length; full outlines keep `SUMMARY_CHARS`.
 LIST_SUMMARY_CHARS = 240
@@ -157,9 +160,12 @@ DRAFTING_GUIDANCE = """\
 - Take every fact, measurement, date, quantity, parameter, personnel list and deliverable
   file name for the new work only from the user's inputs. Enumerate listed items in full and
   never invent unstated measurements or results.
-- Reuse and adapt the exemplars' domain methodology explanations, equations, literature
-  references, generic table structures and technical caveats wherever the user's inputs use
-  the same method, instrument, sensor or workflow.
+- Reproduce the collection's house wording (organisation and tool background, standard
+  methodology explanations, equations, literature references, generic table column headers,
+  acknowledgements, legal disclaimers and standing technical caveats) with its established
+  wording, organisation names and attributions where it applies, adapting or omitting only
+  parts specific to an earlier project. Do not rewrite established house prose or disclaimers
+  from scratch.
 - Treat each exemplar's date, facets and deliverable_type and each section's
   family_recurrence (exemplar_doc_ids and corpus_family_count) as factual provenance. A
   clause shared across several independent version families is established house text; a
@@ -2151,8 +2157,22 @@ class TopicSnapshot:
 
         admit(all_notes, notes, PACKET_NOTES_BYTES)
         admit(all_lessons, lessons, PACKET_LESSONS_BYTES)
-        # 3. Outlines, the last exemplar giving way first.
-        while len(chosen) > 1 and size + sum(map(outline_bytes, chosen)) > budget:
+
+        # 3. Outlines, the last exemplar giving way first; when more than one exemplar is
+        # chosen, reserve room for inline section Markdown unless all their bodies already fit.
+        def inline_need(docs: Sequence[DocumentInfo]) -> int:
+            total_bodies = sum(
+                _json_bytes(bodies[s.section_id])
+                for d in docs
+                for s in self._doc_sections[d.doc_id]
+                if bodies[s.section_id]
+            )
+            return min(PACKET_MIN_INLINE_BYTES, total_bodies)
+
+        while (
+            len(chosen) > 1
+            and size + sum(map(outline_bytes, chosen)) + inline_need(chosen) > budget
+        ):
             demote()
             size = measured()
         if chosen:
@@ -2262,9 +2282,6 @@ class TopicSnapshot:
                 include(s)
         for row in supplements:
             supplement(row)
-        if first is not None:
-            for s in outlined(first):
-                include(s)
         for doc in rest:
             for s in matched(doc):
                 include(s)
@@ -2272,6 +2289,9 @@ class TopicSnapshot:
             for s in recurring(doc):
                 if shows_new_unit(s):
                     include(s)
+        if first is not None:
+            for s in outlined(first):
+                include(s)
         for doc in rest:
             for s in boundary(doc):
                 include(s)
