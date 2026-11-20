@@ -45,12 +45,14 @@ Arkive serves curated reference collections ("topics").
 1. Call list_topics when the topic slug or its facets are unknown. Facets filter a topic
    (client, project, author and the like): list_documents, search, grep and prepare_draft
    accept `filters`, a mapping from facet name to one value or alias; facets combine with AND.
-2. Answering questions: use search for meaning and grep for exact strings, numbers or file
-   names, read_section for context, get_topic_guide for scope and curator notes,
-   lookup_glossary for unclear terms, and view_page when a chart, map or layout matters.
-   Cite doc_id, section_id and pages. When search and grep find no evidence for a requested
-   fact or mechanism, say that the corpus does not establish it and stop searching rather
-   than inferring an answer from adjacent workflows.
+2. Answering questions: prefer targeted search or grep (default limits) over broad listings,
+   read_section for context, get_topic_guide for scope and curator notes, lookup_glossary for
+   unclear terms, and view_page when a chart, map or layout matters. Cite doc_id, section_id
+   and pages. Check whether a proposal or draft differs from a delivered report or final
+   memorandum: treat the delivered final deliverable as authoritative while noting provisional
+   proposal or earlier-draft values when relevant. When search and grep find no evidence for a
+   requested fact or mechanism, say that the corpus does not establish it and stop searching
+   rather than inferring an answer from adjacent workflows.
 3. Drafting a deliverable: call prepare_draft with the user's full project_inputs, never
    summarised, and follow the drafting_guidance, exemplars, lessons and curator_notes it
    returns. Use read_section for an outline entry it did not include.
@@ -188,7 +190,7 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
 
     @server.tool()
     def search(
-        topic: str, query: str, filters: dict[str, str] | None = None, top_k: int = 8
+        topic: str, query: str, filters: dict[str, str] | None = None, top_k: int = 5
     ) -> Annotated[CallToolResult, list[SearchHit]]:
         """Hybrid keyword and semantic search over chunks, optionally restricted by facet
         `filters`, with at most three chunks per version family unless fewer hits remain.
@@ -205,7 +207,7 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
 
     @server.tool()
     def grep(
-        topic: str, pattern: str, filters: dict[str, str] | None = None, max_matches: int = 20
+        topic: str, pattern: str, filters: dict[str, str] | None = None, max_matches: int = 12
     ) -> Annotated[CallToolResult, list[GrepMatch]]:
         """Case-insensitive literal search for exact strings, numbers and filenames,
         optionally restricted by facet `filters`; at most 50 matches."""

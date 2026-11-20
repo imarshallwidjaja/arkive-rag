@@ -139,6 +139,8 @@ PACKET_MARGIN_BYTES = 512
 PACKET_NOTES_BYTES = 6_000
 PACKET_LESSONS_BYTES = 6_000
 OTHER_CANDIDATE_SUMMARY_CHARS = 300
+# A document summary in a listing is cut to this length; full outlines keep `SUMMARY_CHARS`.
+LIST_SUMMARY_CHARS = 240
 # A document summary is shown cut to this many characters (a card summary is a few sentences),
 # and an exemplar names at most this many other members of its version family.
 SUMMARY_CHARS = 2_000
@@ -1359,7 +1361,7 @@ class TopicSnapshot:
     ) -> DocumentPage:
         """One page of `list_documents` without source hashes: at most `limit` documents from
         `offset`, fewer when more would not fit one tool result, each summary cut to
-        `SUMMARY_CHARS`."""
+        `LIST_SUMMARY_CHARS`."""
         if not 1 <= limit <= MAX_DOCUMENT_PAGE:
             raise InvalidFilterError(f"limit must be between 1 and {MAX_DOCUMENT_PAGE}")
         if offset < 0:
@@ -1370,7 +1372,7 @@ class TopicSnapshot:
                 d.model_dump(exclude={"sha256"})
                 | {
                     "title": _clipped(d.title, TITLE_CHARS),
-                    "summary": _clipped(d.summary, SUMMARY_CHARS),
+                    "summary": _clipped(d.summary, LIST_SUMMARY_CHARS),
                 }
             )
             for d in documents[offset : offset + limit]

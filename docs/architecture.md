@@ -772,7 +772,8 @@ local packs are not staged by accident.
   `inspect` and the evaluation harness. `list_documents_page` returns one page
   of them without hashes: `limit` from 1 to 100 (default 50) from `offset`,
   fewer when more would not fit one tool result, with `total` and
-  `next_offset`. A summary is cut to 2,000 characters (`SUMMARY_CHARS`).
+  `next_offset`. A summary in a listing is cut to 240 characters
+  (`LIST_SUMMARY_CHARS`).
 - **Outlines and sections.** `outline(doc_id, offset)` returns the sections
   from `offset` that fit one tool result, each heading path cut by
   `heading_context`, with `total_sections` and `next_offset`.

@@ -862,7 +862,7 @@ class DocumentListItem(_Frozen):
     """One document as `list_documents` pages it. `doc_date` is as printed (or the metadata
     date); `date` is its calendar form and where it came from, None when the printed date is
     ambiguous or no date is known. The version fields follow `DocumentRole`. A title longer
-    than `snapshot.TITLE_CHARS` or a summary longer than `snapshot.SUMMARY_CHARS` ends with an
+    than `snapshot.TITLE_CHARS` or a summary longer than `snapshot.LIST_SUMMARY_CHARS` ends with an
     ellipsis where it was cut."""
 
     doc_id: str

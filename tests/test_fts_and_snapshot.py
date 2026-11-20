@@ -749,27 +749,28 @@ def test_document_pages_omit_hashes_validate_limits_and_shrink_to_the_response_b
     tmp_path: Path,
 ) -> None:
     files = {
-        f"p{n:02d}/memo.md": f"# Memo {n}\n\n" + f"Long summary line {n} of the memo. " * 60
-        for n in range(30)
+        f"p{n:03d}/memo.md": f"# {'Detailed Harbour Survey Memo ' * 15}{n}\n\n"
+        + f"Long summary line {n} of the memo. " * 20
+        for n in range(60)
     }
     path = compile_snapshot(tmp_path, files, topic="memos")
 
     with TopicSnapshot.open(path) as snap:
         everything = snap.list_documents()
-        page = snap.list_documents_page(limit=7, offset=21)
-        last = snap.list_documents_page(limit=7, offset=28)
+        page = snap.list_documents_page(limit=7, offset=51)
+        last = snap.list_documents_page(limit=7, offset=58)
         wide = snap.list_documents_page(limit=100)
         for bad in ({"limit": 0}, {"limit": 101}, {"offset": -1}):
             with pytest.raises(InvalidFilterError):
                 snap.list_documents_page(**bad)  # type: ignore[arg-type]
 
-    assert len(everything) == 30 and all(d.sha256 for d in everything)
-    assert [d.doc_id for d in page.documents] == [d.doc_id for d in everything[21:28]]
-    assert (page.total, page.offset, page.limit, page.next_offset) == (30, 21, 7, 28)
+    assert len(everything) == 60 and all(d.sha256 for d in everything)
+    assert [d.doc_id for d in page.documents] == [d.doc_id for d in everything[51:58]]
+    assert (page.total, page.offset, page.limit, page.next_offset) == (60, 51, 7, 58)
     assert "sha256" not in page.documents[0].model_dump()
     assert (len(last.documents), last.next_offset) == (2, None)
     assert len(wide.model_dump_json().encode()) <= RESPONSE_MAX_BYTES
-    assert wide.next_offset == len(wide.documents) < 30
+    assert wide.next_offset == len(wide.documents) < 60
 
 
 def test_grep_returns_at_most_fifty_matches(snapshot: TopicSnapshot) -> None:
