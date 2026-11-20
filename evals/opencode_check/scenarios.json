@@ -58,7 +58,7 @@
         {"condition": "invalid_filter_recovery", "tools": ["list_documents"], "invalid_value": "zz-no-such-value"}
       ],
       "topics_queried": ["coastal-survey-projects"],
-      "answer_groups": [["doc_0"]]
+      "answer_groups": [["doc_"]]
     },
     {
       "scenario_id": "grep-exact-number",
@@ -66,15 +66,15 @@
       "prompt": "In the coastal-survey-projects topic, how many cleaned soundings does brenlow_soundings.csv hold? Find it with grep and cite the doc_id and section_id.",
       "required_tools": ["grep"],
       "topics_queried": ["coastal-survey-projects"],
-      "answer_groups": [["1,284,330"], ["doc_003"], ["doc_003_sec_006"]]
+      "answer_groups": [["1,284,330"], ["doc_b0d99a3c39"], ["doc_b0d99a3c39_sec_006"]]
     },
     {
       "scenario_id": "chart-value-view-page",
       "description": "Reads a value printed only in a chart of a rendered PDF page through view_page, which returns the page image.",
-      "prompt": "In the coastal-survey-projects topic, the Q102 technical memorandum (doc_006) has a bar chart of rock removed per bench. Look at page 1 with view_page and tell me the volume for Bench 3, citing the doc_id and page.",
-      "page_image": {"topic": "coastal-survey-projects", "doc_id": "doc_006", "page_number": 1},
+      "prompt": "In the coastal-survey-projects topic, the Q102 technical memorandum (doc_cc01ac49e1) has a bar chart of rock removed per bench. Look at page 1 with view_page and tell me the volume for Bench 3, citing the doc_id and page.",
+      "page_image": {"topic": "coastal-survey-projects", "doc_id": "doc_cc01ac49e1", "page_number": 1},
       "topics_queried": ["coastal-survey-projects"],
-      "answer_groups": [["41,700"], ["doc_006"]]
+      "answer_groups": [["41,700"], ["doc_cc01ac49e1"]]
     },
     {
       "scenario_id": "draft-from-blueprint",

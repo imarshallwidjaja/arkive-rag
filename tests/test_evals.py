@@ -29,6 +29,7 @@ from arkive_rag.models import (
     ProviderError,
     UnsafePathError,
     corpus_fingerprint,
+    document_id,
     fold_for_quote,
 )
 from arkive_rag.passages import shingles
@@ -80,6 +81,8 @@ from evals.schema import (
 )
 from tests.support import (
     BATHYMETRY_CORPUS,
+    HARBOUR_MEMO,
+    REEF_NOTE,
     FakeGateway,
     ScriptedOpenAI,
     compile_snapshot,
@@ -89,6 +92,7 @@ from tests.support import (
     response_body,
     structured_body,
     usage,
+    write_docx,
     write_pdf,
 )
 
@@ -142,8 +146,8 @@ def test_example_collection_packs_match_their_collections_and_hold_out_their_ref
         sources = compiler.discover_corpus(corpus_dir)
         digests = {s.rel_path: hashlib.sha256(compiler.read_source(s)).hexdigest() for s in sources}
         assert pack.corpus_fingerprint == corpus_fingerprint(digests.items()), pack_path.name
-        # Document ids follow the build: doc_001 is the first discovered file in path order.
-        by_id = {f"doc_{i:03d}": s for i, s in enumerate(sources, start=1)}
+        # Document IDs follow the build: each is the hash of its file's path.
+        by_id = {document_id(s.rel_path): s for s in sources}
         named = {a.doc_id for case in pack.qa_cases for a in case.source_anchors}
         named |= {d for case in pack.retrieval_cases for d in case.expected_docs}
         assert named <= by_id.keys(), pack_path.name
@@ -157,6 +161,7 @@ def test_example_collection_packs_match_their_collections_and_hold_out_their_ref
                 format=source.format,
                 title=source.rel_path,
                 doc_date=None,
+                date=None,
                 deliverable_type="unknown",
                 summary="",
                 page_count=0,
@@ -898,12 +903,13 @@ def _sha(text: str) -> str:
 
 def reference_doc(**overrides: Any) -> DocumentInfo:
     fields: dict[str, Any] = {
-        "doc_id": "doc_003",
+        "doc_id": document_id(REFERENCE_PATH),
         "rel_path": REFERENCE_PATH,
         "sha256": hashlib.sha256(REFERENCE_TEXT.encode()).hexdigest(),
         "format": "md",
         "title": "Estuary Proposal",
         "doc_date": None,
+        "date": None,
         "deliverable_type": "proposal",
         "summary": "Estuary proposal.",
         "page_count": 1,
@@ -1110,8 +1116,8 @@ def test_eval_cli_refuses_mismatched_inputs_before_outputs_or_model_calls(
     older = tmp_path / "older.arkive.db"
     older.write_bytes(snapshot_path.read_bytes())
     with closing(sqlite3.connect(older)) as db, db:
-        db.execute("UPDATE corpus_meta SET value = '2.0' WHERE key = 'schema_version'")
-    assert "schema version '2.0'" in run(EXAMPLE_PACK_PATH, "--layer", "1", snapshot=older)
+        db.execute("UPDATE corpus_meta SET value = '4.0' WHERE key = 'schema_version'")
+    assert "schema version '4.0'" in run(EXAMPLE_PACK_PATH, "--layer", "1", snapshot=older)
     # With --layer all, a later layer's inputs are checked before layer 1 calls any model.
     everything = ("--corpus", str(corpus))
     unknown_filter = pack_file("filter", retrieval_cases__3__filters={"project": "p999"})
@@ -1122,8 +1128,8 @@ def test_eval_cli_refuses_mismatched_inputs_before_outputs_or_model_calls(
     assert "retrieval case 'visual_only_1': unknown document 'doc_009'" in run(
         unknown_expected, "--layer", "1"
     )
-    note_reference = pack_file("note", holdouts__0__reference_doc_id="doc_003")
-    assert "holdout 'estuary-proposal': reference document doc_003" in run(
+    note_reference = pack_file("note", holdouts__0__reference_doc_id=REEF_NOTE)
+    assert f"holdout 'estuary-proposal': reference document {REEF_NOTE}" in run(
         note_reference, *everything
     )
     assert "is a curator note" in run(note_reference, *everything)
@@ -1143,8 +1149,8 @@ def test_eval_cli_refuses_mismatched_inputs_before_outputs_or_model_calls(
     )
     past_end = pack_file("pages", qa_cases__0__source_anchors__0__pages=[1, 4])
     assert (
-        "source anchor doc_001 pages [1, 4]: p101-harbour-lidar/harbour-memo.md has no pages"
-        in (run(past_end, *everything))
+        f"source anchor {HARBOUR_MEMO} pages [1, 4]: p101-harbour-lidar/harbour-memo.md has no"
+        " pages" in (run(past_end, *everything))
     )
 
     (corpus / "p102-estuary-multibeam" / "estuary-proposal.md").write_text("# Edited\n")
@@ -1281,7 +1287,8 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
                 return await result if inspect.isawaitable(result) else result
 
             grep = await call("grep", topic="bathymetry", pattern="330.9")
-            page = await call("view_page", topic="bathymetry", doc_id="doc_001", page_number=1)
+            chart = document_id("p101-harbour-lidar/chart.pdf")
+            page = await call("view_page", topic="bathymetry", doc_id=chart, page_number=1)
             missing = await call("read_section", topic="bathymetry", section_id="nope")
             return sorted(by_name), grep, page, missing, server_instructions
 
@@ -1546,6 +1553,9 @@ def test_layer2_does_not_judge_or_credit_unfinished_runs(
 DREDGE_REPORT: dict[str, Sequence[Sequence[str]]] = {
     "p104-dredge/report.pdf": [["Intro text one"], ["# Results", "Volume 42 m3"], ["Appendix"]]
 }
+DREDGE = document_id("p104-dredge/report.pdf")
+ARCHIVE_LOG = document_id("p105-archive/log.md")
+GAP_REPORT = document_id("p106-gap/report.pdf")
 
 
 def qa_case(case_id: str, anchors: list[dict[str, Any]], kind: str = "lookup") -> QACase:
@@ -1566,8 +1576,8 @@ def test_qa_evidence_labels_the_sections_each_anchor_covers_and_refuses_oversize
         BATHYMETRY_CORPUS | {"p105-archive/log.md": long_log},
         pdfs=DREDGE_REPORT | gap_report,
     )
-    page = {"doc_id": "doc_004", "pages": [3, 3]}
-    whole = {"doc_id": "doc_003", "pages": None}
+    page = {"doc_id": DREDGE, "pages": [3, 3]}
+    whole = {"doc_id": REEF_NOTE, "pages": None}
     with TopicSnapshot.open(snapshot_path) as snapshot:
         assert [d.rel_path for d in snapshot.list_documents()][3:] == [
             "p104-dredge/report.pdf",
@@ -1575,16 +1585,16 @@ def test_qa_evidence_labels_the_sections_each_anchor_covers_and_refuses_oversize
             "p106-gap/report.pdf",
         ]
         evidence = qa_evidence(snapshot, qa_case("c", [page, whole, page]))
-        too_long = qa_case("too_long", [{"doc_id": "doc_005", "pages": None}])
+        too_long = qa_case("too_long", [{"doc_id": ARCHIVE_LOG, "pages": None}])
         with pytest.raises(ValueError, match=r"'too_long': the evidence .* over the 48000"):
             qa_evidence(snapshot, too_long)
         assert qa_evidence(snapshot, qa_case("none", [], kind="abstention")) == (
             "(no source anchors listed)"
         )
-        blank = {"doc_id": "doc_006", "pages": [2, 2]}
+        blank = {"doc_id": GAP_REPORT, "pages": [2, 2]}
         with pytest.raises(
             ValueError,
-            match=r"'gap': source anchor doc_006 pages \[2, 2\]: no section of"
+            match=rf"'gap': source anchor {GAP_REPORT} pages \[2, 2\]: no section of"
             r" p106-gap/report.pdf overlaps it",
         ):
             qa_evidence(snapshot, qa_case("gap", [whole, blank]))
@@ -1593,9 +1603,10 @@ def test_qa_evidence_labels_the_sections_each_anchor_covers_and_refuses_oversize
         )
     # Only the report section that overlaps page 3 is evidence, and once although anchored twice.
     assert evidence == (
-        "--- p104-dredge/report.pdf (doc_004), section doc_004_sec_002, pages 2-3 ---\n"
+        f"--- p104-dredge/report.pdf ({DREDGE}), section {DREDGE}_sec_002, pages 2-3 ---\n"
         "# Results\n\nVolume 42 m3\n\nAppendix"
-        "\n\n--- p103-reef-sonar/AGENTS.md (doc_003), section doc_003_sec_001, pages 1-1 ---\n"
+        f"\n\n--- p103-reef-sonar/AGENTS.md ({REEF_NOTE}), section {REEF_NOTE}_sec_001,"
+        " pages 1-1 ---\n"
         "# Status\n\nThe reef Sentinel-2 case study has not been written yet."
     )
 
@@ -1609,7 +1620,7 @@ def test_eval_cli_refuses_a_qa_case_whose_evidence_is_over_the_judge_limit(
         tmp_path, BATHYMETRY_CORPUS | {"p105-archive/log.md": long_log}
     )
     pack = tmp_path / "long.eval.json"
-    anchors = [{"doc_id": "doc_004", "pages": None}]
+    anchors = [{"doc_id": ARCHIVE_LOG, "pages": None}]
     pack.write_text(json.dumps(pack_with(qa_cases__1__source_anchors=anchors)))
     out = tmp_path / "out"
     arguments = ["--pack", str(pack), "--snapshot", str(snapshot_path), "--out", str(out)]
@@ -1628,7 +1639,7 @@ def test_layer2_judges_answers_against_labelled_anchor_evidence_and_counts_claim
     tmp_path: Path, example_pack: EvalPack
 ) -> None:
     snapshot_path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS, pdfs=DREDGE_REPORT)
-    paged = qa_case("dredge_volume", [{"doc_id": "doc_004", "pages": [2, 2]}], kind="aggregation")
+    paged = qa_case("dredge_volume", [{"doc_id": DREDGE, "pages": [2, 2]}], kind="aggregation")
     cases = (*example_pack.qa_cases, paged)
     verdict = QAJudgeScore(
         factual_accuracy_1_to_5=4,
@@ -1653,18 +1664,19 @@ def test_layer2_judges_answers_against_labelled_anchor_evidence_and_counts_claim
     judged = [r["input"][0]["content"][0]["text"] for r in api.requests("/responses")[1::2]]
     whole_document, curator_note, abstention, page_range = judged[::2]
     assert (
-        "EVIDENCE:\n--- p101-harbour-lidar/harbour-memo.md (doc_001), section doc_001_sec_001,"
+        f"EVIDENCE:\n--- p101-harbour-lidar/harbour-memo.md ({HARBOUR_MEMO}),"
+        f" section {HARBOUR_MEMO}_sec_001,"
         " pages 1-1 ---\n# Rainfall" in whole_document
     )
-    assert "section doc_001_sec_003, pages 1-1 ---\n# Bathymetry" in whole_document
-    assert "SOURCE ANCHORS:\n- doc_001, whole document\n" in whole_document
-    assert "(doc_003), section doc_003_sec_001" in curator_note
+    assert f"section {HARBOUR_MEMO}_sec_003, pages 1-1 ---\n# Bathymetry" in whole_document
+    assert f"SOURCE ANCHORS:\n- {HARBOUR_MEMO}, whole document\n" in whole_document
+    assert f"({REEF_NOTE}), section {REEF_NOTE}_sec_001" in curator_note
     assert "SOURCE ANCHORS:\n(none listed)\n\nEVIDENCE:\n(no source anchors listed)" in abstention
-    assert "- doc_004, pages 2-2\n" in page_range
-    assert "--- p104-dredge/report.pdf (doc_004), section doc_004_sec_002, pages 2-3 ---" in (
+    assert f"- {DREDGE}, pages 2-2\n" in page_range
+    assert f"--- p104-dredge/report.pdf ({DREDGE}), section {DREDGE}_sec_002, pages 2-3 ---" in (
         page_range
     )
-    assert "doc_004_sec_001" not in page_range
+    assert f"{DREDGE}_sec_001" not in page_range
     rows = cast(list[dict[str, Any]], result["rows"])
     assert [r["kind"] for r in rows[::2]] == ["lookup", "lookup", "abstention", "aggregation"]
     counts = {"supported": 1, "contradicted": 1, "unverifiable": 1}
@@ -2084,7 +2096,7 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
             response_body([message("The median is 330.9 mm (harbour-memo.md).")]),
             structured_body(verdict),
             response_body([function_call("c1", "grep", grep)]),
-            response_body([message("The median is 330.9 mm (doc_001).")]),
+            response_body([message(f"The median is 330.9 mm ({HARBOUR_MEMO}).")]),
             structured_body(verdict),
         )
     copied = "The chart shows the Nine Year Median = 330.9 mm reference line for 2016"
@@ -2131,7 +2143,7 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
         ("grep", grep, 0),
     ]
     assert mcp_call[0]["result_chars"] > 200 and len(mcp_call[0]["result_head"]) == 200
-    assert mcp_call[0]["result_head"].startswith('{\n  "doc_id": "doc_001"')
+    assert mcp_call[0]["result_head"].startswith(f'{{\n  "doc_id": "{HARBOUR_MEMO}"')
     assert qa_rows[0]["judge"]["claims"][1] == {
         "claim": "The memo is from 2019.",
         "status": "unverifiable",
@@ -2290,7 +2302,7 @@ def snapshot_with(
     corpus.mkdir(parents=True)
     for rel_path in word_files:
         (corpus / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (corpus / rel_path).write_bytes(b"word document bytes")
+        write_docx(corpus / rel_path, ["Word notes"])
     pdf = write_pdf(root / "converted.pdf", [["Converted Word notes"]]).read_bytes()
     with monkeypatch.context() as patched:
         patched.setattr(compiler, "convert_office_to_pdf", lambda *args: pdf)
@@ -2312,7 +2324,10 @@ def test_eval_cli_refuses_outputs_it_cannot_write_and_inputs_it_cannot_convert_o
         corpus = snapshot_path.parent / "bathymetry-corpus"
         before = tree()
         arguments = ["--pack", str(pack), "--snapshot", str(snapshot_path), "--out", str(out)]
-        result = runner.invoke(eval_app, [*arguments, "--corpus", str(corpus), *extra])
+        # A wide terminal, so Rich never wraps a long temporary path inside a word.
+        result = runner.invoke(
+            eval_app, [*arguments, "--corpus", str(corpus), *extra], env={"COLUMNS": "1000"}
+        )
         assert result.exit_code == 2, result.output
         assert api.request_count == 0 and tree() == before
         return " ".join(result.output.replace("\u2502", " ").split())

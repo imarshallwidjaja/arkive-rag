@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -38,6 +39,7 @@ from arkive_rag.models import (
     BlueprintSectionDraft,
     CompiledCorpus,
     CorpusDocument,
+    CraftObservation,
     DeliverableTypeDraft,
     DocumentReading,
     FacetDraft,
@@ -52,10 +54,23 @@ from arkive_rag.models import (
     SenseDraft,
     StandingPassageSelection,
     TermObservation,
+    document_id,
 )
 from arkive_rag.passages import standing_candidates
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
-from tests.support import BATHYMETRY_CORPUS, HOUSE_DISCLOSURE, MARKETING_CORPUS, FakeGateway
+from tests.support import (
+    BATHYMETRY_CORPUS,
+    CAMPAIGN_NOTE,
+    ESTUARY_PROPOSAL,
+    HARBOUR_MEMO,
+    HOUSE_DISCLOSURE,
+    LOYALTY_BRIEF,
+    MARKETING_CORPUS,
+    SPRING_BRIEF,
+    SPRING_REVIEW,
+    FakeGateway,
+    sec,
+)
 
 
 def compile_files(
@@ -103,19 +118,46 @@ def test_guide_citations_get_one_rerun_listing_the_valid_tokens_then_raise(
     tmp_path: Path,
 ) -> None:
     files = {"p1/memo.md": "# Results\n\nSeagrass mapped.", "p1/AGENTS.md": "# Note\n\nDraft."}
-    gateway = FakeGateway(guide_script=["See [doc_002:bad_sec].", "See [doc_002:doc_002_sec_001]."])
+    memo, note = document_id("p1/memo.md"), document_id("p1/AGENTS.md")
+    valid = f"[{memo}:{sec('p1/memo.md')}]"
+    gateway = FakeGateway(guide_script=[f"See [{memo}:bad_sec].", f"See {valid}."])
 
     corpus = compile_files(tmp_path / "ok", files, gateway)
 
-    assert corpus.guide_markdown == "See [doc_002:doc_002_sec_001]."
+    assert corpus.guide_markdown == f"See {valid}."
     first, rerun = gateway.of_type(WriteGuide)
     assert first.feedback is None and rerun.feedback is not None
-    assert "[doc_002:bad_sec]" in rerun.feedback and "[doc_002:doc_002_sec_001]" in rerun.feedback
-    # The curator note (doc_001) is not citable.
-    assert "doc_001_sec_001" not in rerun.feedback.split("cite only")[1]
-    stubborn = FakeGateway(guide_script=["No citations.", "Still [doc_001:doc_001_sec_001]."])
-    with pytest.raises(RejectedOutputError, match=r"\[doc_001:doc_001_sec_001\]"):
+    assert f"[{memo}:bad_sec]" in rerun.feedback and valid in rerun.feedback
+    # The curator note is not citable.
+    assert sec("p1/AGENTS.md") not in rerun.feedback.split("cite only")[1]
+    note_token = f"[{note}:{sec('p1/AGENTS.md')}]"
+    stubborn = FakeGateway(guide_script=["No citations.", f"Still {note_token}."])
+    with pytest.raises(RejectedOutputError, match=re.escape(note_token)):
         compile_files(tmp_path / "bad", files, stubborn)
+
+
+@pytest.mark.parametrize(
+    ("markdown", "bad"),
+    [
+        # A section ID of another document, and a pre-hash ID, never resolve.
+        (f"See [{HARBOUR_MEMO}:{ESTUARY_PROPOSAL}_sec_001].", True),
+        ("See [doc_001:doc_001_sec_001].", True),
+        # Prose in brackets that only starts with "doc" is not a citation token.
+        (f"Open the [docx] and [documents] files [{HARBOUR_MEMO}:{HARBOUR_MEMO}_sec_001].", False),
+    ],
+)
+def test_guide_citation_tokens_name_a_section_of_their_own_document(
+    markdown: str, bad: bool
+) -> None:
+    documents = tuple(
+        CorpusDocument(document_id(path), path, reading(["# A\n\nText."], ()))
+        for path in (
+            "p101-harbour-lidar/harbour-memo.md",
+            "p102-estuary-multibeam/estuary-proposal.md",
+        )
+    )
+
+    assert bool(induction.invalid_citations(markdown, CorpusView(documents))) is bad
 
 
 # Organisation.
@@ -155,8 +197,8 @@ BROKEN = organisation(
         DeliverableTypeDraft(
             name="proposal",
             description="Proposal.",
-            exemplar_doc_ids=["doc_001", "doc_002"],
-            feedback_doc_ids=["doc_002"],
+            exemplar_doc_ids=[HARBOUR_MEMO, ESTUARY_PROPOSAL],
+            feedback_doc_ids=[ESTUARY_PROPOSAL],
         ),
     ],
 )
@@ -175,10 +217,10 @@ def test_structurally_invalid_organisation_is_rerun_once_then_raises(tmp_path: P
     assert "unknown folder 'nowhere'" in message
     assert "unknown document ID 'doc_009'" in message
     # A feedback document of a type must not also supply its exemplar text.
-    assert "'proposal': 'doc_002' is both an exemplar and a feedback document" in message
+    assert f"'proposal': '{ESTUARY_PROPOSAL}' is both an exemplar and a feedback" in message
     first, rerun = gateway.of_type(OrganiseCorpus)
     assert first.feedback is None and rerun.feedback is not None and "doc_009" in rerun.feedback
-    assert "'doc_002' is both an exemplar and a feedback document" in rerun.feedback
+    assert f"'{ESTUARY_PROPOSAL}' is both an exemplar and a feedback document" in rerun.feedback
 
 
 def test_organisation_normalises_repetition_within_a_value_so_the_snapshot_stores_it(
@@ -204,7 +246,7 @@ def test_organisation_normalises_repetition_within_a_value_so_the_snapshot_store
             ("Northwind Marine", ("NM",)),
             ("Contoso Ports", ("CP",)),
         ]
-        assert snap.resolve_filters({"client": "nm"}) == frozenset({"doc_001"})
+        assert snap.resolve_filters({"client": "nm"}) == frozenset({HARBOUR_MEMO})
 
 
 @pytest.mark.parametrize(
@@ -231,7 +273,7 @@ def test_organisation_rejects_values_a_filter_could_not_tell_apart(
 ) -> None:
     draft = organisation(FacetDraft(name="client", description="Client.", values=values))
 
-    checked = check_organisation(draft, frozenset(), frozenset())
+    checked = check_organisation(draft, frozenset(), {})
 
     assert checked.result is None
     assert any(message in r for r in checked.rejections), checked.rejections
@@ -245,7 +287,7 @@ def test_more_recurring_deliverable_types_than_the_cap_are_rejected_and_rerun(
             DeliverableTypeDraft(
                 name=f"type {i}",
                 description="A type.",
-                exemplar_doc_ids=["doc_001"],
+                exemplar_doc_ids=[HARBOUR_MEMO],
                 feedback_doc_ids=[],
             )
             for i in range(MAX_DELIVERABLE_TYPES + 1)
@@ -401,21 +443,26 @@ def test_glossary_keeps_defined_terms_separate_senses_and_undefined_terms(
     assert senses(corpus, "Churn") == [
         (
             "Lapsed members. Churn is the share of members who stop buying within a year.",
-            ("doc_002_sec_002",),
+            (f"{LOYALTY_BRIEF}_sec_002",),
         )
     ]
     # Two documents define CTA differently: two senses, each citing its own section.
     assert senses(corpus, "CTA") == [
-        ("CTA (call to action) is the button that closes every email.", ("doc_002_sec_003",)),
+        (
+            "CTA (call to action) is the button that closes every email.",
+            (f"{LOYALTY_BRIEF}_sec_003",),
+        ),
         (
             "CTA (call to action) means the single step a reader should take next.",
-            ("doc_003_sec_003",),
+            (f"{SPRING_BRIEF}_sec_003",),
         ),
     ]
     (cta,) = [e for e in corpus.glossary if e.term == "CTA"]
     assert cta.aliases == ("call to action",)
     # Used in two documents, defined in neither: discoverable, with no definition.
-    assert senses(corpus, "ICP") == [(None, ("doc_003_sec_003", "doc_004_sec_002"))]
+    assert senses(corpus, "ICP") == [
+        (None, (f"{SPRING_BRIEF}_sec_003", f"{SPRING_REVIEW}_sec_002"))
+    ]
     assert corpus.build_report.unsupported_definitions == 0
 
 
@@ -434,14 +481,14 @@ def test_definitions_the_judge_does_not_support_become_undefined_and_are_counted
 ) -> None:
     corpus = compile_files(tmp_path, MARKETING_CORPUS, DoubtsChurn())
 
-    assert senses(corpus, "Churn") == [(None, ("doc_002_sec_002",))]
-    assert senses(corpus, "CTA")[0] == (None, ("doc_002_sec_003",))
+    assert senses(corpus, "Churn") == [(None, (f"{LOYALTY_BRIEF}_sec_002",))]
+    assert senses(corpus, "CTA")[0] == (None, (f"{LOYALTY_BRIEF}_sec_003",))
     assert senses(corpus, "CTA")[1][0] is not None
     assert corpus.build_report.unsupported_definitions == 2
     assert corpus.build_report.judge_refusals == {"check_definitions": 1}
 
 
-LAT_CLUSTER_SECTIONS = ("doc_001_sec_003", "doc_002_sec_002")
+LAT_CLUSTER_SECTIONS = (f"{HARBOUR_MEMO}_sec_003", f"{ESTUARY_PROPOSAL}_sec_002")
 
 
 def glossary_draft(
@@ -460,17 +507,20 @@ def glossary_draft(
 
 
 def test_every_glossary_citation_must_contain_a_form_the_entry_publishes(tmp_path: Path) -> None:
-    # doc_002_sec_002 says only "LAT"; the entry publishes neither "LAT" nor an alias for it.
-    unpublished = glossary_draft("Lowest astronomical tide", [["doc_002_sec_002"]])
+    # The proposal's second section says only "LAT"; the entry publishes neither "LAT" nor an
+    # alias for it.
+    unpublished = glossary_draft("Lowest astronomical tide", [[f"{ESTUARY_PROPOSAL}_sec_002"]])
     gateway = FakeGateway(glossary_script=[unpublished, unpublished])
 
-    with pytest.raises(RejectedOutputError, match="doc_002_sec_002 contains neither"):
+    with pytest.raises(RejectedOutputError, match=f"{ESTUARY_PROPOSAL}_sec_002 contains neither"):
         compile_files(tmp_path, BATHYMETRY_CORPUS, gateway)
     first, rerun = gateway.of_type(WriteGlossary)
     assert [c.term for c in first.clusters] == ["LAT"]
     assert rerun.feedback is not None and "add the form used there as an alias" in rerun.feedback
 
-    published = glossary_draft("Lowest astronomical tide", [["doc_002_sec_002"]], ["LAT"])
+    published = glossary_draft(
+        "Lowest astronomical tide", [[f"{ESTUARY_PROPOSAL}_sec_002"]], ["LAT"]
+    )
     corpus = compile_files(
         tmp_path / "ok", BATHYMETRY_CORPUS, FakeGateway(glossary_script=[published])
     )
@@ -500,7 +550,11 @@ def test_aliases_are_stripped_one_per_folded_form_in_a_total_order() -> None:
     assert {canonical_aliases("LAT", list(p)) for p in itertools.permutations(forms)} == {expected}
 
 
-def reading(markdowns: Sequence[str], terms: Sequence[TermObservation]) -> DocumentReading:
+def reading(
+    markdowns: Sequence[str],
+    terms: Sequence[TermObservation],
+    craft: Sequence[CraftObservation] = (),
+) -> DocumentReading:
     return DocumentReading(
         sha256="0" * 64,
         format="md",
@@ -525,8 +579,9 @@ def reading(markdowns: Sequence[str], terms: Sequence[TermObservation]) -> Docum
             summary="Memo.",
             attributes=(),
             terms=tuple(terms),
-            craft=(),
+            craft=tuple(craft),
         ),
+        date=None,
         discarded_quotes=0,
     )
 
@@ -555,25 +610,65 @@ def test_term_clusters_do_not_depend_on_observation_order() -> None:
     assert [q.section_id for q in cluster.quotes] == ["doc_001_sec_001", "doc_001_sec_002"]
 
 
-def test_definitions_are_judged_over_complete_sections_in_windows(tmp_path: Path) -> None:
+def test_induction_orders_documents_and_sections_by_path_not_by_document_id() -> None:
+    paths = ("p1/a.md", "p2/b.md", "p3/c.md")
+    ids = [document_id(p) for p in paths]
+    assert sorted(ids) == ids[::-1], "the paths' IDs must sort against path order"
+    term = TermObservation(
+        term="LAT", kind="acronym", aliases=(), quote="LAT", defines=False, section_ordinal=1
+    )
+    craft = CraftObservation(aspect="tone", statement="Plain.", quote="LAT", section_ordinal=1)
+    view = CorpusView(
+        tuple(
+            CorpusDocument(document_id(p), p, reading(["LAT is the datum."], [term], [craft]))
+            for p in paths
+        )
+    )
+    sections = [sec(p) for p in paths]
+
+    (cluster,) = term_clusters(view)
+    assert [q.section_id for q in cluster.quotes] == sections
+    assert [lead.section_id for lead in induction.craft_leads(view, ids[::-1])] == sections
+    assert [d.doc_id for d in exemplar_documents(view, ids[::-1])] == ids
+    draft = organisation(
+        types=[
+            DeliverableTypeDraft(
+                name="memo",
+                description="Memo.",
+                exemplar_doc_ids=[ids[2], ids[0], ids[2]],
+                feedback_doc_ids=[ids[1]],
+            )
+        ]
+    )
+    accepted = check_organisation(draft, frozenset(), view.citable_order).result
+    assert accepted is not None
+    (memo,) = accepted.deliverable_types
+    assert (memo.exemplar_doc_ids, memo.feedback_doc_ids) == ((ids[0], ids[2]), (ids[1],))
+
+
+def test_definitions_are_judged_over_complete_sections_in_windows() -> None:
     filler = "\n\n".join(
         " ".join(f"Line {p}.{i} was surveyed twice." for i in range(30)) for p in range(140)
     )
-    files = {
-        "p1/memo.md": f"# Datum\n\n{filler}\n\n**LAT** means the lowest astronomical tide.\n",
-    }
+    view = candidate_view(
+        ("p1/memo.md", [f"# Datum\n\n{filler}\n\n**LAT** means the lowest astronomical tide."])
+    )
     gateway = FakeGateway()
 
-    corpus = compile_files(tmp_path, files, gateway)
+    windows = view.evidence([sec("p1/memo.md")])
+    (probability,) = induction.judge_support(
+        gateway,
+        "check_definitions",
+        windows,
+        [induction.definition_predicate("LAT", "LAT means the lowest astronomical tide.")],
+    )
 
     assert len(filler) > 2 * EVIDENCE_WINDOW_CHARS
-    (entry,) = corpus.glossary
-    assert entry.senses[0].definition == "LAT means the lowest astronomical tide."
-    assert corpus.build_report.unsupported_definitions == 0
-    windows = [e for op, e, _ in gateway.judged if op == "check_definitions"]
     assert len(windows) >= 3 and all(len(w) <= EVIDENCE_WINDOW_CHARS for w in windows)
+    assert [e for _, e, _ in gateway.judged] == list(windows)
     # Only the last window holds the definition; the highest probability decides.
     assert "lowest astronomical tide" in windows[-1] and "lowest astronomical" not in windows[0]
+    assert probability == 0.9
 
 
 @pytest.mark.parametrize("heading_chars", [45_000, 46_000, 200_000])
@@ -604,8 +699,8 @@ def test_blueprints_cite_resolvable_sections_and_exemplars(tmp_path: Path) -> No
 
     brief, review = corpus.blueprints
     assert (brief.deliverable_type, review.deliverable_type) == ("campaign brief", "review notes")
-    assert brief.exemplar_doc_ids == ("doc_002", "doc_003")
-    assert brief.feedback_doc_ids == ("doc_004",)
+    assert brief.exemplar_doc_ids == (LOYALTY_BRIEF, SPRING_BRIEF)
+    assert brief.feedback_doc_ids == (SPRING_REVIEW,)
     sections = {s.section_id for d in corpus.documents for s in d.sections}
     cited = [c for s in brief.outline for c in s.citations]
     cited += [c for g in (*brief.conventions, *brief.pitfalls) for c in g.citations]
@@ -613,7 +708,7 @@ def test_blueprints_cite_resolvable_sections_and_exemplars(tmp_path: Path) -> No
     assert [g.statement for g in brief.conventions] == [
         "Lead with the customer benefit before the product name."
     ]
-    assert brief.conventions[0].citations == ("doc_002_sec_003", "doc_003_sec_003")
+    assert brief.conventions[0].citations == (f"{LOYALTY_BRIEF}_sec_003", f"{SPRING_BRIEF}_sec_003")
     assert [g.statement for g in brief.pitfalls] == ["Cut the jargon from the opening line."]
     assert [s.heading for s in brief.outline] == [
         "Title and summary",
@@ -625,14 +720,16 @@ def test_blueprints_cite_resolvable_sections_and_exemplars(tmp_path: Path) -> No
     # `Convention:` line unselected. The single review-notes exemplar has no candidates.
     request, review_request = gateway.of_type(WriteBlueprint)
     assert [(c.candidate_id, c.citations) for c in request.standing_candidates] == [
-        ("candidate_01", ("doc_002_sec_003", "doc_003_sec_003")),
-        ("candidate_02", ("doc_002_sec_004", "doc_003_sec_004")),
+        ("candidate_01", (f"{LOYALTY_BRIEF}_sec_003", f"{SPRING_BRIEF}_sec_003")),
+        ("candidate_02", (f"{LOYALTY_BRIEF}_sec_004", f"{SPRING_BRIEF}_sec_004")),
     ]
     (disclosure,) = brief.standing_passages
     assert disclosure.label == "Disclosure"
     assert disclosure.text == HOUSE_DISCLOSURE.split("\n\n")[1].strip()
-    assert disclosure.citations == ("doc_002_sec_004", "doc_003_sec_004")
-    assert "[candidate_02] found in doc_002_sec_004, doc_003_sec_004" in request.text()
+    assert disclosure.citations == (f"{LOYALTY_BRIEF}_sec_004", f"{SPRING_BRIEF}_sec_004")
+    assert (
+        f"[candidate_02] found in {LOYALTY_BRIEF}_sec_004, {SPRING_BRIEF}_sec_004" in request.text()
+    )
     assert review.standing_passages == () and review_request.standing_candidates == ()
     assert "(none: this type has one exemplar document" in review_request.text()
     assert corpus.build_report.dropped_blueprint_statements == 0
@@ -640,18 +737,20 @@ def test_blueprints_cite_resolvable_sections_and_exemplars(tmp_path: Path) -> No
     # Craft observations of the exemplars and the feedback document are leads to verify.
     assert request.craft_leads == (
         CraftLead(
-            "doc_002_sec_003",
+            f"{LOYALTY_BRIEF}_sec_003",
             "convention",
             "Lead with the customer benefit before the product name.",
         ),
         CraftLead(
-            "doc_003_sec_003",
+            f"{SPRING_BRIEF}_sec_003",
             "convention",
             "Lead with the customer benefit before the product name.",
         ),
-        CraftLead("doc_004_sec_002", "reviewer_feedback", "Cut the jargon from the opening line."),
+        CraftLead(
+            f"{SPRING_REVIEW}_sec_002", "reviewer_feedback", "Cut the jargon from the opening line."
+        ),
     )
-    assert "[doc_004_sec_002] reviewer_feedback: Cut the jargon" in request.text()
+    assert f"[{SPRING_REVIEW}_sec_002] reviewer_feedback: Cut the jargon" in request.text()
     assert "leads, not evidence" in WriteBlueprint.instructions
     assert {t.name for t in request.tools} == {"outline", "read_section", "grep"}
     assert len(request.source_digest) == 64
@@ -662,20 +761,20 @@ def test_blueprint_tools_cannot_read_curator_notes_and_their_revision_is_in_the_
 ) -> None:
     gateway = FakeGateway()
     corpus = compile_files(tmp_path, MARKETING_CORPUS, gateway)
-    assert corpus.documents[0].is_curator_note and corpus.documents[0].doc_id == "doc_001"
+    assert corpus.documents[0].is_curator_note and corpus.documents[0].doc_id == CAMPAIGN_NOTE
     request = gateway.of_type(WriteBlueprint)[0]
     tools = {t.name: t for t in request.tools}
 
-    with pytest.raises(NotFoundError, match="doc_001"):
-        tools["outline"].invoke({"doc_id": "doc_001"})
-    with pytest.raises(NotFoundError, match="doc_001_sec_001"):
-        tools["read_section"].invoke({"section_id": "doc_001_sec_001"})
+    with pytest.raises(NotFoundError, match=CAMPAIGN_NOTE):
+        tools["outline"].invoke({"doc_id": CAMPAIGN_NOTE})
+    with pytest.raises(NotFoundError, match=f"{CAMPAIGN_NOTE}_sec_001"):
+        tools["read_section"].invoke({"section_id": f"{CAMPAIGN_NOTE}_sec_001"})
     assert tools["grep"].invoke({"pattern": "autumn recap"}) == "[]"
     with pytest.raises(ValueError, match="blank"):
         tools["grep"].invoke({"pattern": " "})
     for name, args in (
         ("grep", {"pattern": 3}),
-        ("outline", {"doc_id": ["doc_002"]}),
+        ("outline", {"doc_id": [LOYALTY_BRIEF]}),
         ("read_section", {}),
     ):
         with pytest.raises(ValueError, match="must be a string"):
@@ -729,11 +828,12 @@ def test_a_blueprint_with_an_empty_outline_fails_after_one_rerun(tmp_path: Path)
 
 
 def candidate_view(*docs: tuple[str, Sequence[str]]) -> CorpusView:
-    """Documents doc_001, doc_002, ... in argument order; each section's Markdown as given."""
+    """Documents in argument order, which must be path order; each section's Markdown as
+    given."""
     return CorpusView(
         tuple(
-            CorpusDocument(f"doc_{n:03d}", rel_path, reading(markdowns, ()))
-            for n, (rel_path, markdowns) in enumerate(docs, start=1)
+            CorpusDocument(document_id(rel_path), rel_path, reading(markdowns, ()))
+            for rel_path, markdowns in docs
         )
     )
 
@@ -751,8 +851,8 @@ def test_candidates_beyond_the_cap_keep_those_in_the_most_documents_and_the_requ
     None
 ):
     assert induction.MAX_STANDING_CANDIDATES == 60
-    # Sixty-one distinct sentences recur between doc_001 and doc_002; the last two also recur
-    # in doc_003, so they outrank the rest, and the tie among the others keeps canonical order.
+    # Sixty-one distinct sentences recur between a.md and b.md; the last two also recur in
+    # c.md, so they outrank the rest, and the tie among the others keeps canonical order.
     sentences = [
         f"Standing clause number {n} of the house terms binds every survey we carry out."
         for n in range(1, 62)
@@ -760,7 +860,7 @@ def test_candidates_beyond_the_cap_keep_those_in_the_most_documents_and_the_requ
     view = candidate_view(
         ("p1/a.md", sentences), ("p2/b.md", sentences), ("p3/c.md", sentences[-2:])
     )
-    exemplars = ("doc_001", "doc_002", "doc_003")
+    exemplars = tuple(document_id(p) for p in ("p1/a.md", "p2/b.md", "p3/c.md"))
     found = standing_candidates(exemplar_documents(view, exemplars))
 
     offered = induction.offered_candidates(view, found)
@@ -780,7 +880,9 @@ def selecting(*selections: tuple[str, str]) -> BlueprintDraft:
     return BlueprintDraft(
         description="A brief.",
         outline=[
-            BlueprintSectionDraft(heading="Audience", purpose="Who.", citations=["doc_002_sec_002"])
+            BlueprintSectionDraft(
+                heading="Audience", purpose="Who.", citations=[f"{LOYALTY_BRIEF}_sec_002"]
+            )
         ],
         conventions=[],
         pitfalls=[],

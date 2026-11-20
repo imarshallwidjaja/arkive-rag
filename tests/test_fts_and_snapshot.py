@@ -22,6 +22,7 @@ from arkive_rag.models import (
     SearchHit,
     SnapshotIntegrityError,
     UnsafePathError,
+    document_id,
 )
 from arkive_rag.snapshot import (
     MAX_TOP_K,
@@ -31,7 +32,18 @@ from arkive_rag.snapshot import (
     build_fts5_query,
     write_snapshot,
 )
-from tests.support import BATHYMETRY_CORPUS, MARKETING_CORPUS, FakeGateway, compile_snapshot
+from tests.support import (
+    BATHYMETRY_CORPUS,
+    CAMPAIGN_NOTE,
+    ESTUARY_PROPOSAL,
+    LOYALTY_BRIEF,
+    MARKETING_CORPUS,
+    SPRING_BRIEF,
+    SPRING_REVIEW,
+    FakeGateway,
+    compile_snapshot,
+    write_pdf,
+)
 
 FTS_BATTERY = [
     "Sentinel-2",
@@ -282,11 +294,29 @@ def test_filters_combine_with_and_resolve_aliases_and_restrict_every_read(
         "p103-reef-sonar",
     }
     only_estuary = snapshot.grep("sentinel-2", filters={"project": "p102-estuary-multibeam"})
-    assert {m.doc_id for m in only_estuary} == {"doc_002"}
+    assert {m.doc_id for m in only_estuary} == {ESTUARY_PROPOSAL}
     assert (
         snapshot.grep("sentinel-2", filters={"client": "Contoso", "project": "p101-harbour-lidar"})
         == []
     )
+
+
+def test_every_read_follows_path_order_not_the_hash_order_of_document_ids(
+    tmp_path: Path,
+) -> None:
+    paths = ("north.md", "south.md", "west.md")
+    ids = [document_id(p) for p in paths]
+    assert sorted(ids) == ids[::-1], "the paths' IDs must sort against path order"
+    # Identical documents tie in every ranking, so only the tie-break orders them.
+    same = "# Tide\n\nThe harbour tide gauge reads two metres at low water.\n"
+    path = compile_snapshot(tmp_path, dict.fromkeys(paths, same), topic="tides")
+
+    with TopicSnapshot.open(path) as snap:
+        assert [d.doc_id for d in snap.list_documents()] == ids
+        assert [m.doc_id for m in snap.grep("tide gauge")] == ids
+        channels = snap.rank_channels("harbour tide gauge", FakeGateway().embed_query)
+        for channel, hits in channels.items():
+            assert [h.doc_id for h in hits] == ids, channel
 
 
 def test_curator_guidance_answers_status_questions(snapshot: TopicSnapshot) -> None:
@@ -453,10 +483,10 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     stale = tmp_path / "stale.arkive.db"
     shutil.copy(path, stale)
     with sqlite3.connect(stale) as db:
-        db.execute("UPDATE corpus_meta SET value = '2.0' WHERE key = 'schema_version'")
+        db.execute("UPDATE corpus_meta SET value = '4.0' WHERE key = 'schema_version'")
     db.close()
     with pytest.raises(
-        SnapshotIntegrityError, match=r"schema version '2\.0'; Arkive \S+ reads schema 3\.0 only"
+        SnapshotIntegrityError, match=r"schema version '4\.0'; Arkive \S+ reads schema 5\.0 only"
     ):
         TopicSnapshot.open(stale)
     with pytest.raises(SnapshotIntegrityError, match="does not exist"):
@@ -465,6 +495,39 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     garbage.write_bytes(os.urandom(4096))
     with pytest.raises(SnapshotIntegrityError, match="not a valid snapshot"):
         TopicSnapshot.open(garbage)
+
+
+def test_document_dates_round_trip_with_their_basis(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    for rel_path, text in {
+        "a/memo.md": "# Memo\n\nDate: 20/11/2025\n\nSurvey notes.",
+        "b/notes.md": "# Notes\n\nDate: 05/04/2026\n\nSurvey notes.",
+    }.items():
+        (corpus_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (corpus_dir / rel_path).write_text(text, encoding="utf-8")
+    (corpus_dir / "c").mkdir()
+    write_pdf(
+        corpus_dir / "c" / "report.pdf",
+        [["# Report", "Survey notes."]],
+        {"CreationDate": "D:20250630"},
+    )
+    output = tmp_path / "dates.arkive.db"
+    write_snapshot(compile_corpus(corpus_dir, FakeGateway(), topic="d", title="D"), output)
+
+    with TopicSnapshot.open(output) as snap:
+        dates = {
+            d.rel_path: (d.doc_date, d.date.iso if d.date else None, d.date and d.date.basis)
+            for d in snap.list_documents()
+        }
+    assert dates == {
+        "a/memo.md": ("20/11/2025", "2025-11-20", "printed"),
+        # Ambiguous as printed: kept as written, with no calendar date and no fallback.
+        "b/notes.md": ("05/04/2026", None, None),
+        "c/report.pdf": ("2025-06-30", "2025-06-30", "metadata"),
+    }
+    with sqlite3.connect(output) as db, pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        db.execute("UPDATE documents SET doc_date_basis = NULL WHERE doc_date_iso IS NOT NULL")
+    db.close()
 
 
 def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path) -> None:
@@ -477,14 +540,14 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
     write_snapshot(corpus, output)
 
     with TopicSnapshot.open(output) as snap:
-        assert SCHEMA_VERSION == "3.0"
+        assert SCHEMA_VERSION == "5.0"
         assert tuple(snap.facets) == corpus.facets
         assert tuple(snap.glossary) == corpus.glossary
         assert tuple(snap.blueprints) == corpus.blueprints
         assert snap.build_settings == dict(corpus.build_settings)
         assert snap.build_report == corpus.build_report
         assert snap.guide_markdown == corpus.guide_markdown
-        assert {d.doc_id: d.facets for d in snap.list_documents()}["doc_004"] == {
+        assert {d.doc_id: d.facets for d in snap.list_documents()}[SPRING_REVIEW] == {
             "campaign": ["spring-launch"],
             "author": ["Sam Okafor"],
             "channel": ["Social"],
@@ -501,33 +564,52 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
 @pytest.mark.parametrize(
     ("table", "column", "old", "new", "message"),
     [
-        ("glossary", "entry_json", "doc_002_sec_002", "doc_002_sec_099", "cites 'doc_002_sec_099'"),
-        # doc_001 is the curator note: its sections are not citable.
-        ("glossary", "entry_json", "doc_002_sec_002", "doc_001_sec_001", "cites 'doc_001_sec_001'"),
-        ("blueprints", "blueprint_json", '"doc_002"', '"doc_001"', "names document 'doc_001'"),
-        ("blueprints", "blueprint_json", '"outline"', '"sketch"', "row is malformed"),
-        # doc_003_sec_004 is cited only by the campaign brief's standing passage.
         (
-            "blueprints",
-            "blueprint_json",
-            '"doc_003_sec_004"',
-            '"doc_003_sec_099"',
-            "cites 'doc_003_sec_099'",
+            "glossary",
+            "entry_json",
+            f"{LOYALTY_BRIEF}_sec_002",
+            f"{LOYALTY_BRIEF}_sec_099",
+            f"cites '{LOYALTY_BRIEF}_sec_099'",
+        ),
+        # The curator note's sections are not citable.
+        (
+            "glossary",
+            "entry_json",
+            f"{LOYALTY_BRIEF}_sec_002",
+            f"{CAMPAIGN_NOTE}_sec_001",
+            f"cites '{CAMPAIGN_NOTE}_sec_001'",
         ),
         (
             "blueprints",
             "blueprint_json",
-            '"doc_003_sec_004"',
-            '"doc_004_sec_001"',
-            "standing passage citing 'doc_004_sec_001', which is not a section of the"
+            f'"{LOYALTY_BRIEF}"',
+            f'"{CAMPAIGN_NOTE}"',
+            f"names document '{CAMPAIGN_NOTE}'",
+        ),
+        ("blueprints", "blueprint_json", '"outline"', '"sketch"', "row is malformed"),
+        # The spring brief's fourth section is cited only by the campaign brief's standing
+        # passage.
+        (
+            "blueprints",
+            "blueprint_json",
+            f'"{SPRING_BRIEF}_sec_004"',
+            f'"{SPRING_BRIEF}_sec_099"',
+            f"cites '{SPRING_BRIEF}_sec_099'",
+        ),
+        (
+            "blueprints",
+            "blueprint_json",
+            f'"{SPRING_BRIEF}_sec_004"',
+            f'"{SPRING_REVIEW}_sec_001"',
+            f"standing passage citing '{SPRING_REVIEW}_sec_001', which is not a section of the"
             " blueprint's exemplars",
         ),
-        # Both citations then name doc_002: a passage must recur in another exemplar.
+        # Both citations then name the loyalty brief: a passage must recur in another exemplar.
         (
             "blueprints",
             "blueprint_json",
-            '"doc_003_sec_004"',
-            '"doc_002_sec_003"',
+            f'"{SPRING_BRIEF}_sec_004"',
+            f'"{LOYALTY_BRIEF}_sec_003"',
             "standing passage 'Disclosure' whose citations name fewer than two exemplar documents",
         ),
         # `get_blueprint` resolves a folded type, so it must name one blueprint.
@@ -590,7 +672,7 @@ def test_guide_summarises_blueprints_and_one_blueprint_is_read_in_full_by_folded
     ]
     assert brief.outline and brief.conventions
     assert [p.citations for p in brief.standing_passages] == [
-        ("doc_002_sec_004", "doc_003_sec_004")
+        (f"{LOYALTY_BRIEF}_sec_004", f"{SPRING_BRIEF}_sec_004")
     ]
 
 
@@ -645,6 +727,36 @@ def test_glossary_lookup_by_term_alias_list_and_miss(tmp_path: Path) -> None:
         ),
         ("DROP TABLE chunks_fts", "lacks the tables chunks_fts"),
         ("UPDATE documents SET page_count = 'many' WHERE ordinal = 1", "not a valid snapshot"),
+        (
+            "UPDATE documents SET doc_date = '2025-02-30', doc_date_iso = '2025-02-30',"
+            " doc_date_basis = 'metadata' WHERE ordinal = 1",
+            "'2025-02-30' is not a calendar date",
+        ),
+        # A date text that disagrees with its calendar date: a metadata date is its own text,
+        # and a printed date's text parses to it.
+        (
+            "UPDATE documents SET doc_date = '2025-06-29', doc_date_iso = '2025-06-30',"
+            " doc_date_basis = 'metadata' WHERE ordinal = 1",
+            "has an inconsistent date",
+        ),
+        (
+            "UPDATE documents SET doc_date = 'May 2025', doc_date_iso = '2025-06',"
+            " doc_date_basis = 'printed' WHERE ordinal = 1",
+            "has an inconsistent date",
+        ),
+        (
+            "UPDATE documents SET doc_date = NULL, doc_date_iso = '2025-06-30',"
+            " doc_date_basis = 'metadata' WHERE ordinal = 1",
+            "has an inconsistent date",
+        ),
+        # A basis without a calendar date, even beside an ambiguous text that parses to none,
+        # in a file written past the table's CHECK constraint.
+        (
+            "PRAGMA ignore_check_constraints = ON;"
+            " UPDATE documents SET doc_date = '05/04/2025', doc_date_iso = NULL,"
+            " doc_date_basis = 'printed' WHERE ordinal = 1",
+            "has an inconsistent date",
+        ),
         ("UPDATE facet_values SET folders_json = '{' WHERE ordinal = 1", "facet row is malformed"),
     ],
 )
@@ -653,7 +765,7 @@ def test_a_damaged_snapshot_fails_to_open_with_an_integrity_error(
 ) -> None:
     path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
     with sqlite3.connect(path) as db:
-        db.execute(damage)
+        db.executescript(damage)
     db.close()
 
     with pytest.raises(SnapshotIntegrityError, match=message) as raised:

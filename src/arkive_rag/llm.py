@@ -54,7 +54,7 @@ from openai.types.responses import Response, ResponseInputParam
 from openai.types.shared import Reasoning
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from arkive_rag.models import InvalidFilterError, NotFoundError, ProviderError
+from arkive_rag.models import InvalidFilterError, NotFoundError, ProviderError, RenderedSource
 
 Effort = Literal["low", "medium", "high"]
 # Tool exceptions that mean the model sent invalid input; they go back to it as text.
@@ -272,7 +272,8 @@ class LanguageGateway(Protocol):
 
 
 class BuildCache:
-    """Content-addressed store of validated provider responses, shared by build threads."""
+    """Content-addressed store of validated provider responses and rendered pages, shared by
+    build threads. It is the compiler's render cache (`load_render`, `store_render`)."""
 
     def __init__(self, path: Path) -> None:
         self._lock = threading.Lock()
@@ -289,6 +290,16 @@ class BuildCache:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS llm_cache (cache_key TEXT PRIMARY KEY,"
                 " response_json TEXT NOT NULL, created_at TEXT NOT NULL)"
+            )
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS page_render_cache (cache_key TEXT NOT NULL,"
+                " page_number INTEGER NOT NULL, native_text TEXT NOT NULL,"
+                " webp_bytes BLOB NOT NULL, PRIMARY KEY (cache_key, page_number))"
+            )
+            # One row per complete rendered source, written with its pages.
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS page_render_meta (cache_key TEXT PRIMARY KEY,"
+                " page_count INTEGER NOT NULL, metadata_date_iso TEXT)"
             )
             self._db.commit()
         except sqlite3.Error as exc:
@@ -345,6 +356,89 @@ class BuildCache:
         if stored is None:
             raise AssertionError(f"build cache entry for {cache_key} does not decode")
         return stored
+
+    def _read_render(self, cache_key: str) -> RenderedSource | None:
+        """The rendered source stored under `cache_key`, or None when no complete, well-formed
+        entry is stored: a missing metadata row, a page count that disagrees with the pages,
+        a gap in 1..N, or a value of the wrong type or an image that is not WebP is a miss."""
+        meta = self._db.execute(
+            "SELECT page_count, metadata_date_iso FROM page_render_meta WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if meta is None:
+            return None
+        page_count, metadata_date = meta
+        rows = self._db.execute(
+            "SELECT page_number, native_text, webp_bytes FROM page_render_cache"
+            " WHERE cache_key = ? ORDER BY page_number",
+            (cache_key,),
+        ).fetchall()
+        # The row count is compared before the page numbers, so a hostile page count never
+        # sizes anything.
+        if (
+            not isinstance(page_count, int)
+            or page_count < 1
+            or len(rows) != page_count
+            or not all(row[0] == number for number, row in enumerate(rows, start=1))
+            or not (metadata_date is None or isinstance(metadata_date, str))
+        ):
+            return None
+        pages: list[tuple[str, bytes]] = []
+        for _, text, webp in rows:
+            if not isinstance(text, str) or not isinstance(webp, bytes | memoryview):
+                return None
+            pages.append((text, bytes(webp)))
+        try:
+            return RenderedSource(tuple(pages), metadata_date)
+        except ValueError:
+            return None
+
+    def load_render(self, cache_key: str) -> RenderedSource | None:
+        try:
+            with self._lock:
+                # One read transaction, so the pages and their metadata row are one snapshot.
+                self._db.execute("BEGIN")
+                try:
+                    return self._read_render(cache_key)
+                finally:
+                    self._db.commit()
+        except sqlite3.Error as exc:
+            raise ProviderError(f"build cache read failed: {exc}") from exc
+
+    def store_render(self, cache_key: str, rendered: RenderedSource) -> RenderedSource:
+        """Store `rendered` unless a complete entry exists, and return the stored entry.
+
+        As with responses, the first complete entry for a key is canonical; an incomplete or
+        malformed one is replaced.
+        """
+        try:
+            with self._lock:
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    existing = self._read_render(cache_key)
+                    if existing is None:
+                        for table in ("page_render_cache", "page_render_meta"):
+                            self._db.execute(
+                                f"DELETE FROM {table} WHERE cache_key = ?", (cache_key,)
+                            )
+                        self._db.executemany(
+                            "INSERT INTO page_render_cache VALUES (?, ?, ?, ?)",
+                            [
+                                (cache_key, number, text, webp)
+                                for number, (text, webp) in enumerate(rendered.pages, start=1)
+                            ],
+                        )
+                        self._db.execute(
+                            "INSERT INTO page_render_meta VALUES (?, ?, ?)",
+                            (cache_key, len(rendered.pages), rendered.metadata_date),
+                        )
+                    self._db.commit()
+                except BaseException:
+                    self._db.rollback()
+                    raise
+        except sqlite3.Error as exc:
+            raise ProviderError(f"build cache write failed: {exc}") from exc
+        return existing if existing is not None else rendered
 
     def close(self) -> None:
         with self._lock:

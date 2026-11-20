@@ -109,6 +109,7 @@ def build(
                 topic=slug,
                 title=title or slug,
                 max_concurrency=max_concurrency,
+                render_cache=build_cache,
             )
         finally:
             if build_cache:

@@ -22,7 +22,7 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_007",
+          "doc_id": "doc_8a0ea01679",
           "pages": null
         }
       ]
@@ -51,11 +51,11 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_003",
+          "doc_id": "doc_1a444efc06",
           "pages": null
         },
         {
-          "doc_id": "doc_009",
+          "doc_id": "doc_3b334e3739",
           "pages": null
         }
       ]
@@ -99,39 +99,39 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_001",
+          "doc_id": "doc_a54ff182c7",
           "pages": null
         },
         {
-          "doc_id": "doc_002",
+          "doc_id": "doc_20339a4c9f",
           "pages": null
         },
         {
-          "doc_id": "doc_003",
+          "doc_id": "doc_1a444efc06",
           "pages": null
         },
         {
-          "doc_id": "doc_004",
+          "doc_id": "doc_510ef1bd30",
           "pages": null
         },
         {
-          "doc_id": "doc_005",
+          "doc_id": "doc_1ecd87479b",
           "pages": null
         },
         {
-          "doc_id": "doc_006",
+          "doc_id": "doc_f1ff7fd7fd",
           "pages": null
         },
         {
-          "doc_id": "doc_007",
+          "doc_id": "doc_8a0ea01679",
           "pages": null
         },
         {
-          "doc_id": "doc_008",
+          "doc_id": "doc_23c817a0ee",
           "pages": null
         },
         {
-          "doc_id": "doc_009",
+          "doc_id": "doc_3b334e3739",
           "pages": null
         }
       ]
@@ -148,7 +148,7 @@
       "held_out_markers": [
         "kettlecraft-winter"
       ],
-      "reference_doc_id": "doc_008",
+      "reference_doc_id": "doc_23c817a0ee",
       "instructions": "You are a campaign manager at Hollin & Pike Creative writing the campaign brief for Teodor Vasquez-Lund's Kettlecraft Homeware winter campaign. Write the complete brief in Markdown from the run notes in the prompt, taking every campaign-specific fact from the run notes, and when your tools give you prior Hollin & Pike documents, follow their house structure and wording. Return only the brief.",
       "run_notes": "- campaign: Kettlecraft Winter Warmers\n- client: Kettlecraft Homeware\n- creator: Teodor Vasquez-Lund\n- channels: email newsletter; short-form video\n- target audience: first-time home owners, 25-35\n- spend: GBP 14,800\n- dates: 3 November to 19 December 2025\n- goal: 2,400 Winter Warmer flask sets sold online by 19 December\n- tagline: \"Hot at nine, hot at five.\"\n- CTA: buyers must order by 18 December for pre-holiday delivery\n- assets: 3 newsletter features (Pinloom scheduling); 5 x 15-second videos (Clipstack edit); UGC round-up: customers' winter-walk content\n- KPIs: newsletter link CTR, target 3.0 %; CPM ceiling GBP 5.50; daily online orders via Sparkboard\n- must include: 12-hour heat claim shown with its test ref KH-TR-118; the delivery cut-off shown in every asset\n",
       "exemplar_paths": [

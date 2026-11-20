@@ -17,11 +17,12 @@ from typer.testing import CliRunner
 
 from arkive_rag import __version__, cli
 from arkive_rag.cli import app
-from arkive_rag.models import ArkiveError, ObservationDraft
+from arkive_rag.models import ArkiveError, ObservationDraft, document_id
 from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
 from tests.support import (
     BATHYMETRY_CORPUS,
+    HARBOUR_MEMO,
     MARKETING_CORPUS,
     FakeGateway,
     ScriptedOpenAI,
@@ -30,6 +31,7 @@ from tests.support import (
     usage,
 )
 
+CHART_MEMO = document_id("p101-harbour-lidar/harbour-chart-memo.pdf")
 PDF_PAGES = [
     ["# Rainfall", "Nine Year Median = 330.9 mm"],
     ["# Outputs", "Raster estuary_2024_grid.tif"],
@@ -84,11 +86,11 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
             ("list_topics", {}),
             ("get_topic_guide", {"topic": marine}),
             ("list_documents", {"topic": marine, "filters": {"project": "p101-harbour-lidar"}}),
-            ("get_document_outline", {"topic": marine, "doc_id": "doc_001"}),
+            ("get_document_outline", {"topic": marine, "doc_id": CHART_MEMO}),
             ("search", {"topic": marine, "query": "nine year median rainfall", "top_k": 3}),
             ("grep", {"topic": marine, "pattern": "330.9"}),
-            ("read_section", {"topic": marine, "section_id": "doc_001_sec_002"}),
-            ("view_page", {"topic": marine, "doc_id": "doc_001", "page_number": 2}),
+            ("read_section", {"topic": marine, "section_id": f"{CHART_MEMO}_sec_002"}),
+            ("view_page", {"topic": marine, "doc_id": CHART_MEMO, "page_number": 2}),
             ("list_documents", {"topic": "soils"}),
             ("grep", {"topic": "soils", "pattern": "330.9"}),
             ("lookup_glossary", {"topic": marine}),
@@ -110,7 +112,7 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
         "project",
         ["p101-harbour-lidar", "p102-estuary-multibeam", "p103-reef-sonar"],
     )
-    assert "[doc_00" in data(guide)["guide_markdown"]
+    assert f"[{CHART_MEMO}:" in data(guide)["guide_markdown"]
     # The guide carries blueprint summaries; get_blueprint returns one in full.
     assert data(guide)["blueprints"] == [
         {
@@ -137,9 +139,9 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
     ]
     assert [s["heading_path"] for s in data(outline)["sections"]] == ["Rainfall", "Outputs"]
     assert len(data(hits)) == 3 and "330.9" in data(hits)[0]["content"]
-    assert {m["doc_id"] for m in data(matches)} == {"doc_001", "doc_002"}
+    assert {m["doc_id"] for m in data(matches)} == {CHART_MEMO, HARBOUR_MEMO}
     assert data(section)["markdown"] == "# Outputs\n\nRaster estuary_2024_grid.tif"
-    assert data(section)["prev_section_id"] == "doc_001_sec_001"
+    assert data(section)["prev_section_id"] == f"{CHART_MEMO}_sec_001"
     text, image = page.content
     assert isinstance(text, TextContent) and "page 2 of 2" in text.text
     assert isinstance(image, ImageContent) and image.mime_type == "image/webp"
@@ -149,7 +151,7 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
     assert [(t["term"], t["defined"]) for t in data(terms)["terms"]] == [("LAT", True)]
     (entry,) = data(lat)["matches"]
     assert entry["aliases"] == ["lowest astronomical tide"]
-    assert entry["senses"][0]["citations"] == ["doc_002_sec_003"]
+    assert entry["senses"][0]["citations"] == [f"{HARBOUR_MEMO}_sec_003"]
 
 
 def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
@@ -160,11 +162,11 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
         [
             ("search", {"topic": "bathymetry", "query": "rainfall"}),
             ("grep", {"topic": "bathymetry", "pattern": "Sentinel-2", "max_matches": 1}),
-            ("read_section", {"topic": "bathymetry", "section_id": "doc_001_sec_001"}),
-            ("view_page", {"topic": "bathymetry", "doc_id": "doc_001", "page_number": 1}),
+            ("read_section", {"topic": "bathymetry", "section_id": f"{CHART_MEMO}_sec_001"}),
+            ("view_page", {"topic": "bathymetry", "doc_id": CHART_MEMO, "page_number": 1}),
             ("list_documents", {"topic": "mining"}),
             ("list_documents", {"topic": "bathymetry", "filters": {"project": "p999"}}),
-            ("view_page", {"topic": "bathymetry", "doc_id": "doc_001", "page_number": 9}),
+            ("view_page", {"topic": "bathymetry", "doc_id": CHART_MEMO, "page_number": 9}),
             ("grep", {"topic": "bathymetry", "pattern": "x", "filters": {"stage": "memo"}}),
             ("lookup_glossary", {"topic": "bathymetry", "query": " "}),
             ("get_blueprint", {"topic": "bathymetry", "deliverable_type": "press release"}),
@@ -176,11 +178,11 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
 
     assert "OPENAI_API_KEY" in error_text(search) and "grep" in error_text(search)
     assert len(data(grep)) == 1
-    assert data(section)["section_id"] == "doc_001_sec_001"
+    assert data(section)["section_id"] == f"{CHART_MEMO}_sec_001"
     assert isinstance(page.content[1], ImageContent)
     assert error_text(bad_topic).endswith("unknown topic 'mining'; valid topics: bathymetry, soils")
     assert "valid values: p101-harbour-lidar" in error_text(bad_project)
-    assert error_text(bad_page).endswith("doc_001 has no page 9; it has pages 1-2")
+    assert error_text(bad_page).endswith(f"{CHART_MEMO} has no page 9; it has pages 1-2")
     assert error_text(bad_facet).endswith("unknown facet 'stage'; valid facets: project, client")
     assert "glossary query must not be blank" in error_text(blank)
     assert error_text(bad_type).endswith("valid types: proposal, survey memorandum")
@@ -228,12 +230,13 @@ def test_cli_inspect_and_grep_work_offline(
     assert summary["arkive_version"] == __version__
     source = snapshots[0].parent / "bathymetry-corpus" / "p101-harbour-lidar/harbour-chart-memo.pdf"
     assert summary["documents"][0] == {
-        "doc_id": "doc_001",
+        "doc_id": CHART_MEMO,
         "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "rel_path": "p101-harbour-lidar/harbour-chart-memo.pdf",
         "format": "pdf",
         "title": "Rainfall",
         "doc_date": None,
+        "date": None,
         "deliverable_type": "document",
         "page_count": 2,
         "is_curator_note": False,
@@ -249,7 +252,7 @@ def test_cli_inspect_and_grep_work_offline(
     assert summary["build_settings"]["efforts"]["observe"] == "low"
     assert summary["build_report"]["discarded_unlocated_quotes"] == 0
     assert grepped.exit_code == 0, grepped.output
-    assert [m["doc_id"] for m in json.loads(grepped.stdout)] == ["doc_002"]
+    assert [m["doc_id"] for m in json.loads(grepped.stdout)] == [HARBOUR_MEMO]
     assert bad_facet.exit_code == 1 and "valid facets: project, client" in bad_facet.stderr
     assert repeated.exit_code == 2 and "given twice" in repeated.output
     assert malformed.exit_code == 2 and "not FACET=VALUE" in malformed.output
@@ -281,7 +284,7 @@ def test_installed_cli_serves_snapshots_over_stdio(
     version, grep, search = anyio.run(run)
 
     assert version == __version__
-    assert {m["doc_id"] for m in data(grep)} == {"doc_001", "doc_002"}
+    assert {m["doc_id"] for m in data(grep)} == {CHART_MEMO, HARBOUR_MEMO}
     assert "OPENAI_API_KEY" in error_text(search)
 
 

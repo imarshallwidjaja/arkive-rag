@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import io
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
@@ -12,7 +14,8 @@ from typing import Annotated, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict, Field
+from PIL import Image
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ArkiveError(Exception):
@@ -117,6 +120,16 @@ def fold_for_quote(text: str) -> str:
     text = _LINE_HYPHENATION.sub("", text)
     text = _EMPHASIS.sub("", _BLOCK_QUOTE_MARKERS.sub("", text)).replace("|", " ")
     return _WHITESPACE.sub(" ", fold_text(text)).strip()
+
+
+def document_id(rel_path: str) -> str:
+    """The stable ID of the document at `rel_path`, a corpus-relative POSIX path.
+
+    It depends on the NFC-normalised path only, never on the bytes or on the other files of
+    the corpus, so adding, removing or editing another file leaves every other ID unchanged.
+    """
+    norm = unicodedata.normalize("NFC", rel_path)
+    return f"doc_{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:10]}"
 
 
 class _Frozen(BaseModel):
@@ -314,9 +327,160 @@ class RenderedPage(_Frozen):
     visual_summary: str
 
 
+# `printed`: parsed from the date the document prints. `metadata`: from the original file's
+# own metadata, used only when the document prints no date.
+DateBasis = Literal["printed", "metadata"]
+
+
+_CALENDAR_DATE = re.compile(r"(\d{4})-(\d{2})(?:-(\d{2}))?", re.ASCII)
+
+
+def is_calendar_date(iso: str) -> bool:
+    """Whether `iso` is a real calendar date written `YYYY-MM-DD`, or a month `YYYY-MM`."""
+    match = _CALENDAR_DATE.fullmatch(iso)
+    if match is None:
+        return False
+    try:
+        datetime.date(int(match[1]), int(match[2]), int(match[3] or 1))
+    except ValueError:
+        return False
+    return True
+
+
+_MONTH_NAMES = (
+    *("january", "february", "march", "april", "may", "june"),
+    *("july", "august", "september", "october", "november", "december"),
+)
+_MONTH_NUMBERS = (
+    {name: number for number, name in enumerate(_MONTH_NAMES, start=1)}
+    | {name[:3]: number for number, name in enumerate(_MONTH_NAMES, start=1)}
+    | {"sept": 9}
+)
+_MONTH = "(" + "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True)) + r")\.?"
+_DAY = r"(\d{1,2})(?:st|nd|rd|th)?"
+# re.ASCII keeps every pattern to ASCII digits and makes IGNORECASE fold ASCII letters only,
+# so a matched month name is a key of _MONTH_NUMBERS once lowered.
+_ISO_DAY = re.compile(r"(\d{4})-(\d{2})-(\d{2})", re.ASCII)
+_ISO_MONTH = re.compile(r"(\d{4})-(\d{2})", re.ASCII)
+_DAY_MONTH_YEAR = re.compile(rf"{_DAY} (?:of )?{_MONTH},? (\d{{4}})", re.ASCII | re.IGNORECASE)
+_MONTH_DAY_YEAR = re.compile(rf"{_MONTH} {_DAY},? (\d{{4}})", re.ASCII | re.IGNORECASE)
+_MONTH_YEAR = re.compile(rf"{_MONTH},? (\d{{4}})", re.ASCII | re.IGNORECASE)
+_NUMERIC_DATE = re.compile(r"(\d{1,2})([/.-])(\d{1,2})\2(\d{4})", re.ASCII)
+_YEAR_FIRST_DATE = re.compile(r"(\d{4})([/.])(\d{1,2})\2(\d{1,2})", re.ASCII)
+
+
+def iso_date(year: str | int, month: str | int, day: str | int | None = None) -> str | None:
+    """`YYYY-MM-DD`, or `YYYY-MM` without a day, when the parts name a real date."""
+    try:
+        parsed = datetime.date(int(year), int(month), 1 if day is None else int(day))
+    except ValueError:
+        return None
+    return parsed.isoformat() if day is not None else parsed.isoformat()[:7]
+
+
+def parse_printed_date(printed: str) -> str | None:
+    """The ISO form of a printed date that has one reading, else None.
+
+    After NFKC (so `19ᵗʰ` reads as `19th`) and with whitespace collapsed, the whole text must
+    be one of: `YYYY-MM-DD` or `YYYY-MM`; a day (with or without an ordinal suffix), an
+    English month name (full or abbreviated) and a year; a month name, day and year; a month
+    name and year, which gives `YYYY-MM`; a numeric `D/M/YYYY` (also with `-` or `.`) where
+    exactly one of the first two numbers is above 12, which makes it the day, or where both
+    are the same, so either order reads alike (`01/01/2026`); or a year-first `YYYY/M/D` or
+    `YYYY.M.D` with a year from 1900 to 2100. Anything else, such as `05/04/2026` or a
+    range, has no single reading and gives None. A Unicode dash or minus sign reads as `-`,
+    as `fold_text` reads it, so `2025\u201305\u201319` is `2025-05-19`.
+    """
+    text = " ".join(_DASHES.sub("-", unicodedata.normalize("NFKC", printed)).split())
+    if match := _ISO_DAY.fullmatch(text):
+        return iso_date(match[1], match[2], match[3])
+    if match := _ISO_MONTH.fullmatch(text):
+        return iso_date(match[1], match[2])
+    if match := _DAY_MONTH_YEAR.fullmatch(text):
+        return iso_date(match[3], _MONTH_NUMBERS[match[2].lower()], match[1])
+    if match := _MONTH_DAY_YEAR.fullmatch(text):
+        return iso_date(match[3], _MONTH_NUMBERS[match[1].lower()], match[2])
+    if match := _MONTH_YEAR.fullmatch(text):
+        return iso_date(match[2], _MONTH_NUMBERS[match[1].lower()])
+    if match := _NUMERIC_DATE.fullmatch(text):
+        first, second = int(match[1]), int(match[3])
+        if first == second:
+            return iso_date(match[4], first, first)
+        if (first > 12) == (second > 12):
+            return None
+        day, month = (first, second) if first > 12 else (second, first)
+        return iso_date(match[4], month, day)
+    if (match := _YEAR_FIRST_DATE.fullmatch(text)) and 1900 <= int(match[1]) <= 2100:
+        return iso_date(match[1], match[3], match[4])
+    return None
+
+
+class DocumentDate(_Frozen):
+    """A document's calendar date, `YYYY-MM-DD` or `YYYY-MM`, and where it came from."""
+
+    iso: str
+    basis: DateBasis
+
+    @field_validator("iso")
+    @classmethod
+    def _real_date(cls, iso: str) -> str:
+        if not is_calendar_date(iso):
+            raise ValueError(f"{iso!r} is not a calendar date written YYYY-MM-DD or YYYY-MM")
+        return iso
+
+
+# Longest side of a rendered page. A larger page (an A0 sheet, a foldout) renders at a smaller
+# scale: libwebp refuses images over 16,383 px, and a 2x A0 bitmap holds about 130 MB.
+MAX_RENDER_SIDE_PX = 4096
+
+
+def _decodes_as_webp(data: bytes) -> bool:
+    """Whether `data` is a WebP image within MAX_RENDER_SIDE_PX whose pixels decode. The
+    format and size come from the header, so an image that is not one is refused before its
+    pixels are decoded."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != "WEBP" or not (
+                1 <= image.width <= MAX_RENDER_SIDE_PX and 1 <= image.height <= MAX_RENDER_SIDE_PX
+            ):
+                return False
+            image.load()
+            return True
+    except OSError, ValueError, SyntaxError, Image.DecompressionBombError:
+        return False
+
+
+@dataclass(frozen=True)
+class RenderedSource:
+    """Every page of a rendered PDF, Word or PowerPoint source as (native text, WebP bytes),
+    numbered from 1, and the date its original file's own metadata carries.
+
+    `metadata_date` is `YYYY-MM-DD` or `YYYY-MM`, or None when the file carries no date. A
+    rendered source has at least one page, and every image is a WebP image no side of which
+    exceeds MAX_RENDER_SIDE_PX that Pillow decodes in full, so a truncated, damaged or
+    oversized cache entry is refused.
+    """
+
+    pages: tuple[tuple[str, bytes], ...]
+    metadata_date: str | None
+
+    def __post_init__(self) -> None:
+        if not self.pages:
+            raise ValueError("a rendered source has at least one page")
+        for number, page in enumerate(self.pages, start=1):
+            text, webp = page
+            if not isinstance(text, str) or not isinstance(webp, bytes):
+                raise ValueError(f"page {number} is not (native text, WebP bytes)")
+            if not _decodes_as_webp(webp):
+                raise ValueError(f"page {number} image is not a WebP image that decodes")
+        if self.metadata_date is not None and not is_calendar_date(self.metadata_date):
+            raise ValueError(f"metadata date {self.metadata_date!r} is not a calendar date")
+
+
 class DocumentReading(_Frozen):
     """The reading of one source. `discarded_quotes` counts observations dropped because
-    their quote was still not found in the source after one rerun."""
+    their quote was still not found in the source after one rerun. `date` is None when the
+    printed date is ambiguous, or when nothing is printed and the file carries no date."""
 
     sha256: str
     format: SourceFormat
@@ -324,12 +488,24 @@ class DocumentReading(_Frozen):
     sections: tuple[ReadSection, ...]
     pages: tuple[RenderedPage, ...]
     card: ObservationCard
+    date: DocumentDate | None
     discarded_quotes: int
+
+    @property
+    def date_label(self) -> str | None:
+        """The date as prompts show it: the date as printed, else the metadata date marked as
+        such, else None."""
+        if self.card.doc_date:
+            return self.card.doc_date
+        if self.date is not None:
+            return f"{self.date.iso} (file metadata)"
+        return None
 
 
 @dataclass(frozen=True)
 class CorpusDocument:
-    """A reading placed in the corpus: its ID follows sorted path order."""
+    """A reading placed in the corpus. `doc_id` is `document_id(rel_path)`; documents are
+    ordered by path."""
 
     doc_id: str
     rel_path: str
@@ -466,7 +642,9 @@ class CompiledDocument(_Frozen):
     sha256: str
     format: SourceFormat
     title: str
+    # The date as printed, or the metadata date's ISO form when nothing is printed.
     doc_date: str | None
+    date: DocumentDate | None
     deliverable_type: str
     summary: str
     # Facet name to the document's sorted values, in facet definition order.
@@ -555,12 +733,16 @@ class TopicGuide(_Frozen):
 
 
 class DocumentInfo(_Frozen):
+    """`doc_date` is as printed (or the metadata date); `date` is its calendar form and
+    where it came from, None when the printed date is ambiguous or no date is known."""
+
     doc_id: str
     rel_path: str
     sha256: str
     format: str
     title: str
     doc_date: str | None
+    date: DocumentDate | None
     deliverable_type: str
     summary: str
     page_count: int

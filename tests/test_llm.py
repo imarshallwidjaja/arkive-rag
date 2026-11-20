@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import sqlite3
@@ -18,6 +19,7 @@ import openai
 import pytest
 from agents import Runner
 from agents.tracing.processors import default_exporter
+from PIL import Image, ImageFile, WebPImagePlugin
 from pydantic import BaseModel
 
 from arkive_rag import llm
@@ -37,8 +39,10 @@ from arkive_rag.llm import (
     load_dotenv_if_present,
 )
 from arkive_rag.models import (
+    MAX_RENDER_SIDE_PX,
     NotFoundError,
     ProviderError,
+    RenderedSource,
     SnapshotIntegrityError,
 )
 from tests.support import (
@@ -905,6 +909,78 @@ def test_cache_instances_on_one_file_keep_the_first_stored_value(
 
         assert stored == {"first": "A", "second": "A"}
         assert second.get("k") == "A"
+
+
+def webp(tag: bytes) -> bytes:
+    """A 1x1 WebP image whose pixel encodes `tag`, as a rendered page holds."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), (tag[0], 0, 0)).save(buffer, format="WEBP", lossless=True)
+    return buffer.getvalue()
+
+
+def test_rendered_sources_keep_the_first_complete_entry_and_any_damage_is_a_miss(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cache.db"
+    first = RenderedSource((("page one", webp(b"1")), ("page two", webp(b"2"))), "2025-06")
+    with BuildCache(path) as cache, BuildCache(path) as other:
+        assert cache.load_render("k") is None
+        assert cache.store_render("k", first) == first
+        # A later writer of the same key gets the stored entry; the first one stays canonical.
+        assert other.store_render("k", RenderedSource((("x", webp(b"9")),), None)) == first
+        assert other.load_render("k") == first
+
+        damage = [
+            # A missing first page, then a missing last page: the page count catches both.
+            "DELETE FROM page_render_cache WHERE page_number = 1",
+            "DELETE FROM page_render_cache WHERE page_number = 2",
+            "DELETE FROM page_render_meta",
+            "UPDATE page_render_meta SET page_count = 0",
+            # A hostile page count is a miss, not a list of 2**63 page numbers.
+            "UPDATE page_render_meta SET page_count = 9223372036854775807",
+            "UPDATE page_render_meta SET metadata_date_iso = '2025-13'",
+            "UPDATE page_render_meta SET metadata_date_iso = 7",
+            "UPDATE page_render_cache SET webp_bytes = 7 WHERE page_number = 2",
+            "UPDATE page_render_cache SET webp_bytes = 'RIFF....WEBP' WHERE page_number = 2",
+            # A WebP file header with no image chunk, and an image cut short, do not decode.
+            "UPDATE page_render_cache SET webp_bytes = x'52494646000000005745425000'"
+            " WHERE page_number = 2",
+            "UPDATE page_render_cache SET webp_bytes = substr(webp_bytes, 1, 30)"
+            " WHERE page_number = 2",
+            "UPDATE page_render_cache SET webp_bytes = zeroblob(50) WHERE page_number = 2",
+            "UPDATE page_render_cache SET native_text = x'00' WHERE page_number = 1",
+        ]
+        for statement in damage:
+            with sqlite3.connect(path) as db:
+                db.execute(statement)
+            db.close()
+
+            assert cache.load_render("k") is None, statement
+            # The damaged entry is replaced by the next complete one.
+            assert cache.store_render("k", first) == first
+            assert other.load_render("k") == first
+
+    with pytest.raises(ValueError, match="at least one page"):
+        RenderedSource((), None)
+
+
+def test_a_rendered_page_of_the_wrong_format_or_size_is_refused_before_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def image(size: tuple[int, int], fmt: str) -> bytes:
+        buffer = io.BytesIO()
+        Image.new("RGB", size, "white").save(buffer, format=fmt)
+        return buffer.getvalue()
+
+    def refuse(self: object) -> None:
+        raise AssertionError("pixels decoded")
+
+    refused = (image((2, 2), "PNG"), image((MAX_RENDER_SIDE_PX + 1, 1), "WEBP"))
+    monkeypatch.setattr(ImageFile.ImageFile, "load", refuse)
+    monkeypatch.setattr(WebPImagePlugin.WebPImageFile, "load", refuse)
+    for data in refused:
+        with pytest.raises(ValueError, match="page 1 image is not a WebP image"):
+            RenderedSource((("text", data),), None)
 
 
 def test_undecodable_cache_entries_are_misses_that_get_replaced(tmp_path: Path) -> None:

@@ -33,7 +33,7 @@ import anyio
 from pydantic import BaseModel
 
 from arkive_rag import passages as _passages
-from arkive_rag.compiler import compile_corpus, discover_corpus, read_source
+from arkive_rag.compiler import RenderCache, compile_corpus, discover_corpus, read_source
 from arkive_rag.llm import BudgetExceededError, Effort, LanguageGateway, OpenAIGateway, Tool
 from arkive_rag.models import DocumentInfo, ProviderError, fold_for_quote
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
@@ -141,8 +141,12 @@ def compile_holdout_snapshot(
     gateway: LanguageGateway,
     holdout: Holdout,
     reference: DocumentInfo,
+    render_cache: RenderCache | None = None,
 ) -> None:
-    """Build the holdout snapshot and publish it at `output_path` only after its guard passes."""
+    """Build the holdout snapshot and publish it at `output_path` only after its guard passes.
+
+    `render_cache`, normally the build cache `gateway` uses, lets a holdout skip rendering
+    files an earlier build rendered."""
     sources = select_holdout_sources(corpus_dir, holdout, reference)
     unverified = output_path.with_name(f".{output_path.name}.unverified")
     with tempfile.TemporaryDirectory(prefix="arkive-holdout-") as scratch:
@@ -151,7 +155,11 @@ def compile_holdout_snapshot(
             (holdout_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
             (holdout_dir / rel_path).write_bytes(data)
         corpus = compile_corpus(
-            holdout_dir, gateway, topic="holdout", title="Corpus without the held-out deliverable"
+            holdout_dir,
+            gateway,
+            topic="holdout",
+            title="Corpus without the held-out deliverable",
+            render_cache=render_cache,
         )
         try:
             write_snapshot(corpus, unverified)
@@ -520,13 +528,15 @@ async def run_layer3_holdout(
     output_dir: Path,
     holdout: Holdout,
     drafts: int,
+    render_cache: RenderCache | None = None,
 ) -> dict[str, object]:
     """Draft one held-out deliverable in `drafts` rounds; only completed drafts are scored.
 
     The holdout snapshot is built once and written to `output_dir/holdout.arkive.db`.
-    `holdout_gateway` compiles it; it must embed in the full snapshot's embedding space, because
-    `embedder` serves both. The reference and the included files are checked before any file is
-    copied or any model is called. Every round runs `zero_shot`, `chunk_search` and
+    `holdout_gateway` compiles it, with `render_cache` when one is given; it must embed in the
+    full snapshot's embedding space, because `embedder` serves both. The reference and the
+    included files are checked before any file is copied or any model is called. Every round
+    runs `zero_shot`, `chunk_search` and
     `arkive_mcp`, and `exemplars_in_context` unless the holdout lists no `exemplar_paths` (it is
     then reported in `skipped_arms`), and makes one blind judge call when any draft completed.
     Each round's `blind_drafts` maps Candidate labels to draft text; the caller writes them out.
@@ -544,7 +554,13 @@ async def run_layer3_holdout(
     # A worker thread: compiling may start its own event loop for agent runs, and this
     # coroutine's loop is already running.
     await anyio.to_thread.run_sync(
-        compile_holdout_snapshot, corpus_dir, holdout_path, holdout_gateway, holdout, reference
+        compile_holdout_snapshot,
+        corpus_dir,
+        holdout_path,
+        holdout_gateway,
+        holdout,
+        reference,
+        render_cache,
     )
 
     with TopicSnapshot.open(holdout_path) as built:

@@ -8,7 +8,7 @@ import re
 import threading
 import zipfile
 import zlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -52,6 +52,7 @@ from arkive_rag.models import (
     StandingPassageSelection,
     StatedAttribute,
     TermDraft,
+    document_id,
     fold_for_quote,
 )
 from arkive_rag.snapshot import write_snapshot
@@ -67,6 +68,11 @@ _QUOTED = re.compile(r'"([^"]+)"')
 _FOLDER_FACET = re.compile(r"^Folders: (\w+)$", re.MULTILINE)
 # Attributes that describe the document rather than group the collection.
 _NOT_FACETS = {"deliverable", "date"}
+
+
+def sec(rel_path: str, ordinal: int = 1) -> str:
+    """The section ID the build gives section `ordinal` of the document at `rel_path`."""
+    return f"{document_id(rel_path)}_sec_{ordinal:03d}"
 
 
 def hash_embedding(text: str, dimensions: int) -> NDArray[np.float32]:
@@ -277,7 +283,7 @@ class FakeGateway:
             else:
                 seen = [q.section_id for q in cluster.quotes]
                 seen += [o.section_id for o in cluster.occurrences]
-                senses = [SenseDraft(definition=None, citations=sorted(set(seen))[:3])]
+                senses = [SenseDraft(definition=None, citations=list(dict.fromkeys(seen))[:3])]
             entries.append(
                 GlossaryEntryDraft(
                     term=cluster.term,
@@ -439,7 +445,10 @@ def decision_body(answers: Sequence[float | None], input_tokens: int = 50) -> di
     }
 
 
-def _default_structured(schema_name: str) -> BaseModel:
+_CATALOG_CITATION = re.compile(r"\[doc_[0-9a-f]{10}:doc_[0-9a-f]{10}_sec_\d{3}\]")
+
+
+def _default_structured(schema_name: str, body: dict[str, Any]) -> BaseModel:
     if schema_name == "ObservationDraft":
         return ObservationDraft(
             title="Memo",
@@ -453,7 +462,9 @@ def _default_structured(schema_name: str) -> BaseModel:
     if schema_name == "OrganisationDraft":
         return OrganisationDraft(facets=[], deliverable_types=[])
     if schema_name == "GuideDraft":
-        return GuideDraft(guide_markdown="Overview [doc_001:doc_001_sec_001].")
+        # The first citation token the request's catalog lists.
+        cited = _CATALOG_CITATION.search(json.dumps(body))
+        return GuideDraft(guide_markdown=f"Overview {cited[0] if cited else ''}.")
     raise AssertionError(f"no default response for schema {schema_name!r}; script one")
 
 
@@ -515,7 +526,7 @@ class ScriptedOpenAI:
     def _default(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         if path == "/responses":
             name = body["text"]["format"]["name"]
-            default = self.defaults.get(name) or _default_structured(name)
+            default = self.defaults.get(name) or _default_structured(name, body)
             return structured_body(default if isinstance(default, BaseModel) else default(body))
         if path == "/decisions":
             return decision_body([0.75] * len(body["questions"]))
@@ -558,8 +569,11 @@ class ScriptedOpenAI:
         )
 
 
-def write_pdf(path: Path, pages: Sequence[Sequence[str]]) -> Path:
-    """Write a minimal Helvetica PDF with one text line per entry."""
+def write_pdf(
+    path: Path, pages: Sequence[Sequence[str]], info: Mapping[str, str] | None = None
+) -> Path:
+    """Write a minimal Helvetica PDF with one text line per entry, and an info dictionary
+    (such as `{"CreationDate": "D:20250630164500Z"}`) when `info` is given."""
     objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b""]
     page_ids: list[int] = []
     font_id = 3
@@ -579,6 +593,11 @@ def write_pdf(path: Path, pages: Sequence[Sequence[str]]) -> Path:
         page_ids.append(len(objects))
     kids = " ".join(f"{pid} 0 R" for pid in page_ids)
     objects[1] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode()
+    info_ref = b""
+    if info:
+        entries = " ".join(f"/{key} ({value})" for key, value in info.items())
+        objects.append(f"<< {entries} >>".encode("latin-1"))
+        info_ref = b" /Info %d 0 R" % len(objects)
     body = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, obj in enumerate(objects, start=1):
@@ -587,16 +606,21 @@ def write_pdf(path: Path, pages: Sequence[Sequence[str]]) -> Path:
     xref = len(body)
     body += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
     body += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
-    body += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+    body += b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n" % (
         len(objects) + 1,
+        info_ref,
         xref,
     )
     path.write_bytes(bytes(body))
     return path
 
 
-def write_docx(path: Path, paragraphs: Sequence[str]) -> Path:
-    """Write a minimal WordprocessingML document with one paragraph per entry."""
+def write_docx(
+    path: Path, paragraphs: Sequence[str], core_dates: Mapping[str, str] | None = None
+) -> Path:
+    """Write a minimal WordprocessingML document with one paragraph per entry, and a
+    `docProps/core.xml` holding `core_dates` (`{"modified": ..., "created": ...}` W3CDTF
+    values) when given."""
     body = "".join(f"<w:p><w:r><w:t>{escape(text)}</w:t></w:r></w:p>" for text in paragraphs)
     ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
@@ -622,6 +646,19 @@ def write_docx(path: Path, paragraphs: Sequence[str]) -> Path:
             f'<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="{ns}">'
             f"<w:body>{body}</w:body></w:document>",
         )
+        if core_dates is not None:
+            dates = "".join(
+                f'<dcterms:{name} xsi:type="dcterms:W3CDTF">{value}</dcterms:{name}>'
+                for name, value in core_dates.items()
+            )
+            archive.writestr(
+                "docProps/core.xml",
+                '<?xml version="1.0" encoding="UTF-8"?><cp:coreProperties xmlns:cp='
+                '"http://schemas.openxmlformats.org/package/2006/metadata/core-properties"'
+                ' xmlns:dcterms="http://purl.org/dc/terms/"'
+                ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+                f"{dates}</cp:coreProperties>",
+            )
     return path
 
 
@@ -669,6 +706,10 @@ BATHYMETRY_CORPUS = {
     ),
 }
 
+HARBOUR_MEMO = document_id("p101-harbour-lidar/harbour-memo.md")
+ESTUARY_PROPOSAL = document_id("p102-estuary-multibeam/estuary-proposal.md")
+REEF_NOTE = document_id("p103-reef-sonar/AGENTS.md")
+
 # A standing section every campaign brief ends with, whatever the campaign.
 HOUSE_DISCLOSURE = (
     "## Disclosure\n\nEvery sponsored post carries the label *Paid partnership* in its first"
@@ -704,6 +745,12 @@ MARKETING_CORPUS = {
         "\n\nThe **CTA** was buried in paragraph three. The **ICP** was never named.\n"
     ),
 }
+
+
+CAMPAIGN_NOTE = document_id("AGENTS.md")
+LOYALTY_BRIEF = document_id("loyalty-relaunch/brief.md")
+SPRING_BRIEF = document_id("spring-launch/brief.md")
+SPRING_REVIEW = document_id("spring-launch/review.md")
 
 
 def compile_snapshot(

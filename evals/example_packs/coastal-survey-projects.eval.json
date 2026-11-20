@@ -23,7 +23,7 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_003",
+          "doc_id": "doc_b0d99a3c39",
           "pages": null
         }
       ]
@@ -54,11 +54,11 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_001",
+          "doc_id": "doc_bd7e574633",
           "pages": null
         },
         {
-          "doc_id": "doc_008",
+          "doc_id": "doc_85f4f3854e",
           "pages": null
         }
       ]
@@ -99,19 +99,19 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_002",
+          "doc_id": "doc_82c5251cb9",
           "pages": null
         },
         {
-          "doc_id": "doc_005",
+          "doc_id": "doc_e1bc84e7c7",
           "pages": null
         },
         {
-          "doc_id": "doc_006",
+          "doc_id": "doc_cc01ac49e1",
           "pages": null
         },
         {
-          "doc_id": "doc_008",
+          "doc_id": "doc_85f4f3854e",
           "pages": null
         }
       ]
@@ -127,7 +127,7 @@
       "held_out_markers": [
         "q103"
       ],
-      "reference_doc_id": "doc_008",
+      "reference_doc_id": "doc_85f4f3854e",
       "instructions": "You are Imani Castellane, Survey Lead at Quillfen Geomatics, writing the proposal for the Fennick Waterways Trust canal siltation survey. Write the complete proposal in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Quillfen Geomatics documents, follow their house structure and wording. Return only the proposal.",
       "run_notes": "- job: Q103, Fennick Canal siltation survey; our ref QG-PR-103\n- client: Fennick Waterways Trust\n- author: Imani Castellane (Survey Lead); issue date 20 April 2026\n- client question: silt gained since the 2021 survey along the 7.8 km reach, Hob Lock to Carrow aqueduct\n- platform: small boat; sensor Sonavex R4 multibeam\n- positioning: RTK GNSS; total station at the 2 road bridges (no GNSS there)\n- processing: Hydrolith 7; differencing vs 2021 surface in SurfGrid\n- outputs: silt thickness + volume for each lock pound\n- files: fennick_reach_25cm.tif (GeoTIFF, gridded surface); fennick_silt_thickness.tif (GeoTIFF, silt thickness grid); Q103 memo (PDF)\n- variations: PCR = project change request; both parties sign it first; each one gives extra fee + extra days; covers any change of scope, area or programme\n- timing: May 2026, 3 days on the water, canal at its usual level; processing 7 working days afterwards\n- price: GBP 16,900 fixed, VAT excluded\n",
       "exemplar_paths": [
@@ -212,7 +212,7 @@
       "held_out_markers": [
         "q103"
       ],
-      "reference_doc_id": "doc_009",
+      "reference_doc_id": "doc_820e3700b2",
       "instructions": "You are Imani Castellane, Survey Lead at Quillfen Geomatics, writing the technical memorandum for the Fennick Waterways Trust canal siltation survey. Write the complete memorandum in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Quillfen Geomatics documents or review feedback, follow their house structure and wording. Return only the memorandum.",
       "run_notes": "- job: Q103, Fennick Canal siltation survey\n- client: Fennick Waterways Trust\n- author: Imani Castellane; checker: Dmitri Halloway; issue date 2 June 2026\n- sensor: Sonavex R4 MBES, 400 kHz, run from a 5 m workboat\n- vertical reference: Fennick canal datum, defined as Hob Lock top water level\n- HWX tie-in: at Hob Lock; most recent repeat 21 May 2026\n- bridge sections: total station fixes good to 0.03 m under both road bridges\n- processing: cleaning in Hydrolith 7; difference vs 2021 surface in SurfGrid\n- headline: average silt gain 0.31 m since 2021 over the 7.8 km reach; total 9,870 m3\n- max thickness: 0.74 m, pound upstream of Carrow aqueduct\n- TPU (95 % confidence): depths 0.07 m; silt thickness 0.10 m\n- pound Hob Lock-Wren Lock: 2.9 km, mean 0.22 m, 2,640 m3\n- pound Wren Lock-Mill Lock: 2.6 km, mean 0.29 m, 3,180 m3\n- pound Mill Lock-Carrow aqueduct: 2.3 km, mean 0.44 m, 4,050 m3\n- files: fennick_reach_25cm.tif (25 cm grid, canal datum); fennick_silt_thickness.tif (thickness since 2021)\n- caveat: 2021 grid spacing 1 m, so thicknesses under 0.10 m carry no meaning\n",
       "exemplar_paths": [

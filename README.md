@@ -59,10 +59,9 @@ An `AGENTS.md` anywhere in the corpus is a curator note: it guides induction,
 appears in the topic guide and is searchable. The guide, glossary and
 blueprints never cite it; an agent answering a question from a note cites it
 like any other document. With `--cache`, rebuilding an unchanged corpus makes
-no provider calls. Snapshots use schema `3.0`. Rebuild older snapshots from
-their corpus. An earlier build of schema `3.0` may have blueprint rows without
-standing passages; those rows are refused as malformed at open and the
-snapshot must also be rebuilt.
+no provider calls and renders no page again. A document's ID is a hash of its
+path, so adding or moving another file leaves it unchanged. Snapshots use
+schema `5.0`. Rebuild older snapshots from their corpus.
 
 The MCP server has ten tools. `get_topic_guide` returns the guide, curator
 notes, facets, glossary terms and a summary of each blueprint;

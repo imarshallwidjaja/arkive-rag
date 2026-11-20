@@ -200,7 +200,6 @@ def documents(*docs: tuple[str, Sequence[str]]) -> Documents:
         ExemplarDocument(
             f"doc_{n:03d}",
             rel_path,
-            None,
             tuple(
                 ExemplarSection(f"doc_{n:03d}_sec_{k:03d}", markdown)
                 for k, markdown in enumerate(markdowns, start=1)
@@ -361,3 +360,25 @@ def test_candidates_group_duplicates_in_canonical_order_whatever_the_input_order
     # A document given twice is a caller error, not a second exemplar.
     with pytest.raises(ValueError, match="repeat"):
         candidates(documents(*docs), ("doc_001", "doc_002", "doc_001"))
+
+
+def test_canonical_order_is_path_order_whatever_the_document_ids() -> None:
+    def exemplar(doc_id: str, rel_path: str, markdown: str) -> ExemplarDocument:
+        return ExemplarDocument(doc_id, rel_path, (ExemplarSection(f"{doc_id}_s", markdown),))
+
+    # Path-hash IDs can sort against their paths; canonical order must not follow them.
+    reversed_ids = [
+        exemplar("doc_ccc", "p1/a.md", DISCLAIMER),
+        exemplar("doc_bbb", "p2/b.md", f"Intro.\n\n{DISCLAIMER}"),
+        exemplar("doc_aaa", "p3/c.md", DISCLAIMER),
+    ]
+    (candidate,) = standing_candidates(reversed_ids[::-1])
+    assert candidate.citations == ("doc_ccc_s", "doc_bbb_s", "doc_aaa_s")
+    # Paths compare component by component, as discovery orders files: `p1/x.md` precedes
+    # `p1-old.md`, although the string `p1-old.md` sorts first.
+    by_component = [
+        exemplar("doc_aaa", "p1-old.md", AT_THRESHOLD),
+        exemplar("doc_bbb", "p1/x.md", TERMS),
+    ]
+    (holder,) = standing_candidates(by_component)
+    assert (holder.text, holder.citations) == (TERMS, ("doc_bbb_s", "doc_aaa_s"))

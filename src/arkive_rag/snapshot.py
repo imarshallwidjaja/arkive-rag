@@ -53,9 +53,10 @@ from arkive_rag.models import (
     corpus_fingerprint,
     fold_facet_label,
     fold_text,
+    parse_printed_date,
 )
 
-SCHEMA_VERSION = "3.0"
+SCHEMA_VERSION = "5.0"
 RRF_K = 60.0
 CHANNEL_DEPTH = 100
 MAX_TOP_K = 50
@@ -69,10 +70,12 @@ CREATE TABLE corpus_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE curator_notes (
     ordinal INTEGER PRIMARY KEY, scope_path TEXT NOT NULL, content TEXT NOT NULL);
 CREATE TABLE documents (
-    doc_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, rel_path TEXT NOT NULL UNIQUE,
+    doc_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL UNIQUE, rel_path TEXT NOT NULL UNIQUE,
     sha256 TEXT NOT NULL, format TEXT NOT NULL, title TEXT NOT NULL, doc_date TEXT,
+    doc_date_iso TEXT, doc_date_basis TEXT CHECK (doc_date_basis IN ('printed', 'metadata')),
     deliverable_type TEXT NOT NULL, summary TEXT NOT NULL, page_count INTEGER NOT NULL,
-    is_curator_note INTEGER NOT NULL CHECK (is_curator_note IN (0, 1)));
+    is_curator_note INTEGER NOT NULL CHECK (is_curator_note IN (0, 1)),
+    CHECK ((doc_date_iso IS NULL) = (doc_date_basis IS NULL)));
 CREATE TABLE facets (
     name TEXT PRIMARY KEY, ordinal INTEGER NOT NULL UNIQUE, description TEXT NOT NULL,
     binding TEXT NOT NULL CHECK (binding IN ('path', 'content')));
@@ -108,7 +111,7 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
     chunk_id UNINDEXED, content_norm, breadcrumb_norm,
     tokenize='porter unicode61 remove_diacritics 2');
 """
-# Every table a 3.0 snapshot holds; `TopicSnapshot.open` requires each one.
+# Every table a snapshot of this schema holds; `TopicSnapshot.open` requires each one.
 TABLES = frozenset(re.findall(r"CREATE (?:VIRTUAL )?TABLE (\w+)", SCHEMA))
 # Every key is required when a snapshot opens.
 META_KEYS = (
@@ -289,10 +292,12 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
                 for i, blueprint in enumerate(corpus.blueprints, start=1)
             ],
         )
+        # Text tables first and page images last, so sections and chunks, which every read
+        # path scans, lie together in the file instead of between the page BLOBs.
         row = 0
         for ordinal, doc in enumerate(corpus.documents, start=1):
             db.execute(
-                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc.doc_id,
                     ordinal,
@@ -301,6 +306,8 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
                     doc.format,
                     doc.title,
                     doc.doc_date,
+                    doc.date.iso if doc.date else None,
+                    doc.date.basis if doc.date else None,
                     doc.deliverable_type,
                     doc.summary,
                     len(doc.pages),
@@ -331,13 +338,6 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
                     for s in doc.sections
                 ],
             )
-            db.executemany(
-                "INSERT INTO pages VALUES (?, ?, ?, ?, ?)",
-                [
-                    (doc.doc_id, p.page_number, p.native_text, p.visual_summary, p.webp_bytes)
-                    for p in doc.pages
-                ],
-            )
             for chunk in doc.chunks:
                 vector = corpus.embeddings[row].astype(np.float32).tobytes()
                 row += 1
@@ -360,6 +360,14 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
                     "INSERT INTO chunks_fts VALUES (?, ?, ?)",
                     (chunk.chunk_id, _nfkc(chunk.content), _nfkc(chunk.breadcrumb)),
                 )
+        for doc in corpus.documents:
+            db.executemany(
+                "INSERT INTO pages VALUES (?, ?, ?, ?, ?)",
+                [
+                    (doc.doc_id, p.page_number, p.native_text, p.visual_summary, p.webp_bytes)
+                    for p in doc.pages
+                ],
+            )
 
 
 def _snippet(line: str, needle: str) -> str:
@@ -443,19 +451,11 @@ class TopicSnapshot:
         db.row_factory = sqlite3.Row
         self._load_facets(db)
         documents = db.execute(
-            "SELECT doc_id, rel_path, sha256, format, title, doc_date, deliverable_type, summary,"
-            " page_count, is_curator_note FROM documents ORDER BY ordinal"
+            "SELECT doc_id, rel_path, sha256, format, title, doc_date, doc_date_iso,"
+            " doc_date_basis, deliverable_type, summary, page_count, is_curator_note"
+            " FROM documents ORDER BY ordinal"
         )
-        self._documents = {
-            r["doc_id"]: DocumentInfo.model_validate(
-                dict(r)
-                | {
-                    "is_curator_note": bool(r["is_curator_note"]),
-                    "facets": self.facets_of(r["doc_id"]),
-                }
-            )
-            for r in documents
-        }
+        self._documents = {r["doc_id"]: self._document_info(path, r) for r in documents}
         self.corpus_fingerprint = corpus_fingerprint(
             (d.rel_path, d.sha256) for d in self._documents.values()
         )
@@ -465,8 +465,11 @@ class TopicSnapshot:
                 f" its documents ({self.corpus_fingerprint})"
             )
         self._load_knowledge(db)
+        # Chunks and sections load in path order (document ordinal, then their own ordinal),
+        # the order `list_documents` gives. A chunk's row index is its tie-break in every
+        # ranking, so ties never fall to the hash order of document IDs.
         rows = db.execute(
-            f"SELECT {_HIT_COLUMNS}, c.embedding {_FROM_CHUNKS} ORDER BY c.doc_id, c.ordinal"
+            f"SELECT {_HIT_COLUMNS}, c.embedding {_FROM_CHUNKS} ORDER BY d.ordinal, c.ordinal"
         ).fetchall()
         self._hits = [{k: v for k, v in dict(row).items() if k != "embedding"} for row in rows]
         self._hit_index = {hit["chunk_id"]: i for i, hit in enumerate(self._hits)}
@@ -484,9 +487,41 @@ class TopicSnapshot:
             )
             for r in db.execute(
                 f"SELECT {_SECTION_COLUMNS}, s.markdown FROM sections s"
-                " JOIN documents d ON d.doc_id = s.doc_id ORDER BY s.doc_id, s.ordinal"
+                " JOIN documents d ON d.doc_id = s.doc_id ORDER BY d.ordinal, s.ordinal"
             )
         ]
+
+    def _document_info(self, path: Path, row: sqlite3.Row) -> DocumentInfo:
+        """One `documents` row as a DocumentInfo. A calendar date and its basis come together,
+        with a date text that agrees with it: a metadata date's text is the date itself, and a
+        printed date's text parses to it. It must also be a real date; a row that breaks this is a
+        damaged snapshot."""
+        fields = dict(row)
+        iso, basis = fields.pop("doc_date_iso"), fields.pop("doc_date_basis")
+        text = fields["doc_date"]
+        agrees = (
+            iso is None
+            if basis is None
+            else iso is not None
+            and text is not None
+            and (text == iso if basis == "metadata" else parse_printed_date(text) == iso)
+        )
+        if not agrees:
+            raise SnapshotIntegrityError(
+                f"{path}: document {row['doc_id']} has an inconsistent date"
+                f" (doc_date={fields['doc_date']!r}, doc_date_iso={iso!r},"
+                f" doc_date_basis={basis!r})"
+            )
+        # A malformed value, such as an impossible calendar date, fails validation here and
+        # `open` reports the snapshot as not valid.
+        return DocumentInfo.model_validate(
+            fields
+            | {
+                "date": None if iso is None else {"iso": iso, "basis": basis},
+                "is_curator_note": bool(row["is_curator_note"]),
+                "facets": self.facets_of(row["doc_id"]),
+            }
+        )
 
     def _load_facets(self, db: sqlite3.Connection) -> None:
         """Facets, aliases and the document-to-facets map, loaded once for every read path."""
@@ -834,7 +869,7 @@ class TopicSnapshot:
             index: sum(1.0 / (RRF_K + ranks[index]) for ranks in (lexical, dense) if index in ranks)
             for index in lexical.keys() | dense.keys()
         }
-        ranked = sorted(fused, key=lambda i: (-fused[i], -cosine[i], self._hits[i]["chunk_id"]))
+        ranked = sorted(fused, key=lambda i: (-fused[i], -cosine[i], i))
 
         def hits(order: list[int]) -> list[SearchHit]:
             return [
@@ -863,9 +898,10 @@ class TopicSnapshot:
         rows = self._rows(
             "SELECT c.chunk_id, bm25(chunks_fts, 0.0, 10.0, 2.0) AS score"
             " FROM chunks_fts JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id"
+            " JOIN documents d ON d.doc_id = c.doc_id"
             " WHERE chunks_fts MATCH ?"
             " AND (? IS NULL OR c.doc_id IN (SELECT value FROM json_each(?)))"
-            " ORDER BY score, c.chunk_id LIMIT ?",
+            " ORDER BY score, d.ordinal, c.ordinal LIMIT ?",
             (fts_query, doc_ids, doc_ids, CHANNEL_DEPTH),
         )
         return {self._hit_index[row["chunk_id"]]: rank for rank, row in enumerate(rows, start=1)}

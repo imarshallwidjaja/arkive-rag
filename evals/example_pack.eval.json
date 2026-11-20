@@ -9,14 +9,14 @@
       "category": "exact_identifiers",
       "query": "Which raster holds the dry season depth threshold?",
       "required_groups": [["harbour_dry_depth_thresh.tif"]],
-      "expected_docs": ["doc_001"]
+      "expected_docs": ["doc_81238f732f"]
     },
     {
       "case_id": "visual_only_1",
       "category": "visual_only",
       "query": "What nine year median rainfall reference line does the harbour chart show?",
       "required_groups": [["330.9"]],
-      "expected_docs": ["doc_001"]
+      "expected_docs": ["doc_81238f732f"]
     },
     {
       "case_id": "ligatures_and_tables_1",
@@ -36,7 +36,7 @@
       "category": "conceptual_paraphrase",
       "query": "Has anyone finished writing up the reef study yet?",
       "required_groups": [["not been written", "not yet"]],
-      "expected_docs": ["doc_003"]
+      "expected_docs": ["doc_ecea4a9998"]
     }
   ],
   "qa_cases": [
@@ -47,7 +47,7 @@
       "ground_truth_facts": ["The chart shows a Nine Year Median of 330.9 mm."],
       "required_groups": [["330.9"], ["median"]],
       "source_anchors": [
-        {"doc_id": "doc_001", "pages": null}
+        {"doc_id": "doc_81238f732f", "pages": null}
       ]
     },
     {
@@ -57,7 +57,7 @@
       "ground_truth_facts": ["No: the reef Sentinel-2 case study has not been written yet."],
       "required_groups": [["not been written", "not yet", "no case study"]],
       "source_anchors": [
-        {"doc_id": "doc_003", "pages": null}
+        {"doc_id": "doc_ecea4a9998", "pages": null}
       ]
     },
     {
@@ -73,7 +73,7 @@
       "holdout_id": "estuary-proposal",
       "included_paths": ["p101-harbour-lidar", "p103-reef-sonar"],
       "held_out_markers": ["p102", "estuary-multibeam"],
-      "reference_doc_id": "doc_002",
+      "reference_doc_id": "doc_ad043172f4",
       "instructions": "You are a hydrographic analyst at Northwind Marine writing the proposal for the Contoso Ports estuary multibeam survey. Write the complete proposal in Markdown from the scoping notes in the prompt. Every project-specific fact must come from the scoping notes. Prior Northwind Marine project documents may be available through your tools; when they are, follow their house structure, conventions and explanations. Return only the proposal.",
       "run_notes": "scoping_notes.json\n- project: Contoso Ports estuary multibeam bathymetry survey\n- sonar: multibeam echosounder, 400 kHz, 2024-02-01 .. 2024-03-15\n- area: 812 km2, vertical datum LAT\n- tiling: 2000 x 2000 px tiles\n- outputs: estuary_depth_grid.tif, estuary_depth_uncertainty.tif; nodata=9999; masking=None\n- risks: false soundings over moorings and dredged channels\n- fee: 120,000 AUD\n",
       "exemplar_paths": ["p101-harbour-lidar/harbour-memo.md"],

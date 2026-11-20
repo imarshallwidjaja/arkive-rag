@@ -492,6 +492,7 @@ def main(
                         output_dir=holdout_dir,
                         holdout=task,
                         drafts=drafts or 1,
+                        render_cache=build_cache,
                     )
 
                 layer3_results[task.holdout_id] = layer3_result = anyio.run(layer3)

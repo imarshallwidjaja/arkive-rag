@@ -19,7 +19,7 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_005",
+          "doc_id": "doc_41c08d990c",
           "pages": null
         }
       ]
@@ -50,19 +50,19 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_001",
+          "doc_id": "doc_d81e70766d",
           "pages": null
         },
         {
-          "doc_id": "doc_004",
+          "doc_id": "doc_c85200ee0c",
           "pages": null
         },
         {
-          "doc_id": "doc_006",
+          "doc_id": "doc_529d7300ab",
           "pages": null
         },
         {
-          "doc_id": "doc_008",
+          "doc_id": "doc_740a5af2a6",
           "pages": null
         }
       ]
@@ -104,7 +104,7 @@
       ],
       "source_anchors": [
         {
-          "doc_id": "doc_004",
+          "doc_id": "doc_c85200ee0c",
           "pages": null
         }
       ]
@@ -125,7 +125,7 @@
       "held_out_markers": [
         "pellow-mill"
       ],
-      "reference_doc_id": "doc_008",
+      "reference_doc_id": "doc_740a5af2a6",
       "instructions": "You are Tomasz Reyburn, acoustic consultant, at Larkspur Acoustics writing the facade noise report for the Pellow Mill residential conversion. Write the complete report in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Larkspur Acoustics documents, follow their house structure and wording. Return only the report.",
       "run_notes": "- our ref: LA-R-139; quotation LA-Q-139\n- client: Pellow Mill Developments LLP; contact Mr Callum Odegaard\n- author: Tomasz Reyburn; checker: Orla Penhallow\n- building: Pellow Mill, 4 storeys, brick; 24 flats planned over ground to third floor\n- west side: faces the Wendlecombe branch line, freight trains overnight; every west flat counts as an NSR for rail noise\n- south side: faces Canal Street, light local traffic\n- logging: 72 h; W2 = west elevation, 2nd-floor scaffold; S1 = south elevation, 1st floor; meter Brakel NX3\n- pass-bys: 14 night freight trains picked out of audio pellow_w2_audio_01.wav .. pellow_w2_audio_14.wav\n- W2 day 07:00-23:00: LAeq 61, LAmax 89, LA90 44 dB\n- W2 night 23:00-07:00: LAeq 56, LAmax 87, LA90 38 dB\n- S1 day 07:00-23:00: LAeq 52, LAmax 71, LA90 41 dB\n- S1 night 23:00-07:00: LAeq 43, LAmax 66, LA90 33 dB\n- facade west: glazing Rw 41, vent Dn,e,w 42, bedroom LAmax predicted 44 dB\n- facade south: glazing Rw 33, vent Dn,e,w 34, bedroom LAmax predicted 38 dB\n- facade east: glazing Rw 31, vent Dn,e,w 34, bedroom LAmax predicted 35 dB\n- prediction basis: windows shut, vents open; rooms per architect's window schedule PM-WS-07\n- conclusion: rail freight governs the west design; west bedrooms need Rw 41 or better + acoustic trickle vents, or mechanical ventilation with windows shut; south and east fine with ordinary thermal double glazing\n- advice: Rw 41 glazing + acoustic trickle vents in all west habitable rooms; acoustic mastic around new frames at the brickwork (unsealed joint may cost 5 dB or more); pre-occupation test of 2 west bedrooms\n",
       "exemplar_paths": [
@@ -203,7 +203,7 @@
       "held_out_markers": [
         "corvane"
       ],
-      "reference_doc_id": "doc_001",
+      "reference_doc_id": "doc_d81e70766d",
       "instructions": "You are Orla Penhallow, principal consultant, at Larkspur Acoustics writing the night-time noise report for the Corvane haulage depot. Write the complete report in Markdown from the run notes in the prompt, taking every project-specific fact from the run notes, and when your tools give you prior Larkspur Acoustics documents, follow their house structure and wording. Return only the report.",
       "run_notes": "- our ref: LA-R-126; quotation LA-Q-126\n- client: Corvane Logistics Ltd; contact Ms Priya Lanchester\n- author: Orla Penhallow; checker: Bea Ashdown-Kerr\n- depot: 32 trailer bays; one gate, onto Sallowfield Road\n- neighbours: Sallowfield Terrace back gardens look onto the yard over 60 m of rough grass\n- application: permit movements 23:00-07:00; at present emergencies only\n- S1 = logger at back fence of 11 Sallowfield Terrace, 5 weeknights; files corvane_s1_night1.csv .. corvane_s1_night5.csv\n- S2 = attended in the yard: reversing tractor unit at 10 m; refrigeration unit at 5 m\n- meter: Tessaly SL-55\n- S1 23:00-07:00, median of 5 nights: LAeq 47, LAmax 78, LA90 39 dB\n- S1 05:00-07:00, median of 5 nights: LAeq 53, LAmax 78, LA90 42 dB\n- S2 reversing alarm, 10 m: LAeq 86, LAmax 93 dB\n- S2 refrigeration unit, 5 m: LAeq 74, LAmax 76 dB\n- sources: tonal reversing alarms; reefer units left on with trailers parked\n- events: top S1 LAmax when trucks reverse into bays 8-14 (they back onto the terrace); tonal alarm audible in all logged events over 70 dB\n- council sleep-disturbance criterion: LAmax 60 dB; nearest NSR got 78\n- HGVs per night hour at the gate (camera, mean of 5 weeknights): 23-00 6; 00-01 3; 01-02 2; 02-03 1; 03-04 4; 04-05 9; 05-06 14; 06-07 11\n- pattern: traffic peaks 05:00-07:00 ahead of the morning shift, same hours as the highest S1 LAeq\n- view: early-morning activity is over the criterion today; longer hours with no mitigation would spread such events through the night\n- with mitigation: predicted LAmax 59 dB or lower, enough to back the longer hours\n- mitigation: broadband alarms on all depot tractor units, visiting hauliers told by gate instruction; relocate bays 8-14 to the yard's west side; 3 m earth bund on the east boundary; reefers plugged into the shore power posts when they arrive, diesel units switched off\n",
       "exemplar_paths": [

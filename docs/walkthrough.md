@@ -37,21 +37,21 @@ uv run --locked arkive-rag build path/to/corpus -o bathymetry.arkive.db --cache 
 1. **Discovery and lineage (`discover_corpus`):** walks the corpus in sorted path order, rejects symlinks and unsupported file types before calling OpenAI, and reads the source bytes once to compute the file's SHA-256 hash. (For `.docx` and `.pptx` files, `convert_office_to_pdf` first converts those bytes to PDF in an isolated headless LibreOffice directory so Word checkboxes, floating textboxes, and slide layouts follow the same page pipeline.)
 2. **Page rendering (`render_pdf`):** `pypdfium2` extracts each page's Unicode native text layer and renders a 2x WebP image (`webp_bytes`).
 3. **Structured transcription and fidelity check (`transcribe_with_fidelity`):** the model receives the page image, native text and the preceding page's block tail, and returns ordered blocks and visual transcripts. The chart value `330.9 mm` can enter a `VisualTranscript`. The compiler checks fidelity anchors and retries when required. Page N receives the last 1,200 characters of page N-1's transcribed blocks, excluding visual transcripts; a changed tail causes the next page to be re-transcribed, and propagation stops when a tail is unchanged.
-4. **Cross-page section and table stitching (`assemble_sections`):** headings open sections with their full heading path and page span. When a paragraph or Markdown table continues across a page break (`continues_from_previous_page=True`), `assemble_sections` joins it onto the previous part and updates the page span; when a table row was split mid-cell across pages (`merges_into_previous_row=True`), `merge_tables` joins the split cells column by column.
+4. **Cross-page section and table stitching (`assemble_sections`):** headings open sections with their full heading path and page span. When a paragraph or Markdown table continues across a page break (`continues_from_previous_page=True`), `assemble_sections` joins it onto the previous part and updates the page span; when a table row was split mid-cell across pages (`merges_into_previous_row=True`), the split cells are joined column by column, and each row keeps the pages it came from.
 5. **Chunk pieces (`section_pieces`):** each section stays intact for reading and is split into prose, table and visual pieces for search. Curator notes produce guidance pieces.
 6. **Observation card (`ObserveSections`):** the model records the memorandum's title, date, deliverable type, summary, attributes, terms and craft observations. Term and craft observations carry quotes that the compiler locates in the source. The root `AGENTS.md` gets its card from its own text, without a model call.
 
 The [reading architecture](architecture.md#reading) describes the fidelity, chunking and quote checks.
 
-**Induction** (`induce` in `src/arkive_rag/induction.py`) runs once for the whole corpus, after documents are numbered in sorted path order (`doc_001` for `AGENTS.md`, `doc_002` for `harbour-survey-memorandum.pdf`):
+**Induction** (`induce` in `src/arkive_rag/induction.py`) runs once for the whole corpus, after each document gets its ID, a hash of its path (`document_id`, such as `doc_a1b2c3d4e5`), with documents kept in sorted path order:
 
 1. **Organise (`OrganiseCorpus`):** the model reads the folder tree, curator notes and document cards. It might propose a path-bound `project` facet for the survey folders and a content-bound `client` facet.
 2. **Bind:** the memorandum gets `project: p101-harbour-lidar` from its folder. The Decisions API judges content-bound values against the memorandum's card and outline.
 3. **Glossary (`WriteGlossary`):** term observations and occurrences produce cited senses. A null definition means no definition was established from that sense's cited evidence: the generator supplied none, or the support check demoted it. It does not prove the corpus never defines the term. The build report's `unsupported_definitions` counts proposed definitions demoted by the support check, not every null sense.
 4. **Blueprints (`WriteBlueprint`):** for each recurring deliverable type, such as survey memoranda, an agent reads exemplars and reviewer feedback through `outline`, `read_section`, and `grep`. It returns a cited outline, conventions and reviewer pitfalls, and selects standing house text from candidates found in the exemplars. The Decisions API checks conventions and pitfalls against their cited sections.
-5. **Topic guide (`WriteGuide`):** a cited Markdown overview of the collection from the cards, facets, glossary terms, blueprint summaries, and curator notes; Python verifies that every `[doc_XXX:doc_XXX_sec_YYY]` citation resolves to a citable section.
+5. **Topic guide (`WriteGuide`):** a cited Markdown overview of the collection from the cards, facets, glossary terms, blueprint summaries, and curator notes; Python verifies that every `[doc_a1b2c3d4e5:doc_a1b2c3d4e5_sec_001]` citation resolves to a citable section of the document it names.
 
-**Binding** (`bind_document`) gives sections their IDs (`doc_002_sec_001`, ...) and chunks their IDs and breadcrumbs (`[project: p101-harbour-lidar | client: Northwind Marine | Doc: Harbour Survey Memorandum (pp. 4-6) | Section: 3 Rainfall]`). Finally, `text-embedding-3-large` (1,536 dimensions) embeds `breadcrumb + "\n" + content` in batches and L2-normalises each vector.
+**Binding** (`bind_document`) gives sections their IDs (`doc_a1b2c3d4e5_sec_001`, ...) and chunks their IDs and breadcrumbs (`[project: p101-harbour-lidar | client: Northwind Marine | Doc: Harbour Survey Memorandum (pp. 4-6) | Section: 3 Rainfall]`). Finally, `text-embedding-3-large` (1,536 dimensions) embeds `breadcrumb + "\n" + content` in batches and L2-normalises each vector.
 
 The [induction architecture](architecture.md#induction) describes validation, support checks and standing passage selection.
 
@@ -59,13 +59,13 @@ With `--cache`, provider responses are stored under a hash of their inputs. Rebu
 
 ### 2. Snapshot contents and model calls
 
-`write_snapshot` in `src/arkive_rag/snapshot.py` writes a temporary sibling SQLite file (mode `0600`) in a single transaction, checks foreign keys and database integrity, and atomically renames it into place (retaining the existing file mode when replacing a previous snapshot). The schema version is `3.0`; older snapshots are rebuilt from their corpus.
+`write_snapshot` in `src/arkive_rag/snapshot.py` writes a temporary sibling SQLite file (mode `0600`) in a single transaction, checks foreign keys and database integrity, and atomically renames it into place (retaining the existing file mode when replacing a previous snapshot). The schema version is `5.0`; older snapshots are rebuilt from their corpus.
 
 | Table | Contents |
 | --- | --- |
 | `corpus_meta` | `topic`, `title`, `corpus_fingerprint` (SHA-256 over sorted `rel_path` + file `sha256`), `arkive_version`, `embedding_model`, `embedding_dimensions`, `guide_markdown`, `build_settings` (model IDs and the effort of each operation), and `build_report`. |
 | `curator_notes` | Verbatim `AGENTS.md` files with their path. |
-| `documents` | One row per source file with `sha256`, `format`, `title`, `doc_date`, `deliverable_type`, `summary`, `page_count`, and `is_curator_note`. |
+| `documents` | One row per source file with `sha256`, `format`, `title`, `doc_date`, `doc_date_iso`, `doc_date_basis`, `deliverable_type`, `summary`, `page_count`, and `is_curator_note`. |
 | `facets`, `facet_values`, `facet_aliases`, `document_facets` | The induced facets, their values and aliases, and which document holds which value. |
 | `glossary`, `blueprints` | One validated JSON document per glossary entry and per blueprint (with its standing passages); every citation is checked when the snapshot opens. |
 | `sections` | Full Markdown of every stitched section with `heading_path` and `page_start`..`page_end`. |

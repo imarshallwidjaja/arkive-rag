@@ -188,13 +188,10 @@ class ExemplarSection:
 
 @dataclass(frozen=True)
 class ExemplarDocument:
-    """One exemplar document as candidate discovery reads it: its sections in reading order.
-    `doc_date_iso` is the document's date (`YYYY-MM-DD`, `YYYY-MM`) or None; discovery does
-    not read it yet."""
+    """One exemplar document as candidate discovery reads it: its sections in reading order."""
 
     doc_id: str
     rel_path: str
-    doc_date_iso: str | None
     sections: tuple[ExemplarSection, ...]
 
 
@@ -235,10 +232,12 @@ class StandingCandidate:
 def standing_candidates(documents: Sequence[ExemplarDocument]) -> tuple[StandingCandidate, ...]:
     """The recurring units of a deliverable type's exemplar documents.
 
-    Canonical order is document ID, then each document's sections in the order given, then
-    position in the section; the order of `documents` does not matter, and a document ID may
-    appear once. A unit (`standing_units`) is eligible with at least `STANDING_MIN_WORDS`
-    words, or as a table header row of at least `STANDING_MIN_TABLE_COLUMNS` columns. It
+    Canonical order is document path (compared component by component, as corpus discovery
+    orders files), then each document's sections in the order given, then position in the
+    section; the order of `documents` does not matter, and a document ID may appear once.
+    Document IDs are path hashes, so ordering by ID would scramble the path order. A unit
+    (`standing_units`) is eligible with at least `STANDING_MIN_WORDS` words, or as a table
+    header row of at least `STANDING_MIN_TABLE_COLUMNS` columns. It
     recurs in a section of another document that holds at least
     `STANDING_RECURRENCE_CONTAINMENT` of its word 4-grams, or, for a table header, that has a
     table header with the same folded row. When the documents span more than one top-level
@@ -247,7 +246,7 @@ def standing_candidates(documents: Sequence[ExemplarDocument]) -> tuple[Standing
     same thing (the same folded text, or containment at the threshold both ways) are one
     candidate, represented by the first in canonical order.
     """
-    docs = sorted(documents, key=lambda d: d.doc_id)
+    docs = sorted(documents, key=lambda d: (d.rel_path.split("/"), d.doc_id))
     ids = [d.doc_id for d in docs]
     if len(set(ids)) != len(ids):
         raise ValueError(f"exemplar document IDs repeat: {ids}")

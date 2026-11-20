@@ -55,16 +55,26 @@ must be different files outside the corpus directory.
   any other document's. A
   path-bound facet value still covers a note in its folder, so a project
   filter also finds that project's note.
-- Documents are numbered in sorted path order: `doc_001`, sections
-  `doc_001_sec_001`, chunks `doc_001_chk_0001`. The same corpus produces the
-  same IDs.
+- A document's ID is `document_id(rel_path)`: `doc_` and the first 10 hex
+  digits of the SHA-256 of its NFC-normalised corpus-relative path, such as
+  `doc_a1b2c3d4e5`. Sections are `doc_a1b2c3d4e5_sec_001` and chunks
+  `doc_a1b2c3d4e5_chk_0001`. An ID depends on the path only, so adding,
+  removing or editing another file leaves every other ID unchanged. Two paths
+  with one ID (such as the NFC and NFD spellings of one name) stop the build
+  with `ArkiveError`, naming both, before any file is read.
+- Documents are ordered by path, compared component by component as discovery
+  sorts them. That order, never the hex order of IDs, orders everything a
+  prompt, a cache key or a read returns: `list_documents`, `grep`, search
+  ties, the exemplar and feedback IDs of a deliverable type, glossary quotes,
+  craft leads and standing passage candidates.
 
 ## Build pipeline
 
 `compile_corpus` runs three passes in order. Reading runs per document in a
-thread pool (`--max-concurrency`, default 4); induction is corpus-wide and
-one executor of the same size bounds all its provider calls in flight;
-binding needs both.
+thread pool (`--max-concurrency`, default 4): PDF, Word and PowerPoint files
+start first, largest first, then Markdown, and readings are gathered in path
+order. The first failed read cancels the reads not yet started. Induction is corpus-wide and one executor of the same size bounds all
+its provider calls in flight; binding needs both.
 
 ### Reading
 
@@ -77,9 +87,18 @@ moved. Each PDF, Word and PowerPoint file follows one path:
 1. **Render.** Word and PowerPoint files are converted to PDF by LibreOffice
    (`soffice --headless`) with a private temporary profile, a minimal
    environment and a 120 s timeout. Each PDF page is rendered by pypdfium2 at
-   scale 2.0 to WebP (quality 85), and its full Unicode native text layer is
-   extracted. libpdfium is not thread-safe, so every pdfium call runs under one
-   process-wide lock; WebP encoding runs outside it.
+   scale 2.0 (`PDF_RENDER_SCALE`) to WebP (quality 85, `WEBP_QUALITY`), and its
+   full Unicode native text layer is extracted. A page whose longest side would
+   pass 4,096 px (`MAX_RENDER_SIDE_PX`) at that scale, such as an A0 sheet,
+   renders at the scale that fits it, so libwebp's 16,383 px limit and a huge
+   bitmap are never reached; a Pillow or pdfium failure is `ConversionError`
+   naming the file. libpdfium is not thread-safe, so every pdfium call runs
+   under one process-wide lock; WebP encoding runs outside it. Before any
+   rendering, the file's metadata date (step 7) is read from its original
+   bytes, so a file whose metadata cannot be read fails before LibreOffice,
+   pdfium or any model call runs. With a build cache, the rendered pages and
+   that metadata date are stored per source (see Provider calls) and a later
+   build of the same bytes runs neither LibreOffice nor pdfium.
 2. **Transcribe.** `gpt-6.1-sol` at low reasoning effort receives the page
    image, the native text, and the tail of the previous page's transcript. It
    returns blocks (`heading`, `paragraph`, `table`, `callout`) and visual
@@ -91,14 +110,28 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    causes the following page to be re-transcribed only if that tail changes;
    propagation stops when a page's tail is unchanged.
 3. **Check fidelity.** Running headers, footers and page numbers are removed
-   before anchors are collected: a top or bottom line repeated exactly on
-   three or more pages, or repeated apart from a leading or trailing number
-   that advances with the page; a labelled page number (`Page 3`, `3 of 12`)
-   on an edge line; and a bare number on a page's first or last line. The
-   anchors are GIS/data filenames (`.tif`, `.tiff`, `.shp`, `.nc`, `.gpkg`,
-   `.csv`), signed formatted numbers such as `-330.9` or `59,494`, and integers
-   of three or more digits. They are checked against the exact text the page
-   contributes to its sections. `FIDELITY_ATTEMPTS` holds the two attempts. If
+   before anchors are collected, and only from a page's edge lines (its first
+   two and last two non-blank lines): a top line repeated as a top line, or a
+   bottom line as a bottom line, exactly on three or more pages, or repeated
+   apart from a leading or trailing number that advances with the page; on a
+   two-page document, such a line repeated at the same edge of both pages when
+   both pages have at least five non-blank lines, the line is at most 120
+   characters and holds no part of a data filename (a fragment of one wrapped
+   over lines included), and any such number is the page number itself; a labelled page number (`Page 3`, `3 of 12`) on an edge line; and a
+   bare number on a page's first or last line. A body line that repeats an
+   edge line stays. The anchors are GIS/data
+   filenames (`.tif`, `.tiff`, `.shp`, `.nc`, `.gpkg`, `.csv`), signed
+   formatted numbers such as `-330.9` or `59,494`, and integers of three or
+   more digits. A filename that a narrow table cell wraps over up to six lines
+   of native text also accepts its rejoined form; each occurrence is its own
+   anchor, so two wrapped names that end in the same fragment each need their
+   own transcription, and a number inside a wrapped name (`dry_` / `2026` /
+   `final.tif`, also when the tail starts with `-` or `.`) is part of that
+   filename rather than a number anchor. They are checked against the exact
+   text the page contributes to its sections, where each filename occurrence
+   satisfies one anchor at most: a filename transcribed once cannot stand in
+   for two anchors that both accept it. A missing filename is named whole, as
+   native text wraps it. `FIDELITY_ATTEMPTS` holds the two attempts. If
    a filename is missing from the first (low effort) transcript, or recall is
    below 0.95 (1.0 when the page has one or two anchors), the page is
    transcribed once more at high effort and the missing values are named in
@@ -113,14 +146,35 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    `continues_from_previous_page` joins the previous paragraph or table, and the
    joined part spans both pages. A continued table loses its repeated header
    rows, and when `merges_into_previous_row` is set, its first row is merged
-   cell by cell into the row cut by the page break. Visual transcripts become
-   quoted `[Visual — Page N: label]` blocks in the section.
+   cell by cell into the row cut by the page break; each table row keeps the
+   pages it came from. Visual transcripts become quoted
+   `[Visual — Page N: label]` blocks in the section. A section over 32,000
+   characters (`MAX_SECTION_CHARS`), such as a 20-page continued table or an
+   unheaded transcript, becomes consecutive sections of that heading path
+   within the limit, cut between blocks. The first section holds the heading
+   line and the start of the body, unless fewer than 256 characters
+   (`MIN_FIRST_SLICE_CHARS`) are left beside the heading; then the body starts
+   in the next section, and a heading longer than a section is cut as text. A
+   larger block is sliced: a table on row boundaries with its header and
+   separator rows repeated, each slice spanning only its own rows' pages, and a
+   row too long for a slice wrapped cell by cell into rows of the same columns
+   (a header that would leave a row less than a quarter of a slice is cut like
+   rows instead); a visual transcript at line breaks, every slice under its
+   `[Visual ...]` title (a title longer than a quarter of a slice is quoted once
+   under `[Visual — Page N]`); other text at line breaks or spaces, a fenced
+   code block closed at the end of one slice and reopened at the start of the
+   next with its delimiter and an info word of at most 32 characters. A line
+   that starts with an inline code span (`` ```cli``` runs it ``) is text, not
+   a fence. The visual transcripts of a continued table's pages are sliced the
+   same way and follow the slice that holds their page.
 5. **Chunk pieces.** `section_pieces` packs paragraphs and callouts into prose
    pieces of up to 1,800 characters, splitting an oversized paragraph at
    sentence ends. A table up to 2,400 characters is one `table` piece; a larger
    table is split on row boundaries with a normal packing target of 2,000
-   characters, repeating the header and separator rows. A very large header
-   can make a table piece exceed that target. Each visual transcript is its own
+   characters, repeating the header and separator rows, each piece spanning
+   the pages of its own rows; a header too wide to leave a row a quarter of
+   the target is cut like rows instead of repeated. Each visual transcript is
+   its own
    `visual` piece. No piece exceeds 6,000 characters: a final split wraps
    oversized content at line breaks or spaces and does not repeat a table
    header on later fragments. A piece has its own page span and no ID or breadcrumb yet.
@@ -143,12 +197,39 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    the rerun, observations whose quote is still unlocated are discarded and
    counted in the build report; a batch that quoted something and had no
    quote located raises `RejectedOutputError`, also when its rerun returns
-   no observations at all. A document with several batches has its terms,
-   craft and attributes unioned in code, and one `consolidate_card` request
-   (low effort) writes its single title, date, deliverable type and summary
-   from the batch headers. A curator note gets a card from its own text and
+   no observations at all. A placeholder date answer such as `none` or
+   `not stated` counts as no printed date. A document with several batches
+   has its terms, craft and attributes unioned in code, and one
+   `consolidate_card` request (low effort) writes its single title, date,
+   deliverable type and summary from the batch headers. The date it keeps is
+   always one a batch reported as printed, as that batch wrote it: the
+   reported date its answer names (the same text, the same text once folded,
+   or another form of the same unambiguous date, such as `19th May 2025` for
+   `19ᵗʰ May 2025`), else the first reported. It is none when no batch
+   reported one, and a placeholder is not a reported date, so consolidation
+   neither invents a date nor drops one. A curator note gets a card from its own text and
    no model call: the first line with text is its title and the first line
    that is not a heading its summary.
+7. **Date.** `document_date` gives the reading its calendar date
+   (`YYYY-MM-DD`, or `YYYY-MM`) and basis. A printed date (the card's
+   `doc_date`) parses when it has one reading: ISO, a day (ordinal suffixes
+   such as `19ᵗʰ` included), English month name and year in either order, a
+   month name and year, a numeric `D/M/YYYY` where exactly one of the first
+   two numbers is above 12 or both are equal, or a year-first `YYYY/M/D` or
+   `YYYY.M.D` (years 1900 to 2100). Its basis is `printed`. A printed date with no
+   single reading, such as `05/04/2026` or a range, gives no calendar date and
+   never falls back to the file's metadata. Only a document that prints no
+   date takes the date in its original bytes, with basis `metadata`: a PDF's
+   `CreationDate`, else `ModDate`; a Word or PowerPoint file's
+   `dcterms:modified`, else `dcterms:created`, in `docProps/core.xml`. Each
+   value must be a whole PDF date string or W3CDTF value (`YYYY-MM` precision
+   included) whose hour, minute, second and offset are in range, with an
+   offset only after an hour; trailing text, a range or an impossible time
+   counts as absent, and the next field is read. A `core.xml` over
+   1,000,000 bytes, or one that cannot be read, is `ConversionError`. The
+   LibreOffice conversion and file system times are never read. Such a
+   document's `doc_date` is the metadata date's ISO form, and induction
+   prompts show it as `<date> (file metadata)`.
 
 Markdown files skip steps 1-3: `parse_markdown_blocks` splits them
 deterministically, keeping a fenced code block as one literal paragraph, and
@@ -304,8 +385,9 @@ not confirm.
    a blueprint holds.
 5. **Guide** (`write_guide`, medium effort). A cited Markdown overview from
    the cards, the bound facets, the glossary terms, the blueprint summaries
-   and the curator notes. Every bracketed `[doc...]` token must have the exact
-   form `[doc_XXX:doc_XXX_sec_YYY]` and resolve to a section of a citable
+   and the curator notes. Every bracketed `[doc_...]` token must have the exact
+   form `[doc_a1b2c3d4e5:doc_a1b2c3d4e5_sec_001]`, the section belonging to the
+   document named before it, and resolve to a section of a citable
    document, and at least one valid citation is required when such a section
    exists. A corpus with no citable section (curator notes only) gets a guide
    without citation tokens.
@@ -421,6 +503,22 @@ threads miss the same key at once, the second writer returns the first
 writer's value. An entry that no longer decodes or validates is a miss and is
 replaced. A new cache file is created with mode `0600`.
 
+The same file is the compiler's render cache (`RenderCache`): the table
+`page_render_cache` holds each rendered source's pages (native text and WebP
+bytes, numbered 1..N), and `page_render_meta` holds one row per source with its
+page count and its file's metadata date, written in the same transaction. Both
+are keyed by SHA-256 of `RENDER_CACHE_REVISION`, the source format, the source
+bytes' SHA-256, the render scale, the WebP quality and the side limit. An
+entry is a miss, and is replaced, when its metadata row is missing, its pages
+are not exactly 1..page count, or a value has the wrong type, an image is not
+a WebP image that decodes in full or the date is not a calendar date; the first complete entry is
+canonical. A cache hit opens neither LibreOffice nor pdfium, also for the
+metadata date. `build` passes the cache to `compile_corpus`, and the
+evaluation harness passes it to the holdout build. The render settings are
+recorded in `build_settings` (`rendering`). Closing the cache closes its
+connection; SQLite checkpoints the write-ahead log when the last connection
+closes.
+
 Every provider response adds its operation, model, input, cached-input and
 output tokens to a `UsageMeter`, which estimates USD from Standard-tier list
 prices in `llm.PRICES` (`gpt-6.1-sol`, `gpt-6-luna` on Decisions, and
@@ -439,15 +537,17 @@ model that has no price is refused when the gateway is constructed.
 foreign_key_check` and `PRAGMA integrity_check`, fsyncs, and renames it over
 the output, then fsyncs the directory. A replaced snapshot keeps its file
 mode. A failed build leaves any previous snapshot untouched, and SQLite or
-file-system failures raise `SnapshotIntegrityError`.
+file-system failures raise `SnapshotIntegrityError`. The text tables are
+written first and the page images last, so sections and chunks lie together
+in the file rather than between page BLOBs.
 
-Tables (schema version `3.0`):
+Tables (schema version `5.0`):
 
 | Table | Contents |
 | --- | --- |
 | `corpus_meta` | `schema_version`, `topic`, `title`, `created_at`, `corpus_fingerprint`, `arkive_version`, `embedding_model`, `embedding_dimensions`, `guide_markdown`, `build_settings` (JSON: the model IDs and the effort of each operation) and `build_report` (JSON, as printed by `build`). |
 | `curator_notes` | Verbatim `AGENTS.md` files with their path. |
-| `documents` | One row per source file: `doc_id`, `ordinal`, `rel_path`, `sha256`, `format`, `title`, `doc_date`, `deliverable_type`, `summary`, `page_count`, `is_curator_note`. |
+| `documents` | One row per source file: `doc_id`, `ordinal` (path order), `rel_path`, `sha256`, `format`, `title`, `doc_date` (as printed, or the metadata date), `doc_date_iso` and `doc_date_basis` (`printed` or `metadata`; both null or both set, and when set `doc_date` agrees: a metadata date's `doc_date` is `doc_date_iso`, and a printed one parses to it), `deliverable_type`, `summary`, `page_count`, `is_curator_note`. |
 | `facets` | Name, order, description and binding (`path` or `content`). |
 | `facet_values` | Each facet's values with their order, description and folders (JSON). |
 | `facet_aliases` | Every folded form of a value, the canonical value included, keyed by facet and folded alias, so a form that would name two values cannot be stored. |
@@ -465,11 +565,9 @@ so it is the content address of the corpus a snapshot was built from
 
 `TopicSnapshot.open` uses a read-only SQLite URI with the path
 percent-encoded, so names containing `%`, `?` or `#` open the right file. It
-refuses any schema version other than `3.0`, naming the file's version and the
-one it reads; a `2.0` snapshot is rebuilt from its corpus. Schema `3.0` alone
-does not establish compatibility: a snapshot from an earlier build of this
-version whose blueprint rows lack standing passages is refused at open as a
-malformed blueprint row and must be rebuilt from its corpus. Every
+refuses any schema version other than `5.0`, naming the file's version and the
+one it reads; an older snapshot (`3.0`, or `4.0` from a reverted build) is
+rebuilt from its corpus, which also gives it path-hash document IDs. Every
 `corpus_meta` key and every table is required, and `open` runs `PRAGMA
 foreign_key_check`, so a dangling facet assignment or alias is refused. Each
 facet value must have its canonical alias row. A snapshot is a build output
@@ -533,7 +631,8 @@ local packs are not staged by accident.
   - Exact cosine similarity between the query vector and every chunk that
     passes the filters.
 
-  Ties break on cosine similarity, then chunk ID. Each hit reports its fused
+  Ties break on cosine similarity, then document path order and chunk ordinal.
+  Each hit reports its fused
   score, both ranks and its document's facets. A blank query or an invalid
   filter or `top_k` raises `InvalidFilterError` before the query is embedded.
 - **grep** is a literal, case-insensitive line search over section Markdown.
@@ -931,7 +1030,7 @@ and `vocabulary`, whose anchors cover whole documents. The holdouts are:
 in `tests/test_evals.py` checks, without a snapshot or a model call, that every
 pack in `evals/example_packs/` loads, that its fingerprint matches its
 collection's files, that every anchor and `reference_doc_id` names a document
-of the collection (`doc_001` is the first file in path order), and that every
+of the collection (its ID is `document_id` of the file's path), and that every
 holdout passes `check_reference_held_out` and `select_holdout_sources`.
 
 ### OpenCode check

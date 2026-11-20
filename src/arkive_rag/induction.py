@@ -20,7 +20,7 @@ import json
 import re
 import threading
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Self
@@ -80,8 +80,10 @@ MAX_TOOL_GREP_MATCHES = 20
 SOURCE_TOOLS_REVISION = "arkive-source-tools/1"
 
 _FACET_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
-_CITATION_TOKEN = re.compile(r"\[doc[^\]]*\]")
-_CITATION = re.compile(r"\[(doc_\d+):(doc_\d+_sec_\d+)\]")
+# A bracketed token that starts like a document ID; prose such as `[docx]` is not one.
+_CITATION_TOKEN = re.compile(r"\[doc_[^\]]*\]")
+# `[doc_id:section_id]`, the section ID belonging to the document ID before it.
+_CITATION = re.compile(r"\[(doc_[0-9a-f]{10}):(\1_sec_\d+)\]")
 
 
 # Validate and retry.
@@ -213,10 +215,16 @@ class InductionExecutor:
 
 @dataclass(frozen=True)
 class CorpusView:
-    """Citable documents and their sections, keyed by ID. Curator notes are not citable."""
+    """Citable documents and their sections, keyed by ID. Curator notes are not citable.
+
+    `documents` are in path order. Document IDs are path hashes, so every collection that
+    reaches a prompt is ordered by `citable_order` or `section_order`, never by ID text.
+    """
 
     documents: tuple[CorpusDocument, ...]
     citable: tuple[CorpusDocument, ...] = field(init=False)
+    # Citable document ID to its position in path order.
+    citable_order: Mapping[str, int] = field(init=False)
     sections: Mapping[str, tuple[CorpusDocument, ReadSection]] = field(init=False)
     folded_sections: Mapping[str, str] = field(init=False)
 
@@ -224,19 +232,20 @@ class CorpusView:
         citable = tuple(d for d in self.documents if d.is_citable)
         sections = {d.section_id(s.ordinal): (d, s) for d in citable for s in d.reading.sections}
         object.__setattr__(self, "citable", citable)
+        object.__setattr__(self, "citable_order", {d.doc_id: i for i, d in enumerate(citable)})
         object.__setattr__(self, "sections", sections)
         folded = {sid: fold_for_quote(self.markdown(sid)) for sid in sections}
         object.__setattr__(self, "folded_sections", folded)
 
-    @property
-    def citable_ids(self) -> frozenset[str]:
-        return frozenset(d.doc_id for d in self.citable)
+    def section_order(self, section_id: str) -> tuple[int, int]:
+        """A citable section's position: its document's path order, then its ordinal."""
+        doc, section = self.sections[section_id]
+        return self.citable_order[doc.doc_id], section.ordinal
 
     def document(self, doc_id: str) -> CorpusDocument:
-        for doc in self.citable:
-            if doc.doc_id == doc_id:
-                return doc
-        raise NotFoundError(f"unknown or non-citable document {doc_id!r}")
+        if doc_id not in self.citable_order:
+            raise NotFoundError(f"unknown or non-citable document {doc_id!r}")
+        return self.citable[self.citable_order[doc_id]]
 
     def markdown(self, section_id: str) -> str:
         if section_id not in self.sections:
@@ -303,11 +312,13 @@ def judge_support(
     return best
 
 
-def _card_lines(doc_id: str, rel_path: str, card: ObservationCard) -> list[str]:
+def _card_lines(
+    doc_id: str, rel_path: str, card: ObservationCard, date_label: str | None
+) -> list[str]:
     lines = [
         f"## {doc_id}: {card.title}",
         f"Path: {rel_path}",
-        f"Date: {card.doc_date or 'not stated'} | Deliverable type: {card.deliverable_type}",
+        f"Date: {date_label or 'not stated'} | Deliverable type: {card.deliverable_type}",
         f"Summary: {card.summary}",
     ]
     lines += [f"- {a.name}: {a.value}" for a in card.attributes]
@@ -346,6 +357,8 @@ class CardDigest:
     doc_id: str
     rel_path: str
     card: ObservationCard
+    # `DocumentReading.date_label`.
+    date_label: str | None
 
 
 @dataclass(frozen=True)
@@ -364,7 +377,7 @@ class OrganiseCorpus:
         folders = "\n".join(f"- {f}/" for f in self.folders) or "(all documents are in the root)"
         notes = "\n\n".join(f"### {n.scope_path}\n{n.content}" for n in self.notes) or "(none)"
         cards = "\n\n".join(
-            "\n".join(_card_lines(c.doc_id, c.rel_path, c.card)) for c in self.cards
+            "\n".join(_card_lines(c.doc_id, c.rel_path, c.card, c.date_label)) for c in self.cards
         )
         text = f"FOLDERS:\n{folders}\n\nCURATOR NOTES:\n{notes}\n\nDOCUMENT CARDS:\n{cards}"
         return f"{text}\n\n{self.feedback}" if self.feedback else text
@@ -385,14 +398,23 @@ class Organisation:
 
 
 def check_organisation(
-    draft: OrganisationDraft, folders: frozenset[str], citable_ids: frozenset[str]
+    draft: OrganisationDraft, folders: frozenset[str], citable_order: Mapping[str, int]
 ) -> Checked[Organisation]:
     """Validate an organisation by the folded identity facet filters resolve (`fold_facet_label`).
 
-    Repetition within one value is normalised away: values and aliases are stripped, blank
-    aliases dropped, and one alias kept per folded form. Ambiguity is a rejection: a value given
-    twice, or one folded form naming two values of a facet.
+    `citable_order` maps each citable document ID to its position in path order; a deliverable
+    type's exemplar and feedback IDs are kept in that order. Repetition within one value is
+    normalised away: values and aliases are stripped, blank aliases dropped, and one alias kept
+    per folded form. Ambiguity is a rejection: a value given twice, or one folded form naming
+    two values of a facet.
     """
+
+    def in_path_order(doc_ids: Iterable[str]) -> tuple[str, ...]:
+        # Unknown IDs are rejected below; they sort last only so the rejection can be built.
+        return tuple(
+            sorted(set(doc_ids), key=lambda d: (citable_order.get(d, len(citable_order)), d))
+        )
+
     rejections: list[str] = []
     if len(draft.facets) > MAX_FACETS:
         rejections.append(f"{len(draft.facets)} facets; give at most {MAX_FACETS}")
@@ -471,12 +493,12 @@ def check_organisation(
         if not dtype.exemplar_doc_ids:
             rejections.append(f"deliverable type {dtype.name!r} has no exemplars")
         for doc_id in (*dtype.exemplar_doc_ids, *dtype.feedback_doc_ids):
-            if doc_id not in citable_ids:
+            if doc_id not in citable_order:
                 rejections.append(
                     f"deliverable type {dtype.name!r}: unknown document ID {doc_id!r}"
                 )
         # A feedback document must not supply exemplar text such as a standing passage.
-        for doc_id in sorted(set(dtype.exemplar_doc_ids) & set(dtype.feedback_doc_ids)):
+        for doc_id in in_path_order(set(dtype.exemplar_doc_ids) & set(dtype.feedback_doc_ids)):
             rejections.append(
                 f"deliverable type {dtype.name!r}: {doc_id!r} is both an exemplar and a"
                 " feedback document; give each document one role"
@@ -485,8 +507,8 @@ def check_organisation(
             DeliverableType(
                 name=dtype.name,
                 description=dtype.description,
-                exemplar_doc_ids=tuple(sorted(set(dtype.exemplar_doc_ids))),
-                feedback_doc_ids=tuple(sorted(set(dtype.feedback_doc_ids))),
+                exemplar_doc_ids=in_path_order(dtype.exemplar_doc_ids),
+                feedback_doc_ids=in_path_order(dtype.feedback_doc_ids),
             )
         )
     if rejections:
@@ -517,11 +539,13 @@ def organise(
     gateway: LanguageGateway, view: CorpusView, notes: Sequence[CuratorNote]
 ) -> Organisation:
     folders = view.folders()
-    cards = tuple(CardDigest(d.doc_id, d.rel_path, d.reading.card) for d in view.citable)
+    cards = tuple(
+        CardDigest(d.doc_id, d.rel_path, d.reading.card, d.reading.date_label) for d in view.citable
+    )
     return generate_checked(
         "corpus organisation",
         lambda feedback: gateway.run(OrganiseCorpus(folders, tuple(notes), cards, feedback)),
-        lambda draft: check_organisation(draft, frozenset(folders), view.citable_ids),
+        lambda draft: check_organisation(draft, frozenset(folders), view.citable_order),
     )
 
 
@@ -536,8 +560,9 @@ def binding_evidence(doc: CorpusDocument) -> str:
         f"- {s.heading_path} (pp. {s.page_start}-{s.page_end})" for s in doc.reading.sections
     )
     attributes = "\n".join(f"- {a.name}: {a.value}" for a in card.attributes) or "(none)"
+    date = doc.reading.date_label or "not stated"
     return (
-        f"PATH: {doc.rel_path}\nTITLE: {card.title}\nDATE: {card.doc_date or 'not stated'}\n"
+        f"PATH: {doc.rel_path}\nTITLE: {card.title}\nDATE: {date}\n"
         f"DELIVERABLE TYPE: {card.deliverable_type}\nSUMMARY: {card.summary}\n"
         f"ATTRIBUTES:\n{attributes}\nOUTLINE:\n{outline}"
     )
@@ -622,7 +647,7 @@ term, its kind, its aliases, and its senses. A sense has a definition only when
 the cited sections establish what the term means; otherwise definition is null,
 which records that the corpus uses the term without defining it. When documents
 use the term with conflicting meanings, give one sense per meaning. Cite every
-sense with the section IDs (for example doc_003_sec_002) where the term occurs
+sense with the section IDs (for example doc_a1b2c3d4e5_sec_002) where the term occurs
 with that meaning; use only the IDs shown. Never add knowledge the sections do
 not contain.
 """
@@ -742,7 +767,7 @@ def term_clusters(view: CorpusView) -> list[TermCluster]:
         quotes = tuple(
             sorted(
                 {TermQuote(sid, obs.quote, obs.defines) for sid, obs in members},
-                key=lambda q: (q.section_id, q.text, q.defines),
+                key=lambda q: (view.section_order(q.section_id), q.text, q.defines),
             )
         )
         forms = [f for f in map(fold_for_quote, (term, *aliases)) if f]
@@ -932,7 +957,7 @@ the source shows it, citing the sections that do.
 
 State the outline, conventions and pitfalls generically: no project-specific
 values, names, places or dates. Cite only section IDs the tools returned (for
-example doc_002_sec_004).
+example doc_a1b2c3d4e5_sec_004).
 """
 
 
@@ -1043,7 +1068,7 @@ class SourceTools:
         )
 
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True)
 class CraftLead:
     """A craft observation of an exemplar or feedback document, offered to the blueprint agent
     as a lead to verify in the source."""
@@ -1054,13 +1079,16 @@ class CraftLead:
 
 
 def craft_leads(view: CorpusView, doc_ids: Sequence[str]) -> tuple[CraftLead, ...]:
-    """The located craft observations of `doc_ids`, deduplicated, in canonical sorted order."""
+    """The located craft observations of `doc_ids`, deduplicated, in section path order, then
+    aspect and statement."""
     leads = {
         CraftLead(doc.section_id(c.section_ordinal), c.aspect, c.statement)
         for doc in map(view.document, doc_ids)
         for c in doc.reading.card.craft
     }
-    return tuple(sorted(leads))
+    return tuple(
+        sorted(leads, key=lambda c: (view.section_order(c.section_id), c.aspect, c.statement))
+    )
 
 
 # Standing passage candidates. Code finds the blocks of a type's exemplar text that recur in
@@ -1071,23 +1099,20 @@ def craft_leads(view: CorpusView, doc_ids: Sequence[str]) -> tuple[CraftLead, ..
 def exemplar_documents(
     view: CorpusView, doc_ids: Sequence[str]
 ) -> tuple[_passages.ExemplarDocument, ...]:
-    """The citable documents `doc_ids`, each once, with their sections in ordinal order, as
-    candidate discovery reads them."""
-    documents = []
-    for doc in map(view.document, sorted(set(doc_ids))):
-        sections = sorted(doc.reading.sections, key=lambda s: s.ordinal)
-        documents.append(
-            _passages.ExemplarDocument(
-                doc.doc_id,
-                doc.rel_path,
-                None,
-                tuple(
-                    _passages.ExemplarSection(doc.section_id(s.ordinal), s.markdown)
-                    for s in sections
-                ),
-            )
+    """The citable documents `doc_ids`, each once and in path order, with their sections in
+    reading order, as candidate discovery reads them."""
+    chosen = sorted(map(view.document, set(doc_ids)), key=lambda d: view.citable_order[d.doc_id])
+    return tuple(
+        _passages.ExemplarDocument(
+            doc.doc_id,
+            doc.rel_path,
+            tuple(
+                _passages.ExemplarSection(doc.section_id(s.ordinal), s.markdown)
+                for s in doc.reading.sections
+            ),
         )
-    return tuple(documents)
+        for doc in chosen
+    )
 
 
 # The blueprint request carries every offered candidate in full, so the list is capped to keep
@@ -1315,8 +1340,8 @@ Using only the material given, describe in Markdown: what the collection holds a
 how it is organised (its facets), what each deliverable type covers and which
 blueprints exist, recurring methods, terms and results, and the caveats or gaps
 the curator notes record. Cite every factual claim with the exact section citation
-tokens from the catalog, written as [doc_XXX:doc_XXX_sec_YYY]. Use no other
-citation form.
+tokens from the catalog, written as [doc_a1b2c3d4e5:doc_a1b2c3d4e5_sec_001]. Use no
+other citation form.
 """
 
 
@@ -1335,11 +1360,13 @@ class GuideEntry:
     doc_id: str
     rel_path: str
     card: ObservationCard
+    # `DocumentReading.date_label`.
+    date_label: str | None
     facets: tuple[tuple[str, tuple[str, ...]], ...]
     sections: tuple[GuideSection, ...]
 
     def render(self) -> str:
-        lines = _card_lines(self.doc_id, self.rel_path, self.card)[:4]
+        lines = _card_lines(self.doc_id, self.rel_path, self.card, self.date_label)[:4]
         if self.facets:
             facets = "; ".join(f"{name}: {', '.join(values)}" for name, values in self.facets)
             lines.append(f"Facets: {facets}")
@@ -1406,6 +1433,7 @@ def _guide_catalog(
             doc_id=doc.doc_id,
             rel_path=doc.rel_path,
             card=doc.reading.card,
+            date_label=doc.reading.date_label,
             facets=tuple(
                 (name, tuple(values)) for name, values in assignments[doc.doc_id].items() if values
             ),
