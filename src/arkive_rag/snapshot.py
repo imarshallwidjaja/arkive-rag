@@ -109,8 +109,10 @@ MAX_SUPPLEMENTAL_SECTIONS = 2
 # A document's relevance sums the fused-rank scores of at most this many of its chunks, so a
 # long document does not outrank a closer short one by its length alone.
 RELEVANCE_CHUNKS = 3
-# A candidate of another deliverable type fills a free exemplar slot when its relevance is at
-# least this share of the best exemplar's.
+# A candidate of another deliverable type fills a free exemplar slot when at most one
+# exemplar of the requested type exists, or when its deliverable_type shares a content word
+# with the requested type (e.g. a noise assessment letter and a noise assessment report) and
+# its relevance is at least this share of the best exemplar's.
 CROSS_TYPE_RELEVANCE = 0.6
 # At most this share of a first-ranked chunk's score is added for input words in a document's
 # title, type and summary, which separates documents whose chunks rank alike.
@@ -1951,13 +1953,18 @@ class TopicSnapshot:
         if requested is not None:
             same_type = len(exemplars)
             top = scores[exemplars[0].doc_id] if exemplars else 0.0
+            req_words = set(_DRAFT_WORD.findall(_nfkc(requested).lower())) - _STOPWORDS
             for doc in ranked:
                 if len(exemplars) == MAX_PACKET_EXEMPLARS:
                     break
                 score = scores[doc.doc_id]
                 if doc.family_id in taken_families or doc.is_feedback or score <= 0:
                     continue
-                if same_type <= 1 or score >= CROSS_TYPE_RELEVANCE * top:
+                doc_words = (
+                    set(_DRAFT_WORD.findall(_nfkc(doc.deliverable_type).lower())) - _STOPWORDS
+                )
+                related = bool(req_words & doc_words)
+                if same_type <= 1 or (related and score >= CROSS_TYPE_RELEVANCE * top):
                     exemplars.append(doc)
                     taken_families.add(doc.family_id)
         others = [d for d in ranked if d.family_id not in taken_families][:MAX_OTHER_CANDIDATES]

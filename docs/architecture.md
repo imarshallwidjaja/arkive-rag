@@ -837,8 +837,9 @@ document counts, all before any embedding; a type matches after
 - **Exemplars.** Up to three. With a requested type, its documents fill the
   slots first, best first; a free slot takes the best relevant document
   (relevance above zero) of another type when at most one exemplar is of the
-  requested type, or when that document reaches 0.6 of the best exemplar's
-  relevance (`CROSS_TYPE_RELEVANCE`). Without a type, the three best fill them. An
+  requested type, or when that document's type shares a content word with the
+  requested type and reaches 0.6 of the best exemplar's relevance
+  (`CROSS_TYPE_RELEVANCE`). Without a type, the three best fill them. An
   unordered version family fills one slot, and the exemplar lists its other
   members in `family_doc_ids` (at most 24, the rest counted in
   `omitted_family_members`); its summary is cut to 2,000 characters. The next

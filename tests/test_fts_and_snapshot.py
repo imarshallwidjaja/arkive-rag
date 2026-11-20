@@ -1159,11 +1159,13 @@ def test_a_competitive_neighbour_of_another_type_fills_a_free_slot(tmp_path: Pat
     files = {
         "a/letter-1.md": memo("Depot Letter", "noise assessment letter", [("Noise", night)]),
         "b/letter-2.md": memo("Yard Letter", "noise assessment letter", [("Noise", night)]),
-        "c/report.md": memo("Depot Report", "technical report", [("Results", night)]),
-        "d/memo.md": memo("Fee Memo", "fee memorandum", [("Fees", "Hourly rates and invoicing.")]),
+        "c/report.md": memo("Depot Report", "noise technical report", [("Results", night)]),
+        "d/proposal.md": memo("Depot Proposal", "commercial proposal", [("Scope", night)]),
+        "e/memo.md": memo("Fee Memo", "fee memorandum", [("Fees", "Hourly rates and invoicing.")]),
     }
     path = compile_snapshot(tmp_path, files, topic="acoustic")
-    report, fees = document_id("c/report.md"), document_id("d/memo.md")
+    report = document_id("c/report.md")
+    proposal, fees = document_id("d/proposal.md"), document_id("e/memo.md")
 
     with TopicSnapshot.open(path) as snap:
         packet = snap.prepare_draft(
@@ -1173,11 +1175,11 @@ def test_a_competitive_neighbour_of_another_type_fills_a_free_slot(tmp_path: Pat
         )
 
     types = [e.deliverable_type for e in packet.exemplars]
-    # The report is as relevant as the letters, so it takes the third slot; the fee memo is
-    # not competitive and stays a candidate.
-    assert types == ["noise assessment letter", "noise assessment letter", "technical report"]
+    # The related noise report fills the third slot, while the unrelated proposal (even with
+    # matching project words) and the fee memo stay in `other_candidates`.
+    assert types == ["noise assessment letter", "noise assessment letter", "noise technical report"]
     assert packet.exemplars[2].doc_id == report
-    assert [c.doc_id for c in packet.other_candidates] == [fees]
+    assert [c.doc_id for c in packet.other_candidates] == [proposal, fees]
 
 
 def test_a_long_exemplar_packs_whole_sections_by_priority_within_the_bound(
