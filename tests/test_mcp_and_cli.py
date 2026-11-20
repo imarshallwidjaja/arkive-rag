@@ -4,6 +4,8 @@ import base64
 import hashlib
 import json
 import os
+import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -17,9 +19,16 @@ from typer.testing import CliRunner
 
 from arkive_rag import __version__, cli
 from arkive_rag.cli import app
-from arkive_rag.models import ArkiveError, ObservationDraft, document_id
+from arkive_rag.models import ArkiveError, ObservationDraft, TopicPage, document_id
 from arkive_rag.server import TopicCatalog, create_mcp_server
-from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
+from arkive_rag.snapshot import (
+    RESPONSE_MAX_BYTES,
+    RESPONSE_MAX_LINES,
+    TOPIC_PAGE_MARGIN_BYTES,
+    QueryEmbedder,
+    TopicSnapshot,
+    response_text,
+)
 from tests.support import (
     BATHYMETRY_CORPUS,
     HARBOUR_MEMO,
@@ -95,45 +104,53 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
             ("grep", {"topic": "soils", "pattern": "330.9"}),
             ("lookup_glossary", {"topic": marine}),
             ("lookup_glossary", {"topic": marine, "query": "lowest astronomical"}),
-            ("get_blueprint", {"topic": marine, "deliverable_type": "Survey Memorandum"}),
+            (
+                "prepare_draft",
+                {
+                    "topic": marine,
+                    "project_inputs": "A harbour lidar memo on rainfall and soundings.",
+                    "deliverable_type": "Survey Memorandum",
+                },
+            ),
+            ("list_documents", {"topic": marine, "limit": 1, "offset": 1}),
         ],
         FakeGateway().embed_query,
     )
     topics, guide, memos, outline, hits, matches, section, page, soils, soils_grep = results[:10]
-    terms, lat, memo_blueprint = results[10:]
+    terms, lat, packet, page_two = results[10:]
 
-    assert [(t["topic"], t["document_count"]) for t in data(topics)] == [
+    assert [(t["topic"], t["document_count"]) for t in data(topics)["topics"]] == [
         ("bathymetry", 4),
         ("soils", 1),
     ]
-    assert [len(t["corpus_fingerprint"]) for t in data(topics)] == [64, 64]
-    project = data(topics)[0]["facets"][0]
+    assert [len(t["corpus_fingerprint"]) for t in data(topics)["topics"]] == [64, 64]
+    project = data(topics)["topics"][0]["facets"][0]
     assert (project["name"], project["values"]) == (
         "project",
         ["p101-harbour-lidar", "p102-estuary-multibeam", "p103-reef-sonar"],
     )
     assert f"[{CHART_MEMO}:" in data(guide)["guide_markdown"]
-    # The guide carries blueprint summaries; get_blueprint returns one in full.
-    assert data(guide)["blueprints"] == [
-        {
-            "deliverable_type": "proposal",
-            "description": "How the collection writes a proposal.",
-            "exemplar_count": 1,
-        },
-        {
-            "deliverable_type": "survey memorandum",
-            "description": "How the collection writes a survey memorandum.",
-            "exemplar_count": 1,
-        },
+    assert [
+        (t["deliverable_type"], t["document_count"]) for t in data(guide)["deliverable_types"]
+    ] == [("document", 1), ("proposal", 1), ("survey memorandum", 1)]
+    assert data(topics)["topics"][0]["deliverable_types"] == [
+        "document",
+        "proposal",
+        "survey memorandum",
     ]
-    blueprint = data(memo_blueprint)
-    assert blueprint["deliverable_type"] == "survey memorandum"
-    assert blueprint["outline"] and blueprint["conventions"]
-    # A single exemplar shows no recurrence, so the memorandum has no standing passages.
-    assert blueprint["standing_passages"] == []
+    assert (data(topics)["total"], data(topics)["next_offset"]) == (2, None)
+    draft = data(packet)
+    assert draft["deliverable_type"] == "survey memorandum"
+    assert draft["exemplars"][0]["doc_id"] == HARBOUR_MEMO
+    assert all(s["included"] for s in draft["exemplars"][0]["sections"])
+    assert draft["drafting_guidance"].startswith("- Take every fact")
+    assert [d["rel_path"] for d in data(page_two)["documents"]] == [
+        "p101-harbour-lidar/harbour-memo.md"
+    ]
+    assert (data(page_two)["total"], data(page_two)["next_offset"]) == (4, 2)
     assert data(guide)["glossary_terms"] == ["LAT"]
     assert data(guide)["curator_notes"][0]["scope_path"] == "p103-reef-sonar/AGENTS.md"
-    assert [d["rel_path"] for d in data(memos)] == [
+    assert [d["rel_path"] for d in data(memos)["documents"]] == [
         "p101-harbour-lidar/harbour-chart-memo.pdf",
         "p101-harbour-lidar/harbour-memo.md",
     ]
@@ -146,7 +163,7 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
     assert isinstance(text, TextContent) and "page 2 of 2" in text.text
     assert isinstance(image, ImageContent) and image.mime_type == "image/webp"
     assert base64.b64decode(image.data)[8:12] == b"WEBP"
-    assert [d["rel_path"] for d in data(soils)] == ["p900-soils/soils-memo.md"]
+    assert [d["rel_path"] for d in data(soils)["documents"]] == ["p900-soils/soils-memo.md"]
     assert data(soils_grep) == []
     assert [(t["term"], t["defined"]) for t in data(terms)["terms"]] == [("LAT", True)]
     (entry,) = data(lat)["matches"]
@@ -169,12 +186,17 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
             ("view_page", {"topic": "bathymetry", "doc_id": CHART_MEMO, "page_number": 9}),
             ("grep", {"topic": "bathymetry", "pattern": "x", "filters": {"stage": "memo"}}),
             ("lookup_glossary", {"topic": "bathymetry", "query": " "}),
-            ("get_blueprint", {"topic": "bathymetry", "deliverable_type": "press release"}),
+            (
+                "prepare_draft",
+                {"topic": "bathymetry", "project_inputs": "x", "deliverable_type": "press release"},
+            ),
+            ("prepare_draft", {"topic": "bathymetry", "project_inputs": "Rainfall memo."}),
+            ("grep", {"topic": "bathymetry", "pattern": "x", "max_matches": 51}),
         ],
         None,
     )
     search, grep, section, page, bad_topic, bad_project, bad_page, bad_facet, blank = results[:9]
-    (bad_type,) = results[9:]
+    bad_type, offline_draft, too_many = results[9:]
 
     assert "OPENAI_API_KEY" in error_text(search) and "grep" in error_text(search)
     assert len(data(grep)) == 1
@@ -185,7 +207,313 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
     assert error_text(bad_page).endswith(f"{CHART_MEMO} has no page 9; it has pages 1-2")
     assert error_text(bad_facet).endswith("unknown facet 'stage'; valid facets: project, client")
     assert "glossary query must not be blank" in error_text(blank)
-    assert error_text(bad_type).endswith("valid types: proposal, survey memorandum")
+    assert error_text(bad_type).endswith(
+        "valid types: document (1), proposal (1), survey memorandum (1)"
+    )
+    # Drafting needs no API key: without one, exemplars are ranked by BM25 alone.
+    assert data(offline_draft)["exemplars"]
+    assert "between 1 and 50" in error_text(too_many)
+
+
+# OpenCode cuts a tool result at 51,200 bytes or 2,000 lines; Arkive keeps every result
+# within its own lower bounds.
+OPENCODE_MAX_BYTES = 51_200
+OPENCODE_MAX_LINES = 2_000
+
+
+def _with_large_catalogue(path: Path, topic: str | None = None) -> None:
+    """Edit a snapshot past what a build writes: a content facet with a 20,000-character
+    description and 1,600 values of about 110 characters, 1,300 more deliverable types with
+    2,000-character descriptions, and optionally another topic name."""
+    with sqlite3.connect(path) as db:
+        db.execute("INSERT INTO facets VALUES ('region', 99, ?, 'content')", ("Region. " * 2_500,))
+        values = [f"region-{n:04d}-" + "x" * 100 for n in range(1_600)]
+        db.executemany(
+            "INSERT INTO facet_values VALUES ('region', ?, ?, 'A region.', '[]')",
+            [(v, n) for n, v in enumerate(values, start=1)],
+        )
+        db.executemany(
+            "INSERT INTO facet_aliases VALUES ('region', ?, ?, ?)", [(v, v, v) for v in values]
+        )
+        db.executemany(
+            "INSERT INTO deliverable_types VALUES (?, ?, ?)",
+            [(f"type {n:04d} " + "y" * 90, 1_000 + n, "Kind. " * 330) for n in range(1_300)],
+        )
+        if topic is not None:
+            db.execute("UPDATE corpus_meta SET value = ? WHERE key = 'topic'", (topic,))
+    db.close()
+
+
+def _oversized_snapshot(tmp_path: Path) -> Path:
+    """A topic built to overflow every tool result: a 600-section manual defining a term in
+    each section, a full-length section of two-byte characters, 30 long curator notes, 15
+    reviews with long lessons, 150 small documents and a two-page PDF. The snapshot is then
+    edited past what a build writes: the manual's summary is 60,000 characters and its title
+    and second clause heading 20,000 three-byte characters each, the small documents are
+    drafts it supersedes, one glossary term has four senses citing 500 sections each, the
+    guide is 24,000 bytes of three-byte characters, the PDF's second page has 2,100 lines of
+    native text and 3,000 of visual summary, and the catalogue is large
+    (`_with_large_catalogue`)."""
+    clauses = "".join(
+        f"\n## Clause {i}\n\n**TERM{i:04d}** means clause {i} of the field manual. "
+        + "The crew records the gauge datum at each station. " * 3
+        + "\n"
+        for i in range(600)
+    )
+    files = {
+        "handbook/manual.md": f"# Field Manual\n\nDeliverable: field manual\n{clauses}",
+        # Sections hold at most 32,000 characters; in Cyrillic that is about 60,000 bytes.
+        "long/section.md": "# Long\n\n"
+        + "\n".join(f"\u0421\u0442\u0440\u043e\u043a\u0430 {i} " * 4 for i in range(1_500)),
+        **{
+            f"notes-{i:02d}/AGENTS.md": f"# Note {i}\n\n" + f"Curator guidance {i}. " * 150
+            for i in range(30)
+        },
+        **{
+            f"reviews/review-{k:02d}.md": (
+                f"# Review {k}\n\nDeliverable: field manual review\n\n"
+                f"Reviewer: State the datum of every station in each clause, lesson {k}, "
+                + "and keep the gauge tables in one order. "
+                * 8
+            )
+            for k in range(15)
+        },
+        **{f"zz-drafts/draft-{n:03d}.md": f"# Draft {n}\n\nDraft {n}." for n in range(150)},
+    }
+    path = compile_snapshot(
+        tmp_path, files, topic="oversized", pdfs={"scans/scan.pdf": [["# Scan"], ["# Page"]]}
+    )
+    manual = document_id("handbook/manual.md")
+    wide = "\u6587" * 20_000
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE documents SET summary = ?, title = ? WHERE doc_id = ?",
+            ("Long. " * 10_000, wide, manual),
+        )
+        db.execute(
+            "UPDATE sections SET heading_path = ? WHERE section_id = ?", (wide, f"{manual}_sec_002")
+        )
+        db.execute(
+            "UPDATE corpus_meta SET value = ? WHERE key = 'guide_markdown'", ("\u6587" * 8_000,)
+        )
+        db.execute(
+            "UPDATE pages SET native_text = ?, visual_summary = ? WHERE page_number = 2",
+            (
+                "\n".join(f"\u884c {i}" for i in range(2_100)),
+                "\n".join(f"Shape {i}." for i in range(3_000)),
+            ),
+        )
+        db.execute(
+            "UPDATE documents SET family_id = ?, version_status = 'superseded',"
+            " superseded_by = ? WHERE rel_path LIKE 'zz-drafts/%'",
+            (manual, manual),
+        )
+        db.execute("UPDATE documents SET version_status = 'latest' WHERE doc_id = ?", (manual,))
+        (ordinal, entry_json) = db.execute(
+            "SELECT ordinal, entry_json FROM glossary WHERE term = 'TERM0001'"
+        ).fetchone()
+        entry = json.loads(entry_json)
+        cited = [f"{manual}_sec_{k:03d}" for k in range(2, 502)]
+        entry["senses"] = [{"definition": f"Sense {n}.", "citations": cited} for n in range(4)]
+        db.execute(
+            "UPDATE glossary SET entry_json = ? WHERE ordinal = ?", (json.dumps(entry), ordinal)
+        )
+    db.close()
+    _with_large_catalogue(path)
+    return path
+
+
+def test_every_tool_result_fits_one_opencode_tool_result(tmp_path: Path) -> None:
+    path = _oversized_snapshot(tmp_path)
+    # Nineteen more topics, each with the large catalogue, so the topics need several pages.
+    small = compile_snapshot(tmp_path / "small", {"p1/memo.md": "# Memo\n\nGauge datum."})
+    others = []
+    for n in range(19):
+        copy = tmp_path / f"topic-{n:02d}.arkive.db"
+        copy.write_bytes(small.read_bytes())
+        _with_large_catalogue(copy, topic=f"topic-{n:02d}")
+        others.append(copy)
+    manual = document_id("handbook/manual.md")
+    long_section = f"{document_id('long/section.md')}_sec_001"
+    scan = document_id("scans/scan.pdf")
+    topic = "oversized"
+    calls: list[tuple[str, dict[str, Any]]] = [
+        ("list_topics", {}),
+        ("get_topic_guide", {"topic": topic}),
+        ("list_documents", {"topic": topic, "limit": 100}),
+        ("get_document_outline", {"topic": topic, "doc_id": manual}),
+        ("search", {"topic": topic, "query": "gauge datum station clause", "top_k": 50}),
+        ("grep", {"topic": topic, "pattern": "gauge datum", "max_matches": 50}),
+        ("read_section", {"topic": topic, "section_id": long_section}),
+        ("lookup_glossary", {"topic": topic}),
+        ("lookup_glossary", {"topic": topic, "query": "term"}),
+        ("lookup_glossary", {"topic": topic, "query": "TERM0001"}),
+        (
+            "prepare_draft",
+            {
+                "topic": topic,
+                "project_inputs": "A field manual of gauge datum clauses for every station.",
+                "deliverable_type": "field manual",
+            },
+        ),
+        ("lookup_glossary", {"topic": topic, "query": "term " * 400}),
+        ("view_page", {"topic": topic, "doc_id": scan, "page_number": 2}),
+        ("grep", {"topic": topic, "pattern": "clause 0 of the field manual", "max_matches": 1}),
+        ("read_section", {"topic": topic, "section_id": f"{manual}_sec_002"}),
+        ("list_documents", {"topic": topic, "filters": {"region": "z" * 5_000}}),
+        ("prepare_draft", {"topic": topic, "project_inputs": "x", "deliverable_type": "q" * 5_000}),
+        ("get_topic_guide", {"topic": "t" * 5_000}),
+        ("read_section", {"topic": topic, "section_id": "s" * 5_000}),
+    ]
+
+    results = call_tools((path, *others), calls, FakeGateway().embed_query)
+    pages = [data(results[0])]
+    while pages[-1]["next_offset"] is not None:
+        (more,) = call_tools(
+            (path, *others), [("list_topics", {"offset": pages[-1]["next_offset"]})], None
+        )
+        assert len(response_text_of(more).encode()) <= RESPONSE_MAX_BYTES
+        pages.append(data(more))
+
+    assert RESPONSE_MAX_BYTES < OPENCODE_MAX_BYTES and RESPONSE_MAX_LINES < OPENCODE_MAX_LINES
+    for (name, _), result in zip(calls, results, strict=True):
+        texts = [c.text for c in result.content if isinstance(c, TextContent)]
+        rendered = "\n\n".join(texts)
+        assert len(rendered.encode()) <= RESPONSE_MAX_BYTES, name
+        assert rendered.count("\n") + 1 <= RESPONSE_MAX_LINES, name
+        if not result.is_error and name != "view_page":
+            # One compact JSON block, the same value as the structured result.
+            (text,) = texts
+            assert json.loads(text) == data(result), name
+    topics, guide, page, outline, hits, matches, part, terms, matched, entry, packet = [
+        data(r) for r in results[:11]
+    ]
+    assert "at most 1000" in error_text(results[11])
+    view, long_heading, long_part = results[12], data(results[13]), data(results[14])
+    bad_value, bad_type, bad_topic, bad_section = (error_text(r) for r in results[15:])
+    # Twenty topics come in several pages, each topic once and in order.
+    assert len(pages) > 1 and topics["total"] == 20
+    listed = [t["topic"] for p in pages for t in p["topics"]]
+    assert listed == ["oversized", *(f"topic-{n:02d}" for n in range(19))]
+    (region,) = [f for f in pages[0]["topics"][0]["facets"] if f["name"] == "region"]
+    assert len(region["values"]) + region["omitted_values"] == 1_600
+    assert len(region["values"]) <= 50
+    assert hits and matches
+    # A 24,000-byte guide still comes with every facet name and the types that fit.
+    assert guide["guide_markdown"] == "\u6587" * 8_000
+    assert guide["omitted_deliverable_types"] > 0 and guide["deliverable_types"]
+    assert "region" in [f["name"] for f in guide["facets"]]
+    assert guide["omitted_curator_notes"] > 0 or guide["curator_notes"]
+    assert guide["omitted_glossary_terms"] > 0
+    # The page image comes whole beside a caption cut to the bound, saying what it left out.
+    caption, image = view.content
+    assert isinstance(caption, TextContent) and isinstance(image, ImageContent)
+    assert caption.text.count("\n") < 1_500 and "lines omitted ..." in caption.text
+    assert "\u884c 0" in caption.text and "Shape 0." in caption.text
+    # A match in a section with a 20,000-character heading is returned with the heading cut.
+    ((match,),) = [long_heading]
+    assert match["section_id"] == f"{manual}_sec_002"
+    assert match["heading_path"].endswith("\u2026") and len(match["heading_path"]) == 500
+    assert match["doc_title"].endswith("\u2026") and len(match["doc_title"]) == 500
+    assert long_part["heading_path"].endswith("\u2026") and long_part["markdown"]
+    # Errors quote at most 200 characters of the input and name at most 40 choices.
+    assert "valid values: region-0000-" in bad_value and "(+1560 more)" in bad_value
+    assert re.search(r", \.\.\. \(\+\d+ more\)$", bad_type) and "(5000 characters)" in bad_type
+    assert "unknown topic" in bad_topic and "(5000 characters)" in bad_topic
+    assert "unknown section" in bad_section and "(5000 characters)" in bad_section
+    assert page["documents"][0]["summary"].endswith("\u2026")
+    assert (outline["total_sections"], outline["offset"]) == (601, 0)
+    assert 0 < len(outline["sections"]) == outline["next_offset"] < 601
+    assert part["next_offset"] == len(part["markdown"]) < part["total_chars"]
+    assert part["markdown"].endswith("\n")
+    assert terms["total"] == matched["total"] == 600 and matched["next_offset"]
+    (term,) = entry["matches"]
+    for sense in term["senses"]:
+        assert sense["omitted_citations"] > 0
+        assert len(sense["citations"]) + sense["omitted_citations"] == 500
+    (exemplar,) = [e for e in packet["exemplars"] if e["doc_id"] == manual]
+    assert len(exemplar["title"]) == 500
+    assert exemplar["summary"].endswith("\u2026") and exemplar["omitted_family_members"] > 0
+    assert len(exemplar["family_doc_ids"]) + exemplar["omitted_family_members"] == 150
+    assert packet["lessons"] and packet["omitted_lessons"] > 0
+    assert packet["curator_notes"] and packet["omitted_curator_notes"] > 0
+
+
+def response_text_of(result: CallToolResult) -> str:
+    return "\n\n".join(c.text for c in result.content if isinstance(c, TextContent))
+
+
+def test_list_topics_summarises_only_its_page_and_inspect_shows_the_whole_topic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    small = compile_snapshot(tmp_path / "small", {"p1/memo.md": "# Memo\n\nGauge datum."})
+    paths = []
+    for n in range(12):
+        copy = tmp_path / f"topic-{n:02d}.arkive.db"
+        copy.write_bytes(small.read_bytes())
+        _with_large_catalogue(copy, topic=f"topic-{n:02d}")
+        paths.append(copy)
+    # The first topic's title makes its summary 44,990 bytes uncut: a result on its own, but
+    # not inside a page.
+    with TopicSnapshot.open(paths[0]) as snap:
+        rest = len(response_text(snap.summary()).encode()) - len(snap.title)
+    title = "T" * (44_990 - rest)
+    # The second topic has more facet values than one summary can name.
+    with sqlite3.connect(paths[1]) as db:
+        db.execute("UPDATE corpus_meta SET value = ? WHERE key = 'title'", (title,))
+        for k in range(7):
+            zone = f"zone{k}"
+            values = [f"{zone}-{n:04d}-" + "z" * 100 for n in range(60)]
+            db.execute("INSERT INTO facets VALUES (?, ?, 'Zone.', 'content')", (zone, 100 + k))
+            db.executemany(
+                "INSERT INTO facet_values VALUES (?, ?, ?, 'A zone.', '[]')",
+                [(zone, v, n) for n, v in enumerate(values, start=1)],
+            )
+            db.executemany(
+                "INSERT INTO facet_aliases VALUES (?, ?, ?, ?)", [(zone, v, v, v) for v in values]
+            )
+    db.close()
+    with sqlite3.connect(paths[0]) as db:
+        db.execute("UPDATE corpus_meta SET value = ? WHERE key = 'title'", (title,))
+    db.close()
+    summarised: list[str] = []
+    summary = TopicSnapshot.summary
+
+    def counted(self: TopicSnapshot) -> Any:
+        summarised.append(self.topic)
+        return summary(self)
+
+    monkeypatch.setattr(TopicSnapshot, "summary", counted)
+
+    pages: list[dict[str, Any]] = []
+    offset: int | None = 0
+    while offset is not None:
+        summarised.clear()
+        (result,) = call_tools(tuple(paths), [("list_topics", {"offset": offset})], None)
+        assert len(response_text_of(result).encode()) <= RESPONSE_MAX_BYTES
+        pages.append(data(result))
+        listed = [t["topic"] for t in pages[-1]["topics"]]
+        offset = pages[-1]["next_offset"]
+        # Only the page's topics are summarised, and the one that did not fit after them.
+        assert summarised == [*listed, *([f"topic-{offset:02d}"] if offset else [])]
+    monkeypatch.undo()
+
+    assert len(pages) > 1
+    assert [t["topic"] for p in pages for t in p["topics"]] == [f"topic-{n:02d}" for n in range(12)]
+    first, crowded = pages[0]["topics"][0], pages[1]["topics"][0]
+    assert first["title"] == "T" * 499 + "\u2026" and crowded["title"] == first["title"]
+    zones = [f for f in crowded["facets"] if f["name"].startswith("zone")]
+    assert zones and all(f["omitted_values"] > 10 for f in zones)
+    with TopicSnapshot.open(paths[1]) as snap:
+        alone = TopicPage(topics=[snap.summary()], total=1, offset=0, next_offset=None)
+    assert len(response_text(alone).encode()) <= RESPONSE_MAX_BYTES - TOPIC_PAGE_MARGIN_BYTES
+
+    inspected = CliRunner().invoke(app, ["inspect", str(paths[1])])
+    assert inspected.exit_code == 0, inspected.output
+    whole = json.loads(inspected.stdout)
+    assert whole["title"] == title
+    assert [len(f["values"]) for f in whole["facets"] if f["name"].startswith("zone")] == [60] * 7
+    assert len(whole["deliverable_types"]) > 1_300
 
 
 def test_catalog_rejects_two_snapshots_with_the_same_topic(
@@ -240,15 +568,25 @@ def test_cli_inspect_and_grep_work_offline(
         "deliverable_type": "document",
         "page_count": 2,
         "is_curator_note": False,
+        "is_feedback": False,
+        "feedback_for_types": [],
+        "family_id": CHART_MEMO,
+        "version_status": summary["documents"][0]["version_status"],
+        "superseded_by": None,
         "facets": {"project": ["p101-harbour-lidar"]},
         "sections": 2,
     }
     assert [f["name"] for f in summary["facets"]] == ["project", "client"]
     assert [e["term"] for e in summary["glossary"]] == ["LAT"]
-    assert [b["deliverable_type"] for b in summary["blueprints"]] == [
+    assert [t["deliverable_type"] for t in summary["deliverable_types"]] == [
+        "document",
         "proposal",
         "survey memorandum",
     ]
+    assert summary["feedback_lessons"] == []
+    with TopicSnapshot.open(snapshots[0]) as snap:
+        assert summary["recurring_units"] == snap.recurring_unit_count
+    assert summary["build_report"]["dropped_feedback_lessons"] == 0
     assert summary["build_settings"]["efforts"]["observe"] == "low"
     assert summary["build_report"]["discarded_unlocated_quotes"] == 0
     assert grepped.exit_code == 0, grepped.output
@@ -390,7 +728,7 @@ def test_cli_builds_differently_organised_corpora_into_different_knowledge(
         return (
             [(f["name"], f["binding"]) for f in summary["facets"]],
             [e["term"] for e in summary["glossary"]],
-            [b["deliverable_type"] for b in summary["blueprints"]],
+            [t["deliverable_type"] for t in summary["deliverable_types"]],
         )
 
     assert knowledge("bathymetry") == (
@@ -398,6 +736,10 @@ def test_cli_builds_differently_organised_corpora_into_different_knowledge(
         ["LAT"],
         ["proposal", "survey memorandum"],
     )
+    assert [
+        (lesson["statement"], lesson["target_types"])
+        for lesson in summaries["campaigns"]["feedback_lessons"]
+    ] == [("Cut the jargon from the opening line.", ["campaign brief"])]
     assert knowledge("campaigns") == (
         [("campaign", "path"), ("author", "content"), ("channel", "content")],
         ["Churn", "CTA", "ICP"],

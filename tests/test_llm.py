@@ -26,6 +26,7 @@ from arkive_rag import llm
 from arkive_rag.llm import (
     DECISION_MODEL,
     DEFAULT_MODEL,
+    MAX_JUDGE_REQUEST_CHARS,
     BudgetExceededError,
     BuildCache,
     Effort,
@@ -114,19 +115,24 @@ LOOKUP = Tool(
 )
 
 
-@dataclass(frozen=True)
-class AgentProbe:
-    operation: ClassVar[str] = "agent_probe"
-    output: ClassVar[type[ProbeOutput]] = ProbeOutput
-    effort: Effort = "medium"
-    max_turns: int = 3
-    tools: Sequence[Tool] = (LOOKUP,)
-    source_digest: str = "a" * 64
-    prompt: str = "Catalogue it."
-    instructions: ClassVar[str] = "Use the tools, then answer."
-
-    def text(self) -> str:
-        return self.prompt
+def converse(
+    gateway: OpenAIGateway,
+    *,
+    tools: Sequence[Tool] = (LOOKUP,),
+    max_turns: int = 3,
+    prompt: str = "Catalogue it.",
+) -> llm.Conversation:
+    """One conversation of the test suite's agent on its own event loop."""
+    return asyncio.run(
+        gateway.converse(
+            operation="agent_probe",
+            instructions="Use the tools, then answer.",
+            prompt=prompt,
+            tools=tools,
+            max_turns=max_turns,
+            effort="medium",
+        )
+    )
 
 
 def connect_error() -> httpx2.ConnectError:
@@ -310,8 +316,9 @@ def test_an_async_attempt_that_outlasts_the_deadline_ends_it_without_another_att
         operation_deadline=0.2,
         retry_delays=(0.0, 0.0, 0.0, 0.0),
     )
-    with pytest.raises(ProviderError, match=r"attempt 1 did not finish within the 0\.2 s deadline"):
-        gateway.run_agent(AgentProbe())
+    run = converse(gateway)
+    assert run.status == "provider_error"
+    assert "attempt 1 did not finish within the 0.2 s deadline" in (run.error or "")
     assert len(attempts) == 1
 
 
@@ -398,24 +405,10 @@ def test_malformed_responses_raise_provider_error_on_every_call_type() -> None:
             gateway.embed_texts(["x"])
     with pytest.raises(ProviderError, match="indices"):
         gateway.embed_texts(["x", "y"])
-    with pytest.raises(ProviderError, match="not a response"):
-        gateway.run_agent(AgentProbe())
-    with pytest.raises(ProviderError, match="malformed usage: output_tokens"):
-        gateway.run_agent(AgentProbe(prompt="other"))
-    with pytest.raises(ProviderError, match="unreadable response"):
-        gateway.run_agent(AgentProbe(prompt="no output"))
-    conversation = asyncio.run(
-        gateway.converse(
-            operation="probe",
-            instructions="i",
-            prompt="q",
-            tools=(LOOKUP,),
-            max_turns=2,
-            effort="low",
-        )
-    )
-    assert conversation.status == "provider_error"
-    assert "unreadable response" in (conversation.error or "")
+    for expected in ("not a response", "malformed usage: output_tokens", "unreadable response"):
+        conversation = converse(gateway)
+        assert conversation.status == "provider_error"
+        assert expected in (conversation.error or ""), conversation.error
 
     # Usage without cached-token details is metered as uncached input.
     api.script(
@@ -501,6 +494,27 @@ def test_judge_splits_more_than_400_predicates_across_requests() -> None:
     assert (row.model, row.calls, row.output_tokens) == (DECISION_MODEL, 2, 2)
 
 
+def test_judge_splits_predicates_so_each_request_stays_within_the_character_bound() -> None:
+    api = probe_api()
+    api.script("/decisions", *(decision_body([0.5] * n) for n in (13, 13, 4)))
+    gateway = api.gateway()
+    evidence = "e" * 50_000
+    predicates = [f"{i:03d} " + "q" * 2_996 for i in range(30)]
+
+    answers = gateway.judge("bind_facets", evidence, predicates)
+
+    requests = api.requests("/decisions")
+    assert answers == [0.5] * 30 and [len(b["questions"]) for b in requests] == [13, 13, 4]
+    for body in requests:
+        sent = len(body["input"]) + sum(len(q["instructions"]) for q in body["questions"])
+        assert sent <= MAX_JUDGE_REQUEST_CHARS
+    assert [q["instructions"] for b in requests for q in b["questions"]] == predicates
+    # Evidence that leaves no room for a question is refused before any request.
+    with pytest.raises(ValueError, match="leave"):
+        gateway.judge("bind_facets", "e" * MAX_JUDGE_REQUEST_CHARS, ["q"])
+    assert api.request_count == 3
+
+
 @pytest.mark.parametrize("probability", [float("nan"), 1.5, -0.2])
 def test_judge_rejects_probabilities_that_are_not_finite_or_outside_0_to_1(
     probability: float,
@@ -540,7 +554,7 @@ def agent_turns(*bodies: Outcome) -> ScriptedOpenAI:
     return api
 
 
-def test_agent_run_feeds_tool_input_errors_and_images_back_and_returns_structured_output() -> None:
+def test_conversation_feeds_tool_input_errors_and_images_back_to_the_model() -> None:
     api = agent_turns(
         response_body([function_call("c1", "lookup", '{"key": "missing"}')]),
         response_body(
@@ -549,12 +563,13 @@ def test_agent_run_feeds_tool_input_errors_and_images_back_and_returns_structure
                 function_call("c3", "lookup", '{"key": "chart"}'),
             ]
         ),
-        response_body([message(META.model_dump_json())]),
+        response_body([message("Catalogued.")]),
     )
     gateway = api.gateway()
 
-    assert gateway.run_agent(AgentProbe()) == META
+    run = converse(gateway)
 
+    assert (run.status, run.answer, run.turns) == ("completed", "Catalogued.", 3)
     first, _, third = api.requests("/responses")
     assert (first["reasoning"], first["model"]) == ({"effort": "medium"}, DEFAULT_MODEL)
     assert first["tools"][0]["strict"] is False and first["tools"][0]["name"] == "lookup"
@@ -570,36 +585,27 @@ def test_agent_run_feeds_tool_input_errors_and_images_back_and_returns_structure
     assert gateway.meter.rows()[0].calls == 3
 
 
-def test_agent_run_ends_on_provider_errors_from_tools_turns_or_the_turn_limit() -> None:
-    def failing(args: dict[str, Any]) -> str:
-        raise ProviderError("embedding service down")
-
-    broken = Tool("lookup", "Read one value.", {"type": "object", "properties": {}}, failing)
-    api = agent_turns(response_body([function_call("c1", "lookup", "{}")]))
-    with pytest.raises(ProviderError, match="embedding service down"):
-        api.gateway().run_agent(AgentProbe(tools=(broken,)))
-    assert len(api.requests("/responses")) == 1
-
+def test_conversation_ends_at_the_turn_limit_or_on_an_incomplete_response() -> None:
     looping = [response_body([function_call(f"c{i}", "lookup", '{"key": "k"}')]) for i in range(3)]
     api = agent_turns(*looping)
-    with pytest.raises(ProviderError, match="did not finish within 2 turns"):
-        api.gateway().run_agent(AgentProbe(max_turns=2))
+    assert converse(api.gateway(), max_turns=2).status == "max_turns"
     assert len(api.requests("/responses")) == 2
 
-    api = agent_turns(response_body([message("{}")], "incomplete", "max_output_tokens"))
-    with pytest.raises(ProviderError, match="status 'incomplete'"):
-        api.gateway().run_agent(AgentProbe())
+    api = agent_turns(response_body([message("half")], "incomplete", "max_output_tokens"))
+    run = converse(api.gateway())
+    assert (run.status, run.answer) == ("incomplete", "half")
 
 
-def test_agent_run_meters_completed_turns_when_a_later_turn_fails() -> None:
+def test_conversation_meters_completed_turns_when_a_later_turn_fails() -> None:
     api = agent_turns(
         response_body([function_call("c1", "lookup", '{"key": "k"}')], tokens=usage(40, 4)),
         httpx2.Response(400, json={"error": {"message": "context too long"}}),
     )
     gateway = api.gateway()
 
-    with pytest.raises(ProviderError, match="context too long"):
-        gateway.run_agent(AgentProbe())
+    run = converse(gateway)
+
+    assert run.status == "provider_error" and "context too long" in (run.error or "")
     (row,) = gateway.meter.rows()
     assert (row.operation, row.calls, row.input_tokens, row.output_tokens) == (
         "agent_probe",
@@ -613,53 +619,46 @@ def test_agent_run_meters_completed_turns_when_a_later_turn_fails() -> None:
     "failure",
     [RuntimeError("tool bug"), SnapshotIntegrityError("database disk image is malformed")],
 )
-def test_agent_run_ends_on_tool_exceptions_that_are_not_invalid_input(failure: Exception) -> None:
+def test_conversation_ends_on_tool_exceptions_that_are_not_invalid_input(
+    failure: Exception,
+) -> None:
     def broken(args: dict[str, Any]) -> str:
         raise failure
 
     api = agent_turns(
         response_body([function_call("c1", "lookup", "{}")]),
-        response_body([message(META.model_dump_json())]),
+        response_body([message("never reached")]),
     )
     tool = Tool("lookup", "Read.", {"type": "object", "properties": {}}, broken)
     with pytest.raises(type(failure), match=str(failure)):
-        api.gateway().run_agent(AgentProbe(tools=(tool,)))
+        converse(api.gateway(), tools=(tool,))
     assert len(api.requests("/responses")) == 1
 
 
-def test_agent_turns_retry_transient_failures_under_the_gateway_policy() -> None:
+def test_conversation_turns_retry_transient_failures_under_the_gateway_policy() -> None:
     first_turn = response_body([function_call("c1", "lookup", '{"key": "k"}')])
-    api = agent_turns(
-        first_turn,
-        connect_error(),
-        connect_error(),
-        response_body([message(META.model_dump_json())]),
-    )
+    api = agent_turns(first_turn, connect_error(), connect_error(), response_body([message("ok")]))
     gateway = api.gateway()
 
-    assert gateway.run_agent(AgentProbe()) == META
+    assert converse(gateway).status == "completed"
     assert len(api.requests("/responses")) == 4
     assert gateway.meter.rows()[0].calls == 2
 
     api = agent_turns(first_turn, *[connect_error() for _ in range(5)])
-    with pytest.raises(ProviderError, match="after 5 attempts"):
-        api.gateway().run_agent(AgentProbe())
+    run = converse(api.gateway())
+    assert run.status == "provider_error" and "after 5 attempts" in (run.error or "")
     assert len(api.requests("/responses")) == 6
 
 
-def test_agent_run_returns_unknown_tool_names_to_the_model_and_fails_on_behaviour_errors() -> None:
+def test_conversation_returns_unknown_tool_names_to_the_model() -> None:
     api = agent_turns(
         response_body([function_call("c1", "hallucinated_tool", "{}")]),
-        response_body([message(META.model_dump_json())]),
+        response_body([message("Recovered.")]),
     )
-    assert api.gateway().run_agent(AgentProbe()) == META
+    assert converse(api.gateway()).answer == "Recovered."
     second = api.requests("/responses")[1]
     (output,) = [i for i in second["input"] if i.get("type") == "function_call_output"]
     assert output["call_id"] == "c1" and "hallucinated_tool" in str(output["output"])
-
-    api = agent_turns(response_body([message("not a catalogue")]))
-    with pytest.raises(ProviderError, match="failed"):
-        api.gateway().run_agent(AgentProbe())
 
 
 def test_conversation_records_each_tool_call_in_order_with_its_arguments_and_result() -> None:
@@ -742,11 +741,11 @@ def test_trace_passes_its_key_with_each_run_and_leaves_the_global_exporter_alone
     async def record_run(agent: Any, text: str, *, max_turns: int, run_config: Any) -> Any:
         # Nothing runs, so no trace is exported from the test.
         configs.append(run_config)
-        return SimpleNamespace(final_output=META)
+        return SimpleNamespace(final_output="done")
 
     monkeypatch.setattr(Runner, "run", record_run)
-    probe_api().gateway(api_key="sk-trace-test", trace=True).run_agent(AgentProbe())
-    probe_api().gateway(api_key="sk-other-test").run_agent(AgentProbe())
+    converse(probe_api().gateway(api_key="sk-trace-test", trace=True))
+    converse(probe_api().gateway(api_key="sk-other-test"))
 
     traced, untraced = configs
     assert (traced.tracing_disabled, traced.tracing) == (False, {"api_key": "sk-trace-test"})
@@ -775,7 +774,7 @@ def test_spend_limit_stops_the_next_call_once_the_estimate_reaches_it() -> None:
         lambda: gateway.run(Probe(prompt="next")),
         lambda: gateway.judge("check", "evidence", ["p"]),
         lambda: gateway.embed_texts(["x"]),
-        lambda: gateway.run_agent(AgentProbe()),
+        lambda: converse(gateway),
     ):
         with pytest.raises(BudgetExceededError, match=r"reached the \$0.3 limit"):
             call()
@@ -823,15 +822,12 @@ def test_cache_hits_make_no_requests_and_every_key_input_is_a_miss(tmp_path: Pat
     with BuildCache(tmp_path / "cache.db") as cache:
         gateway = api.gateway(cache=cache)
         probe = Probe(image_webp=b"RIFF-a")
-        agent = AgentProbe()
         first = gateway.run(probe)
-        gateway.run_agent(agent)
         gateway.judge("check", "evidence", ["p", "q"])
         vector = gateway.embed_query("rainfall")
         requests = api.request_count
 
         assert gateway.run(probe) == first
-        assert gateway.run_agent(agent) == META
         assert gateway.judge("check", "evidence", ["p", "q"]) == [0.75, 0.75]
         assert np.array_equal(gateway.embed_query("rainfall"), vector)
         assert api.request_count == requests
@@ -839,17 +835,6 @@ def test_cache_hits_make_no_requests_and_every_key_input_is_a_miss(tmp_path: Pat
         gateway.run(replace(probe, image_webp=b"RIFF-b"))
         gateway.run(replace(probe, effort="high"))
         assert api.request_count == requests + 2
-        changed_schema = Tool(LOOKUP.name, LOOKUP.description, {"type": "object"}, lookup)
-        for variant in (
-            replace(agent, effort="high"),
-            replace(agent, tools=(changed_schema,)),
-            replace(agent, max_turns=4),
-            replace(agent, source_digest="b" * 64),
-        ):
-            api.script("/responses", structured_body(META))
-            before = api.request_count
-            gateway.run_agent(variant)
-            assert api.request_count == before + 1, variant
 
 
 def test_concurrent_misses_for_one_key_return_the_first_stored_response(

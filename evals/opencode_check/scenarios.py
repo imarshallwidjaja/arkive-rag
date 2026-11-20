@@ -8,9 +8,10 @@ eval packs (`evals.schema.satisfies_groups`). Every scenario also
 requires that the agent called no tool outside the Arkive server and that the run ended with
 an answer. Facet names are induced per build, so a scenario never names one: it can instead
 require the answer to name every facet of its topics, read from the served snapshots. For the
-same reason a drafting scenario never names a standing passage or a deliverable type: it names
-a topic, and can require the answer to reproduce one of the passages of the blueprint its last
-`get_blueprint` call on that topic returned.
+same reason a drafting scenario never names a passage or a deliverable type: it names a topic,
+and can require the answer to reproduce a recurring passage of the drafting packet its last
+`prepare_draft` call on that topic returned. Every scenario fails when OpenCode cut an Arkive
+tool result, since the agent then read only part of it.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ ARKIVE_SERVER = "arkive"
 ArkiveTool = Literal[
     "list_topics",
     "get_topic_guide",
-    "get_blueprint",
+    "prepare_draft",
     "list_documents",
     "get_document_outline",
     "search",
@@ -99,9 +100,9 @@ class Scenario(_ScenarioModel):
     # The answer names every facet of each topic in `topics_queried` (or of every served
     # topic when that is empty), compared with `_` and `-` read as spaces.
     answer_names_facets: bool = False
-    # A topic: the answer reproduces at least one standing passage of the blueprint that the
-    # last completed `get_blueprint` call on this topic returned (`_reproduction_outcome`).
-    answer_reproduces_standing_passage_of: NonBlank | None = None
+    # A topic: the answer reproduces at least one recurring passage of the packet that the last
+    # completed `prepare_draft` call on this topic returned (`_reproduction_outcome`).
+    answer_reproduces_recurring_passage_of: NonBlank | None = None
     page_image: PageImage | None = None
 
 
@@ -122,8 +123,8 @@ class ScenarioFile(_ScenarioModel):
             named = set(s.topics_queried)
             if s.page_image:
                 named.add(s.page_image.topic)
-            if s.answer_reproduces_standing_passage_of:
-                named.add(s.answer_reproduces_standing_passage_of)
+            if s.answer_reproduces_recurring_passage_of:
+                named.add(s.answer_reproduces_recurring_passage_of)
             unknown = sorted(named - set(self.topics))
             if unknown:
                 raise ValueError(f"scenario {s.scenario_id!r} queries undeclared topics {unknown}")
@@ -146,6 +147,8 @@ class ToolCall:
     error: str | None
     # MIME types of the files (such as images) in the MCP result, from `state.metadata`.
     file_types: tuple[str, ...] = ()
+    # OpenCode cut the result at its output limit (`state.metadata.truncated`).
+    truncated: bool = False
 
     @property
     def arkive_tool(self) -> str | None:
@@ -184,7 +187,8 @@ def parse_events(lines: Iterable[str]) -> Transcript:
     `tool_use` events carry `part.tool` and `part.state` (`status`, `input`, `output` or
     `error`); `text` events carry `part.text`; `step_finish` events carry `part.tokens` and
     `part.cost`; `error` events carry `error`. OpenCode keeps an MCP result's content items in
-    `part.state.metadata.content`; files there (an image from `view_page`) carry a `mime`.
+    `part.state.metadata.content`; files there (an image from `view_page`) carry a `mime`. It
+    sets `part.state.metadata.truncated` when it cut a result at its output limit.
     Other event types are ignored. A line that is not a JSON object is kept in
     `unreadable_lines`, and the run then fails its checks.
     """
@@ -216,7 +220,8 @@ def parse_events(lines: Iterable[str]) -> Transcript:
         part = _object(event.get("part"))
         if kind == "tool_use":
             state = _object(part.get("state"))
-            content = _object(state.get("metadata")).get("content")
+            metadata = _object(state.get("metadata"))
+            content = metadata.get("content")
             file_types = tuple(
                 str(item.get("mime"))
                 for item in (content if isinstance(content, list) else [])
@@ -230,6 +235,7 @@ def parse_events(lines: Iterable[str]) -> Transcript:
                     output=_as_text(state.get("output")),
                     error=_as_text(state.get("error")),
                     file_types=file_types,
+                    truncated=metadata.get("truncated") is True,
                 )
             )
             texts_after_last_call = []
@@ -287,7 +293,11 @@ def evaluate(
 ) -> list[CheckOutcome]:
     """Every check of `scenario` against one run. `exit_code` is None when the run did not
     finish (it timed out); `facets_by_topic` holds the facet names of each served topic."""
-    outcomes = [_run_completed(transcript, exit_code), _only_arkive_tools(transcript)]
+    outcomes = [
+        _run_completed(transcript, exit_code),
+        _only_arkive_tools(transcript),
+        _no_arkive_result_truncated(transcript),
+    ]
     completed = [c for c in transcript.tool_calls if c.arkive_tool and c.status == "completed"]
     for tool in scenario.required_tools:
         n = sum(c.arkive_tool == tool for c in completed)
@@ -324,69 +334,81 @@ def evaluate(
                 f"absent: {absent}" if absent else f"named {names}",
             )
         )
-    if scenario.answer_reproduces_standing_passage_of:
+    if scenario.answer_reproduces_recurring_passage_of:
         outcomes.append(
-            _reproduction_outcome(completed, answer, scenario.answer_reproduces_standing_passage_of)
+            _reproduction_outcome(
+                completed, answer, scenario.answer_reproduces_recurring_passage_of
+            )
         )
     return outcomes
 
 
-# A long passage counts as reproduced when its opening words are; the agent may adapt a
-# project fact later in it, as the drafting instructions require.
-REPRODUCED_PREFIX_WORDS = 12
+# A recurring passage counts as reproduced when the answer holds this many of its words in a
+# row: the agent may adapt its opening words to the new project's modality, or a project fact
+# later in it, as the drafting instructions require.
+REPRODUCED_WINDOW_WORDS = 10
 _WORD = re.compile(r"\w+")
 
 
-def _words(text: str) -> str:
-    """Text as space-separated words after `fold_for_quote`, padded so a containment test
-    matches whole words only."""
-    return f" {' '.join(_WORD.findall(fold_for_quote(text)))} "
+def _words(text: str) -> list[str]:
+    return _WORD.findall(fold_for_quote(text))
+
+
+def recurring_passages(packet: Mapping[str, Any]) -> list[str]:
+    """The packet's `recurring_samples`: the opening words of each recurring unit its included
+    exemplar sections hold in two or more version families. A section can mix house text with
+    a project's own paragraphs; only these units are house text."""
+    samples = packet.get("recurring_samples")
+    return [t for t in samples if isinstance(t, str)] if isinstance(samples, list) else []
+
+
+def _reproduces(answer_words: Sequence[str], passage: str) -> bool:
+    """Whether the answer holds `REPRODUCED_WINDOW_WORDS` consecutive words of `passage` (all of
+    a shorter one), compared after `fold_for_quote`."""
+    words = _words(passage)
+    width = min(REPRODUCED_WINDOW_WORDS, len(words))
+    if not width:
+        return False
+    spoken = f" {' '.join(answer_words)} "
+    return any(
+        f" {' '.join(words[i : i + width])} " in spoken for i in range(len(words) - width + 1)
+    )
 
 
 def _reproduction_outcome(completed: Sequence[ToolCall], answer: str, topic: str) -> CheckOutcome:
-    """Whether the answer reproduces a standing passage of the blueprint that the last
-    completed `get_blueprint` call on `topic` returned, the one the agent drafted from: its
-    text, or its first `REPRODUCED_PREFIX_WORDS` words, compared after `fold_for_quote`. A
-    blueprint without standing passages is a missing precondition of the snapshot, reported
-    under its own check name so it is not read as an agent failure."""
+    """Whether the answer reproduces a recurring passage (`recurring_passages`) of the packet
+    that the last completed `prepare_draft` call on `topic` returned, the one the agent drafted
+    from (`_reproduces`). A packet without recurring passages is a missing precondition of the
+    snapshot, reported under its own check name so it is not read as an agent failure."""
     fetched = [
         c
         for c in completed
-        if c.arkive_tool == "get_blueprint" and c.arguments.get("topic") == topic
+        if c.arkive_tool == "prepare_draft" and c.arguments.get("topic") == topic
     ]
     if not fetched:
         return CheckOutcome(
-            "answer reproduces a standing passage",
+            "answer reproduces a recurring passage",
             False,
-            f"no completed get_blueprint call on {topic}",
+            f"no completed prepare_draft call on {topic}",
         )
-    blueprint = _json_object(fetched[-1].output)
-    items = blueprint.get("standing_passages")
-    passages = [
-        p["text"]
-        for p in (items if isinstance(items, list) else [])
-        if isinstance(p, dict) and isinstance(p.get("text"), str)
-    ]
+    passages = recurring_passages(_json_object(fetched[-1].output))
     if not passages:
         return CheckOutcome(
-            "precondition: blueprint has a standing passage",
+            "precondition: packet has a recurring passage",
             False,
-            f"the {blueprint.get('deliverable_type')!r} blueprint of {topic} holds no standing"
-            " passage, so reproduction cannot be checked; the served snapshot, not the agent,"
-            " fails this scenario",
+            f"the drafting packet of {topic} includes no recurring passage, so reproduction"
+            " cannot be checked; the served snapshot, not the agent, fails this scenario",
         )
     spoken = _words(answer)
     for text in passages:
-        words = _words(text).split()
-        needle = f" {' '.join(words[:REPRODUCED_PREFIX_WORDS])} "
-        if words and needle in spoken:
+        if _reproduces(spoken, text):
             return CheckOutcome(
-                "answer reproduces a standing passage", True, f"reproduced {text[:60]!r}"
+                "answer reproduces a recurring passage", True, f"reproduced {text[:60]!r}"
             )
     return CheckOutcome(
-        "answer reproduces a standing passage",
+        "answer reproduces a recurring passage",
         False,
-        f"none of {len(passages)} standing passage(s) appears in the answer",
+        f"none of {len(passages)} recurring passage(s) appears in the answer",
     )
 
 
@@ -414,6 +436,15 @@ def _run_completed(transcript: Transcript, exit_code: int | None) -> CheckOutcom
     if not transcript.final_answer:
         problems.append("no final answer")
     return CheckOutcome("run completed", not problems, "; ".join(problems) or "answered")
+
+
+def _no_arkive_result_truncated(transcript: Transcript) -> CheckOutcome:
+    cut = [c.name for c in transcript.tool_calls if c.arkive_tool and c.truncated]
+    return CheckOutcome(
+        "no Arkive result truncated",
+        not cut,
+        f"OpenCode cut the result of {cut}" if cut else "every Arkive result arrived whole",
+    )
 
 
 def _only_arkive_tools(transcript: Transcript) -> CheckOutcome:

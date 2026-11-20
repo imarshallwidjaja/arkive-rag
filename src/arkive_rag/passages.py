@@ -1,18 +1,20 @@
-"""Passages: what a text unit is, which units of a set of documents recur, and how two texts
-compare word by word.
+"""Passages: what a text unit is, which units of a corpus recur, and how two texts compare
+word by word.
 
-The blueprint step of induction offers recurring units as standing passage candidates, and
-the evaluation harness measures drafts with the same units, shingles and containment. Every
-function here is pure: it takes Markdown and plain document records, and does no I/O.
+Induction records which units recur across documents, the drafting packet reports that
+recurrence as provenance, and the evaluation harness measures drafts with the same units,
+shingles and containment. Every function here is pure: it takes Markdown and plain document
+records, and does no I/O.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from arkive_rag.models import fold_for_quote
+from arkive_rag.models import ClusterHolder, UnitCluster, fold_for_quote
 
 # Shorter prose is a phrase, not a passage worth reproducing.
 STANDING_MIN_WORDS = 8
@@ -23,6 +25,8 @@ STANDING_SHINGLE_WORDS = 4
 # Share of a unit's 4-grams a section of another document must hold. Standing blocks measured
 # 0.8 to 1.0 between projects, so light edits such as a changed year still count as recurrence.
 STANDING_RECURRENCE_CONTAINMENT = 0.8
+# A holder's sample of a recurring prose unit is at most this many folded words.
+RECURRING_SAMPLE_WORDS = 16
 
 WORD = re.compile(r"\w+")
 _MARKDOWN_HEADING_LINE = re.compile(r"#{1,6}\s")
@@ -177,85 +181,114 @@ def containment(part: frozenset[tuple[str, ...]], whole: frozenset[tuple[str, ..
     return len(part & whole) / len(part)
 
 
-# Recurring candidates.
+# Recurring units.
 
 
 @dataclass(frozen=True)
-class ExemplarSection:
+class TextSection:
     section_id: str
     markdown: str
 
 
 @dataclass(frozen=True)
-class ExemplarDocument:
-    """One exemplar document as candidate discovery reads it: its sections in reading order."""
+class TextDocument:
+    """One document as recurrence reads it: its sections in reading order."""
 
     doc_id: str
     rel_path: str
-    sections: tuple[ExemplarSection, ...]
-
-
-def _top_folder(rel_path: str) -> str:
-    """The first path component, or "" for a document at the corpus root."""
-    return rel_path.split("/")[0] if "/" in rel_path else ""
+    sections: tuple[TextSection, ...]
 
 
 @dataclass(frozen=True)
 class _PlacedUnit:
-    doc: ExemplarDocument
-    section_id: str
+    doc_index: int
+    section_index: int
     unit: StandingUnit
     # `fold_for_quote` of the text, or of the header row alone for a table header.
     folded: str
-    grams: frozenset[tuple[str, ...]]
+    grams: frozenset[int]
 
     def says_the_same_as(self, other: _PlacedUnit) -> bool:
         if self.unit.header or other.unit.header:
             return self.unit.header == other.unit.header and self.folded == other.folded
         return self.folded == other.folded or (
-            containment(self.grams, other.grams) >= STANDING_RECURRENCE_CONTAINMENT
-            and containment(other.grams, self.grams) >= STANDING_RECURRENCE_CONTAINMENT
+            _held(self.grams, other.grams) and _held(other.grams, self.grams)
         )
 
 
-@dataclass(frozen=True)
-class StandingCandidate:
-    """A recurring block of exemplar text. `text` is exactly as in `citations[0]`, the first
-    holder in canonical order; the other citations are the sections of other exemplar
-    documents where it recurs, in canonical order."""
-
-    candidate_id: str
-    text: str
-    citations: tuple[str, ...]
+def _held(part: frozenset[int], whole: frozenset[int]) -> bool:
+    return len(part & whole) / len(part) >= STANDING_RECURRENCE_CONTAINMENT
 
 
-def standing_candidates(documents: Sequence[ExemplarDocument]) -> tuple[StandingCandidate, ...]:
-    """The recurring units of a deliverable type's exemplar documents.
+def _hashed(grams: frozenset[tuple[str, ...]]) -> frozenset[int]:
+    # In-process hashes only test membership; no result depends on their values or order.
+    return frozenset(map(hash, grams))
+
+
+def _probe_count(size: int) -> int:
+    """How many of a unit's `size` 4-grams to look up so that every section holding at least
+    `STANDING_RECURRENCE_CONTAINMENT` of them holds one of the looked-up ones: such a section
+    misses at most `size - needed` grams."""
+    needed = math.ceil(size * STANDING_RECURRENCE_CONTAINMENT)
+    while needed > 1 and (needed - 1) / size >= STANDING_RECURRENCE_CONTAINMENT:
+        needed -= 1
+    while needed / size < STANDING_RECURRENCE_CONTAINMENT:
+        needed += 1
+    return size - needed + 1
+
+
+def fold_unit(text: str) -> str:
+    """A prose unit's text as recurrence compares it: without its leading list marker
+    (`LIST_MARKER`), then `fold_for_quote`, so items numbered differently in two documents
+    still say the same thing."""
+    marker = LIST_MARKER.match(text)
+    return fold_for_quote(text[marker.end() :] if marker else text)
+
+
+def recurring_units(documents: Sequence[TextDocument]) -> tuple[UnitCluster, ...]:
+    """The text units of `documents` that recur in another document, grouped into clusters.
 
     Canonical order is document path (compared component by component, as corpus discovery
     orders files), then each document's sections in the order given, then position in the
     section; the order of `documents` does not matter, and a document ID may appear once.
     Document IDs are path hashes, so ordering by ID would scramble the path order. A unit
-    (`standing_units`) is eligible with at least `STANDING_MIN_WORDS` words, or as a table
-    header row of at least `STANDING_MIN_TABLE_COLUMNS` columns. It
-    recurs in a section of another document that holds at least
-    `STANDING_RECURRENCE_CONTAINMENT` of its word 4-grams, or, for a table header, that has a
-    table header with the same folded row. When the documents span more than one top-level
-    folder, that document must sit under another top-level folder than the unit's own: the
-    folder is the only sign of a different project the code has. Recurring units that say the
-    same thing (the same folded text, or containment at the threshold both ways) are one
-    candidate, represented by the first in canonical order.
+    (`standing_units`) is eligible with at least `STANDING_MIN_WORDS` words after `fold_unit`,
+    or as a table header row of at least `STANDING_MIN_TABLE_COLUMNS` columns. A section holds
+    a unit when it holds at least `STANDING_RECURRENCE_CONTAINMENT` of the unit's word 4-grams,
+    counting the 4-grams of its whole text without visual transcripts and of its own units,
+    or, for a table header, when it has a table header with the same folded row. A visual
+    transcript describes a figure, so its words never make a section hold prose. Where
+    documents sit plays no part.
+
+    Units that say the same thing (the same folded text, or containment at the threshold both
+    ways) are linked, and a cluster is everything linked to everything else, directly or
+    through other units: a chain of light edits across several documents is one cluster even
+    when its two ends differ more than the threshold allows. A cluster's sections are every
+    section of its units and every section holding one of them, its own document's included;
+    it is kept when they lie in two documents or more. It is represented by its first unit in
+    canonical order, whose section comes first among its document's sections; the others follow
+    in canonical order. Clusters are numbered from 1 in the order of their representatives.
+
+    Each holder of a prose cluster carries a sample: at most `RECURRING_SAMPLE_WORDS` words of
+    the cluster as that section writes it, after `fold_unit`, so a line-end hyphen is joined
+    and a list marker gone. A section with its own unit of the cluster gives that unit's first
+    words; a section holding a unit inside other text gives the words it shares with it
+    (`_held_sample`). A table header row has no sample.
+
+    An inverted index of 4-grams finds the sections that could hold a unit by looking up only
+    its rarest grams (`_probe_count`), so the search stays near linear in corpus size and still
+    finds every section that holds the unit.
     """
     docs = sorted(documents, key=lambda d: (d.rel_path.split("/"), d.doc_id))
     ids = [d.doc_id for d in docs]
     if len(set(ids)) != len(ids):
-        raise ValueError(f"exemplar document IDs repeat: {ids}")
-    spans_folders = len({_top_folder(d.rel_path) for d in docs}) > 1
-    sections = [(doc, s) for doc in docs for s in doc.sections]
-    section_grams = {s.section_id: shingles(fold_for_quote(s.markdown)) for _, s in sections}
+        raise ValueError(f"document IDs repeat: {ids}")
+    sections = [(i, s) for i, doc in enumerate(docs) for s in doc.sections]
     placed: list[_PlacedUnit] = []
-    for doc, section in sections:
+    header_sections: dict[str, set[int]] = {}
+    for index, (doc_index, section) in enumerate(sections):
         for unit in standing_units(section.markdown):
+            grams: frozenset[int] = frozenset()
             if unit.header:
                 header = unit.text.splitlines()[0]
                 if len(_table_cells(header)) < STANDING_MIN_TABLE_COLUMNS:
@@ -263,38 +296,131 @@ def standing_candidates(documents: Sequence[ExemplarDocument]) -> tuple[Standing
                 folded = fold_for_quote(header)
                 if not folded:
                     continue
+                header_sections.setdefault(folded, set()).add(index)
             else:
-                folded = fold_for_quote(unit.text)
+                folded = fold_unit(unit.text)
                 if len(WORD.findall(folded)) < STANDING_MIN_WORDS:
                     continue
-            placed.append(_PlacedUnit(doc, section.section_id, unit, folded, shingles(folded)))
-    headers: dict[str, set[str]] = {}
+                grams = _hashed(shingles(folded))
+            placed.append(_PlacedUnit(doc_index, index, unit, folded, grams))
+    # What a section carries: its whole text folded (tables and headings included, visual
+    # transcripts removed) together with its own units' grams. Folding the whole text joins
+    # a line-end hyphen with the next unit's first word, so neither form alone holds every
+    # gram the other does; with both, every unit's grams lie in its own section's grams and
+    # in those of every section holding the same text.
+    unit_grams: dict[int, list[frozenset[int]]] = {}
     for p in placed:
+        unit_grams.setdefault(p.section_index, []).append(p.grams)
+    section_grams = [
+        _hashed(shingles(fold_for_quote(without_visual_transcripts(s.markdown)))).union(
+            *unit_grams.get(index, ())
+        )
+        for index, (_, s) in enumerate(sections)
+    ]
+    postings: dict[int, list[int]] = {}
+    for index, held in enumerate(section_grams):
+        for gram in held:
+            postings.setdefault(gram, []).append(index)
+
+    def holders(p: _PlacedUnit) -> set[int]:
+        """Every section other than the unit's own that holds it."""
         if p.unit.header:
-            headers.setdefault(p.section_id, set()).add(p.folded)
+            return header_sections[p.folded] - {p.section_index}
+        probes = sorted(p.grams, key=lambda g: len(postings.get(g, ())))
+        return {
+            c
+            for g in probes[: _probe_count(len(p.grams))]
+            for c in postings.get(g, ())
+            if c != p.section_index and _held(p.grams, section_grams[c])
+        }
 
-    def recurrences(p: _PlacedUnit) -> tuple[str, ...]:
-        found: list[str] = []
-        for doc, section in sections:
-            sid = section.section_id
-            if doc.doc_id == p.doc.doc_id or (
-                spans_folders and _top_folder(doc.rel_path) == _top_folder(p.doc.rel_path)
-            ):
+    where = [holders(p) for p in placed]
+    by_section: dict[int, list[int]] = {}
+    for n, p in enumerate(placed):
+        by_section.setdefault(p.section_index, []).append(n)
+    parent = list(range(len(placed)))
+
+    def root(n: int) -> int:
+        while parent[n] != n:
+            parent[n] = parent[parent[n]]
+            n = parent[n]
+        return n
+
+    for n, p in enumerate(placed):
+        # A unit that says the same as `p` lies in a section holding `p`, or in its own.
+        for c in sorted({p.section_index, *where[n]}):
+            for m in by_section.get(c, ()):
+                a, b = root(n), root(m)
+                if a != b and p.says_the_same_as(placed[m]):
+                    parent[max(a, b)] = min(a, b)
+    members: dict[int, list[int]] = {}
+    for n in range(len(placed)):
+        members.setdefault(root(n), []).append(n)
+    clusters: list[UnitCluster] = []
+    for group in members.values():
+        rep = placed[group[0]]
+        holding = {placed[n].section_index for n in group}.union(*(where[n] for n in group))
+        if len({sections[c][0] for c in holding}) < 2:
+            continue
+        ordered = sorted(holding, key=lambda c: (sections[c][0], c != rep.section_index, c))
+        # Per holding section, its first own unit of the cluster and the first unit it holds.
+        own_unit: dict[int, _PlacedUnit] = {}
+        held_unit: dict[int, _PlacedUnit] = {}
+        for n in group:
+            own_unit.setdefault(placed[n].section_index, placed[n])
+            for c in where[n]:
+                held_unit.setdefault(c, placed[n])
+        cluster_holders: list[ClusterHolder] = []
+        for c in ordered:
+            sample: str | None = None
+            if not rep.unit.header:
+                sample = (
+                    " ".join(WORD.findall(own_unit[c].folded)[:RECURRING_SAMPLE_WORDS])
+                    if c in own_unit
+                    else _held_sample(held_unit[c].grams, sections[c][1].markdown)
+                )
+            cluster_holders.append(
+                ClusterHolder(section_id=sections[c][1].section_id, sample=sample)
+            )
+        clusters.append(
+            UnitCluster(
+                cluster_id=len(clusters) + 1,
+                kind="table_header" if rep.unit.header else "prose",
+                text=rep.unit.text,
+                holders=tuple(cluster_holders),
+            )
+        )
+    return tuple(clusters)
+
+
+def _held_sample(grams: frozenset[int], markdown: str) -> str:
+    """The sample of a prose unit with 4-grams `grams` for a section, of Markdown `markdown`,
+    that holds the unit inside other text, such as one sentence of a longer paragraph, and has
+    no unit of the cluster itself (that section's sample is its own unit's first words).
+
+    The sample is the longest run of words in which every 4-gram is one of `grams`, cut to
+    `RECURRING_SAMPLE_WORDS`, so it never runs on into the section's own words. The run is
+    looked for in the section's units after `fold_unit`, then in its whole text without visual
+    transcripts, which is taken only when its run is longer, as when the unit spans two of the
+    section's units. A holder holds at least `STANDING_RECURRENCE_CONTAINMENT` of `grams` in
+    one of those forms, so a run always exists.
+    """
+    n = STANDING_SHINGLE_WORDS
+    best: list[str] = []
+    candidates = [
+        *(WORD.findall(fold_unit(u.text)) for u in standing_units(markdown) if not u.header),
+        WORD.findall(fold_for_quote(without_visual_transcripts(markdown))),
+    ]
+    for words in candidates:
+        start = 0
+        for i in range(len(words) - n + 2):
+            if i <= len(words) - n and hash(tuple(words[i : i + n])) in grams:
                 continue
-            if p.unit.header:
-                held = p.folded in headers.get(sid, ())
-            else:
-                held = containment(p.grams, section_grams[sid]) >= STANDING_RECURRENCE_CONTAINMENT
-            if held:
-                found.append(sid)
-        return tuple(found)
-
-    groups: list[tuple[_PlacedUnit, tuple[str, ...]]] = []
-    for p in placed:
-        where = recurrences(p)
-        if where and not any(p.says_the_same_as(holder) for holder, _ in groups):
-            groups.append((p, where))
-    return tuple(
-        StandingCandidate(f"candidate_{n:02d}", holder.unit.text, (holder.section_id, *where))
-        for n, (holder, where) in enumerate(groups, start=1)
-    )
+            # The 4-grams from `start` to `i - 1` are all shared; they cover the words from
+            # `start` to `i + n - 2`.
+            if i > start and i - start + n - 1 > len(best):
+                best = words[start : i + n - 1]
+            start = i + 1
+    if not best:
+        raise AssertionError("a holder of a recurring unit shares none of its 4-grams")
+    return " ".join(best[:RECURRING_SAMPLE_WORDS])

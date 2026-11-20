@@ -43,35 +43,43 @@ With `--max-cost 5` (a positive finite number of USD), the next provider attempt
 is blocked once estimated spend reaches USD 5. The build then stops with an
 error; if its last request takes the estimate past the limit, it finishes normally.
 Calls already in flight can take the total past the limit, and the estimate ignores the long-context
-surcharge. `--trace` sends traces of agent runs to the OpenAI dashboard (off by
-default); it fails if `OPENAI_AGENTS_DISABLE_TRACING` is set to `1` or `true`
-(in any letter case).
+surcharge.
 
-The build reads the corpus and produces filter facets, a cited glossary and
-blueprints for recurring deliverable types. A blueprint includes an outline,
-conventions, reviewer pitfalls and standing passages of house text. `inspect`
-prints the facet names and values, glossary and blueprints. See the
+The build reads the corpus and produces filter facets, a canonical
+deliverable type for every document (with the types a feedback document
+reviews), version families of drafts and copies, reviewer lessons from
+feedback documents, the text units that recur across documents, and a cited
+glossary. Every induction prompt stays within about 30k tokens however large
+the corpus, and no step caps the number of deliverable types. `inspect` prints
+the facets, glossary, deliverable types, version families, feedback lessons
+and build report. See the
 [build pipeline](docs/architecture.md#build-pipeline) for the induction and
 validation rules. `search` and `grep` take repeated `--filter FACET=VALUE`
 (a canonical value or an alias; several facets combine with AND), and the MCP
 tools `list_documents`, `search` and `grep` take the same `filters` mapping.
 An `AGENTS.md` anywhere in the corpus is a curator note: it guides induction,
-appears in the topic guide and is searchable. The guide, glossary and
-blueprints never cite it; an agent answering a question from a note cites it
+appears in the topic guide and is searchable. The guide, glossary and lessons
+never cite it; an agent answering a question from a note cites it
 like any other document. With `--cache`, rebuilding an unchanged corpus makes
 no provider calls and renders no page again. A document's ID is a hash of its
 path, so adding or moving another file leaves it unchanged. Snapshots use
-schema `5.0`. Rebuild older snapshots from their corpus.
+schema `6.0`. Rebuild older snapshots from their corpus.
 
 The MCP server has ten tools. `get_topic_guide` returns the guide, curator
-notes, facets, glossary terms and a summary of each blueprint;
-`get_blueprint(topic, deliverable_type)` returns one blueprint in full. Its
-instructions tell a drafting agent to follow the blueprint, take every
-project-specific fact from the user's inputs, reproduce the standing passages
-word for word without commentary on their origin (adapting or leaving out a
-passage that holds a project fact the user did not give, since the user's
-inputs take precedence), and reuse corpus names and references only from
-those passages.
+notes, facets, glossary terms and the deliverable types with their counts.
+`prepare_draft(topic, project_inputs, deliverable_type, filters)` returns a
+drafting packet of at most 45,000 bytes: up to three prior exemplars ranked
+against the user's inputs, each with its complete outline and as much whole
+section text as fits, other candidates, reviewer lessons, curator notes and
+drafting guidance. Each section reports, as provenance, how many independent
+version families share its recurring text, so the agent can tell established
+house text from a clause one project used. It ranks with BM25 alone when the
+server has no `OPENAI_API_KEY`. `list_documents` returns pages of at most 100
+documents, and `search` shows at most three chunks of one version family
+before it fills the list with more. Every tool result is one compact JSON
+text block of at most 45,000 bytes and 1,600 lines, below the size at which a
+client such as OpenCode cuts a tool result; a long outline or section comes in
+pages through `get_document_outline` and `read_section` with `offset`.
 
 ## Private corpora, snapshots and eval packs
 
@@ -84,7 +92,8 @@ private store such as a private Git LFS or DVC repository, or a private bucket:
 - snapshots, named `<topic>-<corpus_fingerprint[:12]>.arkive.db`.
 
 `arkive-rag inspect` prints the snapshot's `corpus_fingerprint`, the
-`arkive_version` that wrote it, its facets, glossary, blueprints, build
+`arkive_version` that wrote it, its facets, glossary, deliverable types,
+version families, feedback lessons, the number of recurring units, build
 settings and build report, and the `sha256` of every source document. The
 fingerprint depends only on source paths and bytes, so you can check at any
 time that a snapshot, a corpus folder and an eval pack belong together.
@@ -115,7 +124,10 @@ contamination.
 Layers 2 and 3 need `--corpus`, whose files must still match the snapshot's
 `corpus_fingerprint`; `--cache` reuses a build cache for the holdout snapshots
 and must not overlap `--out`.
-`--max-cost` and `--trace` work as in `build`, and the usage and estimated cost
+`--max-cost` works as in `build`; `--trace` sends traces of the agent runs to
+the OpenAI dashboard (off by default), and fails if
+`OPENAI_AGENTS_DISABLE_TRACING` is set to `1` or `true` (in any letter case).
+The usage and estimated cost
 of the run are written to `results.json` and `report.md`. Before it creates
 any output or build cache or calls any model, the runner checks the pack, the
 snapshot, the retrieval filters and expected documents, the Q&A source anchors

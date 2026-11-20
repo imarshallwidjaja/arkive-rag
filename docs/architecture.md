@@ -6,28 +6,31 @@ snapshot calls OpenAI models. Reading one needs no network, except that the
 `search` tool embeds each query with the OpenAI embedding model.
 
 The build does not assume how a collection is organised. It reads every
-document, induces from the whole corpus the facets an agent can filter by, a
-cited glossary and a blueprint for each recurring deliverable type, and stores
-them in the snapshot next to the sections, pages and chunks.
+document, induces from the whole corpus the facets an agent can filter by,
+each document's canonical deliverable type and feedback role, version families,
+reviewer lessons, recurring text units and a cited glossary, and stores them in
+the snapshot next to the sections, pages and chunks. An agent drafting a new
+deliverable asks the server for a drafting packet: ranked prior exemplars with
+their text and the factual provenance of that text.
 
 ## Modules
 
 | Module | Owns |
 | --- | --- |
-| `models.py` | Domain types (readings, observation cards, facets, glossary entries, blueprints, the build report, read results), the provider output schemas, the shared text folding (`fold_text`, `fold_for_quote`), and the `ArkiveError` hierarchy. |
-| `llm.py` | The request protocols (`StructuredRequest`, `AgentRequest`), the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Agents SDK runs, Decisions, embeddings, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
+| `models.py` | Domain types (readings, observation cards, facets, document roles, feedback lessons, recurring units, glossary entries, the build report, read results and the drafting packet), the provider output schemas, the shared text folding (`fold_text`, `fold_for_quote`, `heading_context`), and the `ArkiveError` hierarchy. |
+| `llm.py` | The `StructuredRequest` protocol, the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Decisions, embeddings, the evaluation harness's agent conversations, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
 | `compiler.py` | Reading (discovery, rendering, the transcription fidelity gate, section stitching, chunk pieces, observation cards with quote location) and binding (IDs, breadcrumbs, embeddings). `compile_corpus` composes reading, induction and binding into a `CompiledCorpus`. Its request types (`PageTranscription`, `ObserveSections`, `ConsolidateCard`) own their prompts, output schemas and reasoning efforts. |
-| `induction.py` | Induction: corpus organisation, facet binding, the glossary, blueprints and the topic guide; the validate-and-retry helper `generate_checked`; support checks; the read-only source tools of the blueprint agent. Its request types (`OrganiseCorpus`, `WriteGlossary`, `WriteBlueprint`, `WriteGuide`) own their prompts, schemas and efforts. |
-| `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what a visual transcript is and its removal (`without_visual_transcripts`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a set of exemplar documents recur (`standing_candidates`, over plain `ExemplarDocument` records). Induction's blueprint step and the evaluation harness both measure text with it. |
-| `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup). |
+| `induction.py` | Induction: corpus organisation in bounded batches, type canonicalisation, facet binding, version families, feedback lessons, the glossary and the topic guide; the validate-and-retry helper `generate_checked`; support checks. Its request types (`OrganiseCorpus`, `CanonicaliseTypes`, `ExtractFeedbackLessons`, `WriteGlossary`, `WriteGuide`) own their prompts, schemas and efforts. |
+| `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what a visual transcript is and its removal (`without_visual_transcripts`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a corpus recur (`recurring_units`, over plain `TextDocument` records). Induction, the drafting packet and the evaluation harness all measure text with it. |
+| `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup, document pages and the drafting packet). |
 | `server.py` | `TopicCatalog` (open snapshots keyed by topic), the ten MCP tools and the server instructions. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
 
 Dependencies point one way: `cli` → `server` → `snapshot`, and `cli` →
-`compiler` → `induction` → `llm`, with `induction` → `passages`; every module
-uses `models`, and `passages` imports nothing else of the package. `snapshot` and
-`server` import neither `compiler`, `induction` nor `llm`; the CLI passes the
-query embedder in. The compiler and induction receive a `LanguageGateway`, so
+`compiler` → `induction` → `llm`, with `induction` → `passages` and `snapshot` →
+`passages`; every module uses `models`, and `passages` imports nothing else of
+the package. `snapshot` and `server` import neither `compiler`, `induction` nor
+`llm`, and make no model call apart from the query embedder the CLI passes in. The compiler and induction receive a `LanguageGateway`, so
 tests drive them with a deterministic fake and no network. Only `llm.py`
 imports the OpenAI SDK and the OpenAI Agents SDK (`openai-agents`).
 
@@ -49,8 +52,9 @@ must be different files outside the corpus directory.
   outranks the model's inference. It is also compiled as a document
   (`is_curator_note`, chunk kind `guidance`), so status questions such as
   "where is the reef case study?" match the note in both `search` and `grep`.
-  Induction cannot cite a curator note: no glossary entry, blueprint or guide
-  citation may point at it, and the blueprint tools cannot read it. An agent
+  Induction cannot cite a curator note: no glossary entry, feedback lesson,
+  recurring unit or guide citation may point at it, and it has no deliverable
+  type of its own beyond its card's. An agent
   answering a question from a note cites its `doc_id` and `section_id` like
   any other document's. A
   path-bound facet value still covers a note in its folder, so a project
@@ -65,8 +69,8 @@ must be different files outside the corpus directory.
 - Documents are ordered by path, compared component by component as discovery
   sorts them. That order, never the hex order of IDs, orders everything a
   prompt, a cache key or a read returns: `list_documents`, `grep`, search
-  ties, the exemplar and feedback IDs of a deliverable type, glossary quotes,
-  craft leads and standing passage candidates.
+  ties, organisation batches, version candidate pairs, glossary quotes,
+  feedback lessons and recurring units.
 
 ## Build pipeline
 
@@ -187,7 +191,9 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    itself (client, author, audience, channel and similar), the terms it uses
    (with kind, aliases and whether the quote defines the term), and craft
    observations (structure, convention, caveat, disclaimer, reviewer
-   feedback, tone). Every term and craft observation carries a verbatim
+   feedback, tone; no induction step reads craft observations now, and they
+   stay in the observation schema so that cached observations stay valid).
+   Every term and craft observation carries a verbatim
    quote, never a section number. Code locates each quote in the batch's
    sections with `fold_for_quote` (NFKC, case, Unicode dashes, whitespace,
    `*` and `_` emphasis, backticks, table pipes, block-quote markers and
@@ -239,55 +245,167 @@ they have no page images for `view_page`. A document with no text raises
 ### Induction
 
 `induce(documents, notes, gateway)` receives the readings with their IDs and
-runs five steps: organise, then bind, then the glossary and the blueprints
-concurrently, then the guide. One executor with `--max-concurrency` workers
-runs the binding questions, the blueprint runs, the glossary batches and the
-definition checks; each task makes one provider call at a time, so the limit
-bounds them together. Results are gathered in submission order, and the first
-failure of any task cancels the tasks not yet started. Every generating step
-goes through
+runs its steps in order: organise, bind, then version families, feedback
+lessons and the glossary on one executor, then the guide. Recurring text units
+are computed in code. One executor with `--max-concurrency` workers runs the
+organisation batches, the binding questions, the version judgements, the
+lesson extractions, the glossary batches and the definition checks; each task
+makes one provider call at a time, so the limit bounds them together. Results
+are gathered in submission order, and the first failure of any task cancels
+the tasks not yet started. Every generating step goes through
 `generate_checked`: run, validate, rerun once with the rejections appended to
 the request, then raise `RejectedOutputError`. Only three outcomes reduce the
-output without failing, and the build report counts each: an observation
-whose quote is still unlocated after its rerun, a glossary definition the
-support check does not confirm, and a blueprint convention or pitfall it does
+output without failing, and the build report counts each: an observation or
+feedback lesson whose quote is still unlocated after its rerun, a glossary
+definition the support check does not confirm, and a feedback lesson it does
 not confirm.
 
-1. **Organise** (`organise_corpus`, medium effort). The request holds the
-   folder tree, the curator notes and every citable document's card. The
-   model returns up to six facets and up to eight recurring deliverable types
-   (each type costs one blueprint run). A facet has a snake_case name, a description and a closed
-   list of values, each with a description and aliases. A facet is
-   *path-bound* when every value names the corpus folders it stands for, or
-   *content-bound* when no value names a folder. Values and aliases are
-   compared by `fold_facet_label`, the folded form the snapshot's alias table
-   and the filter resolver use. Repetition within one value is normalised:
-   values and aliases are stripped, blank aliases dropped and one alias kept
-   per folded form. Validation rejects a facet that mixes the two bindings,
-   an unknown folder, a duplicate facet name, a blank value, a value given
-   twice, a folded form that names two values of one facet, more than six
-   facets, more than eight deliverable types, and a deliverable type with no
-   exemplar, with an unknown document ID, or with a document that is both
-   its exemplar and its feedback document. An organisation that passes is
-   always storable. A
-   path-bound value also answers to the paths of its folders, unless a path
-   already names a value of the facet or belongs to several values.
+Every induction prompt, instructions and request text together, stays within
+90,000 characters (`MAX_PROMPT_CHARS`, about 30k tokens) on a corpus of any
+size, on the first run and on the rerun alike: the limits below are chosen so
+that each request's parts add up to less. A rerun names the rejections one per
+line, each cut to 4,000 characters, as many as fit 6,000 characters
+(`MAX_REJECTION_FEEDBACK_CHARS`), with a count of the rest. Heading paths are
+cut to 500 characters (`heading_context`), and curator notes are shown in path
+order up to 24,000 characters (`MAX_CURATOR_NOTES_PROMPT_CHARS`); a note that
+does not fit is cut with a marker, and `truncated_curator_notes` in the build
+report counts the notes no prompt shows in full. The snapshot stores every
+note verbatim. No step caps how many deliverable types a corpus has.
+
+1. **Organise** (`organise_corpus`, medium effort, then `canonicalise_types`,
+   medium effort). Every citable document becomes a one-line digest:
+   `doc_id | path | format | date | observed type | title | summary |
+   stated attributes`, each field cut (path 160, type 80, title 120, summary
+   180 and attributes 120 characters). Digests are packed in path order into
+   batches of at most 44,000 characters (`MAX_ORGANISE_BATCH_CHARS`), so a
+   corpus of about 150 documents is one batch and a larger one several. Each
+   batch request also holds the curator notes and the folders that hold a
+   document of the batch or no citable document at all, shallowest first, up
+   to 12,000 characters. It returns up to six facets and one entry for every
+   document of the batch: its deliverable type, whether it is feedback, and,
+   for a feedback document, the types of deliverable it reviews. A feedback
+   document keeps its own deliverable type, so it can be drafted as that type.
+   Validation rejects an entry for a document outside the batch, a document
+   given twice or not at all, a blank type, feedback without reviewed types,
+   and reviewed types on a document that is not feedback.
+
+   A facet has a snake_case name, a description and a closed list of values,
+   each with a description and aliases. A facet is *path-bound* when every
+   value names the corpus folders it stands for, or *content-bound* when no
+   value names a folder. Values and aliases are compared by
+   `fold_facet_label`, the folded form the snapshot's alias table and the
+   filter resolver use. Repetition within one value is normalised: values and
+   aliases are stripped, blank aliases dropped and one alias kept per folded
+   form. Validation (`check_facets`) rejects a facet that mixes the two
+   bindings, an unknown folder, a duplicate facet name, a blank value, a value
+   given twice, a folded form that names two values of one facet, and more
+   than six facets. `merge_facets` then joins the batches' facets by name in
+   code: a name proposed path-bound by some batches and content-bound by
+   others keeps the binding more batches proposed (path-bound on a tie) and
+   drops the other proposals; values merge by folded label, keeping the first
+   spelling and description and uniting folders and aliases, with one spelling
+   kept per folded alias (`NM` from one batch and `nm` from another are one
+   alias), and an alias that folds like another value of the facet is
+   dropped. When more than six names
+   remain, those proposed by the most batches are kept. With one batch the
+   result is that batch's facets. A path-bound value also answers to the
+   paths of its folders, unless a path already names a value of the facet or
+   belongs to several values.
+
+   One canonicalisation request then lists every distinct type label the
+   batches used, as a document type or a reviewed type, with its document
+   count, up to three example titles and up to three titles of feedback
+   documents reviewing it (so a label named only as a reviewed type shows what
+   it stands for), while the list fits 60,000 characters
+   (`MAX_TYPE_LABELS_CHARS`); a corpus whose labels alone do not
+   fit is refused with `ArkiveError`. It returns canonical types, each with a
+   name, a description and the labels it covers; every label must belong to
+   exactly one type, and two names may not fold alike. A type held by a single
+   document stays a type of its own. A corpus of one batch is canonicalised
+   all the same, so one code path serves every size.
 2. **Bind.** A path-bound value is assigned to every document under its
    folders, curator notes included. Content-bound values are judged per
    citable document: one `bind_facets` call to the Decisions API whose
-   evidence is the document's path, title, date, deliverable type, summary,
-   attributes and outline, with one predicate per value. A probability of
-   0.5 or more assigns the value; a refused question assigns nothing and is
-   counted. A document may hold several values of a facet or none. Values no
-   document holds are then pruned, and so are facets with fewer than two
-   populated values; the build report names both.
-3. **Glossary** (`write_glossary`, medium effort, structured requests).
+   evidence is the document's path, title, date, observed type, summary,
+   attributes and outline (title, summary and each attribute cut, the
+   attributes at 4,000 characters, headings cut by `heading_context`, the
+   outline cut at 12,000 characters, each with a count of what was left out),
+   with one predicate per value, which quotes the facet's and the value's
+   descriptions cut to 300 characters each. A probability of 0.5 or more assigns the value; a
+   refused question assigns nothing and is counted. A document may hold
+   several values of a facet or none. Values no document holds are then
+   pruned, and so are facets with fewer than two populated values; the build
+   report names both.
+3. **Version families** (`confirm_versions`, `order_versions`). A version
+   family groups drafts, revisions and format exports of one deliverable.
+   Byte-identical citable documents (the same `sha256`) are one family
+   without a question, however short they are; only the first of them in
+   path order takes part in the candidate search. Code proposes candidate
+   pairs of citable documents through two inverted
+   indexes: one of word 4-grams sampled by checksum (one in four), where a
+   pair qualifies when one document holds at least 0.35 of the other's
+   sampled 4-grams, and one of title and file-name words, where two documents
+   of the same canonical type qualify when they share at least 0.6 of those
+   words (two words or more each). A 4-gram or word held by more than 50
+   documents proposes nothing, and a feedback document is never paired with a
+   document that is not feedback: a review quoting what it reviews is another
+   artifact. Each document keeps its six best partners, so
+   pairs grow linearly with the corpus. The Decisions API then judges each
+   pair against compact cards of both documents (path, format, page count,
+   date, canonical type, title, summary and first twelve headings), many
+   pairs per request within one 48,000-character evidence window, with the
+   predicate that the two are "drafts, revisions, or format exports of the
+   exact same deliverable artifact for the exact same engagement and
+   reporting period, not a follow-on phase, a study with a different sensor or
+   method, a periodic installment for another period, or a summary deck
+   paired with a full report". Confirmed pairs (0.5 or more) join into
+   families; a family's ID is its first member in path order.
+
+   In a family of one the document is `sole`. In a larger family, among the
+   distinct members (the first of byte-identical copies in path order), dates
+   decide when every member has a date of the same precision and one is
+   strictly latest; otherwise the decision model is asked, for each ordered
+   pair, whether one is "a later, more final version superseding" the other,
+   and a member that supersedes every other (each forward answer at least 0.5,
+   each reverse answer below it) is `latest`. Every other member, copies
+   included, is `superseded` with `superseded_by` naming the latest member, in
+   one step. Without such a member, or with more than twelve distinct members,
+   every distinct member is `unordered` (the build does not guess an order),
+   and a later byte-identical copy is `superseded` by its first copy.
+4. **Feedback lessons** (`extract_feedback_lessons`, low effort). They run
+   after version families: a superseded feedback document (an earlier draft
+   or a copy of a review) gives no lessons. Each other feedback document's
+   sections are packed into batches whose rendered sections, each labelled
+   with its section ID and heading, take at most 24,000 characters; a larger
+   section is cut at line breaks with its lines in order, and a piece that
+   starts inside a table (with or without outer pipes) repeats the table's
+   header and separator rows when they leave room for a row. Each batch is one
+   structured request that returns transferable lessons: a statement and a
+   verbatim quote of an accepted or resolved reviewer criticism, without
+   project-specific values. Quotes are located with `fold_for_quote`; a lesson
+   with a blank statement or an unlocated quote gets one rerun that names it,
+   and is then discarded and counted in `discarded_unlocated_quotes`. As for
+   observations, a batch that proposed lessons and located none is a broken
+   reading, and so is its rerun when it proposes none. The support check
+   (`check_feedback_lessons`) asks whether the section records a reviewer
+   point the authors accepted or resolved, not one they rejected, left
+   unchanged or ruled out of scope; it judges all lessons of one section
+   together, one request per evidence window, and drops and counts the
+   unsupported ones in `dropped_feedback_lessons`. A stored lesson names its
+   source document, its section and the document's reviewed types.
+5. **Glossary** (`write_glossary`, medium effort, structured requests).
    Code merges term observations by folded term and alias, keeps a term seen
    in two or more sections or quoted where a document defines it, and scans
    the other citable sections for further occurrences (up to six snippets,
-   case-folded). A term's name, aliases and quotes are chosen in a total
-   order (most frequent name, ties broken by folded then literal text), so
-   the same observations in any order give the same request. Terms are sent
+   case-folded, each at most 360 characters from 120 before the match,
+   however long the matched alias). A term keeps at most twelve quotes
+   (`MAX_QUOTES_PER_TERM`), defining quotes first, each group in path order;
+   each quote is shown cut to 600 characters, its kind to 80, and at most
+   twelve aliases of up to 120 characters each in an alias list cut to 600,
+   so a term found in hundreds of documents stays a bounded entry. A term's name, aliases and quotes are
+   chosen in a total order (most frequent name, ties broken by folded then
+   literal text), so the same observations in any order give the same
+   request. Terms are sent
    in batches with their quotes and snippets, each tagged with its section
    ID. Each entry has a term, kind, aliases and
    one or more senses; a sense has a definition, or `null` when the cited
@@ -301,95 +419,70 @@ not confirm.
    definition; below 0.5 or refused, the definition becomes `null` and is
    counted. `unsupported_definitions` counts proposed definitions demoted by
    this check, not senses the generator already left null.
-4. **Blueprints** (`write_blueprint`, medium effort, one Agents SDK run of
-   at most 12 turns per recurring deliverable type). The agent reads the
-   citable documents through three read-only tools, `outline`,
-   `read_section` and `grep`, which refuse an argument that is not a string;
-   its request lists the exemplars' outlines, the feedback documents and,
-   as leads the agent must verify in the source before using, the craft
-   observations located in those documents (aspect, statement, section ID),
-   in sorted order, and the type's standing passage candidates (below). It
-   returns a description, a section outline (heading, purpose, citations),
-   conventions and reviewer pitfalls (statement, citations), stated without
-   project-specific values, and the standing passages it selects (candidate
-   ID and label). The blueprint's exemplar documents are the organisation
-   step's exemplars of the type. Validation requires a non-empty outline,
-   citations of the outline, conventions and pitfalls that resolve to
-   citable sections, and standing passage selections that name a listed
-   candidate, each at most once, with a non-blank label. `check_blueprint`
-   then asks the Decisions API whether the cited sections support each
-   convention and pitfall; unsupported or refused ones are dropped and
-   counted.
-
-   A standing passage is house text: organisation or tool background, method
-   references, reference entries, acknowledgements, disclaimers, disclosures,
-   standard table headers and standing caveats. Code computes the candidates
-   (`standing_candidates` in `passages.py`, no provider call) from the Markdown
-   of the type's exemplar sections:
-
-   - A *unit* is a paragraph, one item of a list (a list marker,
-     `LIST_MARKER`, starts an item: `-`, `*`, `+`, a number followed by `.` or
-     `)`, or one of the bullet glyphs PDF text layers carry, U+2022, U+25E6,
-     U+25AA, U+2023, U+2043 and U+F0B7, the Private Use Area bullet of Word's
-     Symbol font; an unmarked line right after it continues it), or a table's
-     header row with its separator row. A table starts at a line opening with
-     `|`, or at a line holding `|` right above a separator row (a table without
-     outer pipes); such a starting line is never a list item, whatever its
-     first character. A table whose first line opens with `|` runs through the
-     following lines that hold `|` and are not list items; a table without
-     outer pipes runs through every following line that holds `|`. A block quote that is not a visual transcript is a paragraph. Headings,
-     visual transcripts (`> **[Visual` blocks), fenced blocks and table body
-     rows are not units. A unit's text keeps its inner bytes, such as the
-     trailing spaces of a hard line break; only the whole unit is stripped.
-   - A unit is eligible with at least 8 words (`STANDING_MIN_WORDS`, counted
-     after `fold_for_quote`), or as a table header row of at least two
-     columns (`STANDING_MIN_TABLE_COLUMNS`).
-   - A unit *recurs* in a section of another exemplar document that holds at
-     least 0.8 (`STANDING_RECURRENCE_CONTAINMENT`) of the unit's word 4-grams
-     after `fold_for_quote`, so light wording drift still counts; a table
-     header recurs in a section with a table header of the same folded row.
-     When the exemplars span more than one top-level folder, that document
-     must sit under a different top-level folder than the unit's own; when
-     they share one folder or sit at the corpus root, another document is
-     enough.
-   - Recurring units that say the same thing (the same folded text, or
-     containment of at least 0.8 both ways) are one candidate. Its text is
-     the first such unit in canonical order (document, section ordinal,
-     position in the section), exactly as it appears there; its citations
-     are that section, then every section where that unit recurs, in
-     canonical order. Candidates are numbered `candidate_01`, ... in that
-     order.
-
-   The request lists at most 60 candidates (`MAX_STANDING_CANDIDATES`,
-   `offered_candidates`), each with its ID, citations and full text, so
-   candidates are covered by the request's cache key and the request stays
-   bounded. When more are found, it keeps those that recur in the most
-   exemplar documents, ties in canonical order; the kept candidates stay in
-   canonical order with their IDs, and the request says how many were found
-   and how many it lists. A type with one
-   exemplar, or with no recurring unit, has no candidates, and the request
-   says which. A stored passage takes its text and citations from the
-   candidate, in candidate order, so it is exemplar text by construction. When
-   holders' wording differs within the recurrence threshold, the stored text
-   uses the first holder in canonical document order.
-
-   What recurrence proves is limited. The code checks that the text of one
-   exemplar section recurs in another exemplar document, under a different
-   top-level folder when the exemplars span folders. It cannot know that two
-   folders are different projects, or that a recurring sentence is free of
-   project facts: two projects for one client can share the client's name.
-   The agent is instructed to leave out candidates specific to one project,
-   client, place, period or result, and the drafting instructions let the
-   user's inputs take precedence over a passage. The outline, conventions
-   and pitfalls stay generic, and standing passages are the only source text
-   a blueprint holds.
-5. **Guide** (`write_guide`, medium effort). A cited Markdown overview from
-   the cards, the bound facets, the glossary terms, the blueprint summaries
-   and the curator notes. Every bracketed `[doc_...]` token must have the exact
-   form `[doc_a1b2c3d4e5:doc_a1b2c3d4e5_sec_001]`, the section belonging to the
-   document named before it, and resolve to a section of a citable
-   document, and at least one valid citation is required when such a section
-   exists. A corpus with no citable section (curator notes only) gets a guide
+6. **Recurring units** (`recurring_units` in `passages.py`, no provider
+   call), over the deliverables only: a feedback document quoting a flawed
+   paragraph does not make it house text. A *unit* of section Markdown (`standing_units`) is a paragraph, one
+   item of a list (a list marker, `LIST_MARKER`, starts an item: `-`, `*`,
+   `+`, a number followed by `.` or `)`, or one of the bullet glyphs PDF text
+   layers carry, U+2022, U+25E6, U+25AA, U+2023, U+2043 and U+F0B7, the
+   Private Use Area bullet of Word's Symbol font; an unmarked line right after
+   it continues it), or a table's header row with its separator row. A table
+   starts at a line opening with `|`, or at a line holding `|` right above a
+   separator row (a table without outer pipes); such a starting line is never
+   a list item. A table whose first line opens with `|` runs through the
+   following lines that hold `|` and are not list items; a table without outer
+   pipes runs through every following line that holds `|`. A block quote that
+   is not a visual transcript is a paragraph. Headings, visual transcripts
+   (`> **[Visual` blocks), fenced blocks and table body rows are not units. A
+   prose unit is folded without its leading list marker (`fold_unit`), so
+   items numbered `1.` and `2.` in two documents compare alike. A unit is
+   eligible with at least 8 words (`STANDING_MIN_WORDS`, counted after
+   `fold_unit`), or as a table header row of at least two columns
+   (`STANDING_MIN_TABLE_COLUMNS`). A section *holds* a unit when it holds at
+   least 0.8 (`STANDING_RECURRENCE_CONTAINMENT`) of its word 4-grams after
+   folding, counting the 4-grams of the section's whole text without visual
+   transcripts together with those of its own units (folding the whole text
+   joins a line-end hyphen with the next unit's first word, so neither form
+   alone holds every 4-gram the other does), or, for a table header, when it
+   has a table header of the same folded row. A visual transcript describes a
+   figure, so it never makes a section hold prose. Where documents sit plays no part. Units that say the same
+   thing (the same folded text, or containment of at least 0.8 both ways) are
+   linked, and a cluster is everything linked directly or through other units,
+   so a chain of light edits across several documents is one cluster even when
+   its ends differ more than the threshold allows. A cluster's sections are
+   every section of its units and every section holding one of them, its own
+   documents' other sections included, each once; it is kept when they lie in
+   two documents or more, and it is represented by its first unit in canonical
+   order (document path, section ordinal, position). An
+   inverted index of 4-grams finds the sections that could hold a unit by
+   looking up only its rarest 4-grams, enough of them that any section
+   holding 0.8 of the unit holds one; so the search stays near linear and
+   still finds every holder. The snapshot stores each cluster's text and
+   every section that holds it.
+7. **Guide** (`write_guide`, medium effort). A cited Markdown overview from
+   the bounded curator notes, the bound facets, each deliverable type with its
+   document and feedback counts, the glossary term names (up to 4,000
+   characters) and a catalog with one entry per citable document:
+   `[doc_id:first_section_id] title (date, type): summary`, followed by up to
+   six of its top-level sections as citation tokens. The catalog fits 60,000
+   characters (`MAX_GUIDE_CATALOG_CHARS`) and the whole request text 72,000
+   (`MAX_GUIDE_TEXT_CHARS`), rerun feedback included: as the corpus grows, entries drop headings, then
+   shorten their summaries and titles, and past that the catalog lists
+   entries in path order and counts the rest. Every bracketed `[doc_...]`
+   token must have the exact form `[doc_a1b2c3d4e5:doc_a1b2c3d4e5_sec_001]`,
+   the section belonging to the document named before it, and resolve to a
+   section of a citable document, and at least one valid citation is required
+   when such a section exists. A guide of more than 16,000 characters
+   (`MAX_GUIDE_MARKDOWN_CHARS`) or 24,000 bytes as a UTF-8 JSON string
+   (`MAX_GUIDE_MARKDOWN_BYTES`, so a control character counts as its
+   six-byte escape) is rejected too, so `get_topic_guide` can return it
+   whole. The rerun's citation rejection, at most 4,000 characters,
+   opens with the repair instruction, then, when the guide named an unknown
+   document or none, fifteen sample catalog tokens, then the valid tokens of
+   the documents it tried to cite, then the invalid tokens it wrote (each cut
+   to 80 characters); a part that does not fit is left out, and never every
+   section of the corpus is listed. The request shows the topic cut to 200
+   characters. A corpus with no citable section (curator notes only) gets a guide
    without citation tokens.
 
 A support check judges the complete cited sections. Evidence longer than
@@ -406,10 +499,15 @@ document holds no value of left out. Every chunk is then embedded as
 `breadcrumb + "\n" + content` with `text-embedding-3-large` at 1,536
 dimensions.
 
+`bind_document` also stores each document's role, which its caller passes:
+the induced canonical deliverable type, feedback role and version family of a
+citable document, or `curator_note_role` for a curator note, which keeps its
+card's type, is no feedback and is a family of its own.
+
 `build` prints the usage line and the build report. The build report has
 `discarded_unlocated_quotes`, `unsupported_definitions`,
-`dropped_blueprint_statements`, `judge_refusals` (per Decisions operation),
-`pruned_facet_values` and `pruned_facets`.
+`dropped_feedback_lessons`, `judge_refusals` (per Decisions operation),
+`pruned_facet_values`, `pruned_facets` and `truncated_curator_notes`.
 
 ## Provider calls
 
@@ -423,22 +521,23 @@ at 1,536 dimensions. The CLI has no model options.
 
 - `run` sends one structured `responses.parse` call with the request's
   `reasoning.effort`.
-- `run_agent` runs a bounded OpenAI Agents SDK agent with read-only tools and
-  structured output on its own event loop with its own async client. Each
-  model turn is one provider operation under the retry policy below; the
-  Agents SDK's own retries stay off. Invalid tool input (`NotFoundError`,
-  `InvalidFilterError`, `ValueError` or `KeyError`) and a call to a tool name
-  the agent does not have go back to the model as text. Not finishing within
-  `max_turns`, a response that is not `completed`, or a provider or
-  spend-limit error raises `ProviderError`; any other tool exception,
-  including `SnapshotIntegrityError` and a `ProviderError` from a tool, ends
-  the run and propagates. Tools use non-strict JSON schemas.
 - `judge` asks the Decisions API (`POST /v1/decisions`) one `predicate`
   question per statement over shared evidence and returns one probability
   per predicate in order, `None` where the model refused that question. No
-  predicates means no request; more than 400 are split across requests.
-- `converse` is the free-text agent conversation the evaluation harness uses
-  (see Evaluation). It runs on the caller's event loop and is never cached.
+  predicates means no request. Predicates go in order in requests of at most
+  400 questions whose evidence and questions together hold at most 90,000
+  characters (`MAX_JUDGE_REQUEST_CHARS`); evidence that leaves no room for a
+  question is a `ValueError` before any request.
+- `converse` is the free-text OpenAI Agents SDK conversation the evaluation
+  harness uses (see Evaluation). It runs on the caller's event loop with its
+  own async client and is never cached. Each model turn is one provider
+  operation under the retry policy below; the Agents SDK's own retries stay
+  off. Invalid tool input (`NotFoundError`, `InvalidFilterError`, `ValueError`
+  or `KeyError`) and a call to a tool name the agent does not have go back to
+  the model as text. Not finishing within `max_turns`, a response that is not
+  `completed` or a provider error ends the conversation with that status; the
+  spend limit and any other tool exception propagate. Tools use non-strict
+  JSON schemas.
   Its `Conversation.tool_calls` lists every call to one of its tools in
   invocation order as a `ToolCall`: the tool name, the argument text as the
   model sent it (cut at 2,000 characters with a marker giving the full
@@ -464,7 +563,7 @@ at 1,536 dimensions. The CLI has no model options.
 - A structured response that stops at `max_output_tokens` (starting at
   16,384) is retried once with double the budget. Agent turns allow 16,384
   output tokens.
-- A refusal in a structured or agent response raises `ProviderError`; a
+- A refusal in a structured response raises `ProviderError`; a
   Decisions refusal returns `None` for that question. Other failures, a body
   that is not JSON, missing or malformed usage, or output that fails schema
   validation raise `ProviderError`. A `judge` probability that is not a
@@ -479,13 +578,6 @@ keyed by SHA-256 of the call's inputs:
 
 - `run`: operation, model, effort, instructions, text, output schema and the
   image hash;
-- `run_agent`: the same plus `max_turns`, each tool's name, description and
-  parameter schema, and the request's `source_digest` (a hash of everything
-  the tools can read), so a result computed while the tools could read one
-  source set never answers a request over another. The blueprint request's
-  digest also covers `SOURCE_TOOLS_REVISION`, which names the tools'
-  behaviour, so a change in what the tools return is never answered from an
-  older run;
 - `judge`: operation, decision model, evidence and predicates;
 - embeddings: model, dimensions and the batch's texts.
 
@@ -495,9 +587,7 @@ canonical sorted order, and concurrent results are gathered in submission
 order. Adding a file requests the reading of that file only; induction and
 the embeddings are requested again because the corpus changed. A request with
 identical inputs can use a cached response, including in a subset build; its
-inputs cover everything the request can see. Blueprint agent requests also key
-on a digest of every section their tools can read, so a cached run is reused
-only when the request text and all of that source text are unchanged. The
+inputs cover everything the request can see. The
 first valid entry stored under a key is canonical: when two build
 threads miss the same key at once, the second writer returns the first
 writer's value. An entry that no longer decodes or validates is a miss and is
@@ -541,19 +631,21 @@ file-system failures raise `SnapshotIntegrityError`. The text tables are
 written first and the page images last, so sections and chunks lie together
 in the file rather than between page BLOBs.
 
-Tables (schema version `5.0`):
+Tables (schema version `6.0`):
 
 | Table | Contents |
 | --- | --- |
 | `corpus_meta` | `schema_version`, `topic`, `title`, `created_at`, `corpus_fingerprint`, `arkive_version`, `embedding_model`, `embedding_dimensions`, `guide_markdown`, `build_settings` (JSON: the model IDs and the effort of each operation) and `build_report` (JSON, as printed by `build`). |
 | `curator_notes` | Verbatim `AGENTS.md` files with their path. |
-| `documents` | One row per source file: `doc_id`, `ordinal` (path order), `rel_path`, `sha256`, `format`, `title`, `doc_date` (as printed, or the metadata date), `doc_date_iso` and `doc_date_basis` (`printed` or `metadata`; both null or both set, and when set `doc_date` agrees: a metadata date's `doc_date` is `doc_date_iso`, and a printed one parses to it), `deliverable_type`, `summary`, `page_count`, `is_curator_note`. |
+| `documents` | One row per source file: `doc_id`, `ordinal` (path order), `rel_path`, `sha256`, `format`, `title`, `doc_date` (as printed, or the metadata date), `doc_date_iso` and `doc_date_basis` (`printed` or `metadata`; both null or both set, and when set `doc_date` agrees: a metadata date's `doc_date` is `doc_date_iso`, and a printed one parses to it), `deliverable_type` (canonical; a curator note's card type), `summary`, `page_count`, `is_curator_note`, `is_feedback`, `feedback_for_json`, `family_id`, `version_status` (`sole`, `latest`, `superseded` or `unordered`) and `superseded_by` (set exactly when superseded). |
+| `deliverable_types` | Each canonical type with its order and description. |
 | `facets` | Name, order, description and binding (`path` or `content`). |
 | `facet_values` | Each facet's values with their order, description and folders (JSON). |
 | `facet_aliases` | Every folded form of a value, the canonical value included, keyed by facet and folded alias, so a form that would name two values cannot be stored. |
 | `document_facets` | Document-to-value assignments, with foreign keys to `documents` and `facet_values`. |
 | `glossary` | One validated `GlossaryEntry` JSON document per row. |
-| `blueprints` | One validated `Blueprint` JSON document per row. |
+| `feedback_lessons` | Each lesson's statement, source document, section and reviewed types (JSON). |
+| `unit_clusters`, `cluster_sections` | Each recurring unit's kind and text, and every section of a deliverable that holds it, in order, with that section's sample of a prose unit. |
 | `sections`, `pages`, `chunks` | Section Markdown with heading path and pages; native text, visual summary and WebP per page; chunk content, breadcrumb and float32 embedding. |
 | `chunks_fts` | FTS5 over NFKC-normalised chunk content and breadcrumb (`porter unicode61 remove_diacritics 2`). |
 
@@ -565,9 +657,9 @@ so it is the content address of the corpus a snapshot was built from
 
 `TopicSnapshot.open` uses a read-only SQLite URI with the path
 percent-encoded, so names containing `%`, `?` or `#` open the right file. It
-refuses any schema version other than `5.0`, naming the file's version and the
-one it reads; an older snapshot (`3.0`, or `4.0` from a reverted build) is
-rebuilt from its corpus, which also gives it path-hash document IDs. Every
+refuses any schema version other than `6.0`, naming the file's version and the
+one it reads; an older snapshot (`5.0`, whose recurring units and version
+families follow earlier rules, or `3.0` and `4.0`) is rebuilt from its corpus. Every
 `corpus_meta` key and every table is required, and `open` runs `PRAGMA
 foreign_key_check`, so a dangling facet assignment or alias is refused. Each
 facet value must have its canonical alias row. A snapshot is a build output
@@ -575,18 +667,24 @@ that may be truncated or damaged: any decoding or cross-table failure while
 it opens, and any SQLite error from a later read, is `SnapshotIntegrityError`
 naming the file. `open` recomputes the fingerprint from the
 `documents` table and raises `SnapshotIntegrityError` when the recorded one
-differs. It validates every glossary and blueprint row through its model and
-checks that every cited section belongs to a citable document of the
-snapshot, that every blueprint exemplar and feedback document is one, that
-every standing passage cites sections of at least two of its blueprint's
-exemplar documents and no other section, and that no two blueprints have
-deliverable types with the same `fold_facet_label` form (`get_blueprint`
-resolves a type by that form). It
-loads the facets, aliases and document-to-facets map once, with chunk
-metadata and the embedding matrix. `list_topics` and `arkive-rag inspect`
-report the fingerprint and version; `inspect` also prints the facets,
-glossary, blueprints, build settings, build report and each document's
-`sha256`.
+differs. It validates every glossary row through its model and checks that
+every cited section belongs to a citable document of the snapshot; that no two
+deliverable types have the same `fold_facet_label` form (`prepare_draft`
+resolves a type by that form); that every citable document's type and reviewed
+types are listed and that it is feedback exactly when it names reviewed types;
+that each version family's ID is its first member in path order, a family of
+one and only a family of one is `sole`, at most one member is `latest`, and a
+superseded member names another member that is not superseded itself, the
+latest member when the family has one (so supersession takes one step and has
+no cycle); that each feedback lesson cites a section of its feedback source and
+names listed types; and that every recurring unit is held by citable sections
+of two documents, none of them feedback. It loads the
+facets, aliases, document-to-facets map, sections, families and recurring units
+once, with chunk metadata and the embedding matrix. `list_topics` and
+`arkive-rag inspect` report the fingerprint and version; `inspect` also prints
+the facets, glossary, deliverable types, version families of two or more
+documents, feedback lessons, the number of recurring units, build settings,
+build report and each document's `sha256` and section count.
 
 ## Private corpus and eval versioning
 
@@ -612,15 +710,16 @@ local packs are not staged by accident.
 
 ## Retrieval
 
-- **Filters.** `list_documents`, `search`, `rank_channels` and `grep` take
-  `filters`, a mapping from facet name to one value. A value matches a
-  canonical facet value or one of its aliases after `fold_text`. Several
-  facets combine with AND; an empty mapping means no filter.
-  `TopicSnapshot.resolve_filters` turns the mapping into the set of matching
-  document IDs once, and every read path uses that set. An unknown facet or
-  value raises `InvalidFilterError` naming the valid facets or values.
-- **search** fuses two rankings with Reciprocal Rank Fusion
-  (each ranking adds `1 / (60 + rank)` to a chunk's score), taking the top 100 of each:
+- **Filters.** `list_documents`, `search`, `rank_channels`, `grep` and
+  `prepare_draft` take `filters`, a mapping from facet name to one value. A
+  value matches a canonical facet value or one of its aliases after
+  `fold_text`. Several facets combine with AND; an empty mapping means no
+  filter. `TopicSnapshot.resolve_filters` turns the mapping into the set of
+  matching document IDs once, and every read path uses that set. An unknown
+  facet or value raises `InvalidFilterError` naming the valid facets or values.
+- **Ranking.** Two channels are fused with Reciprocal Rank Fusion (each
+  ranking adds `1 / (60 + rank)` to a chunk's score), each taking its top 300
+  chunks (`CHANNEL_DEPTH`):
   - BM25 over `chunks_fts`, weighting content 10 and breadcrumb 2.
     `build_fts5_query` quotes every letter-and-digit token (`_` separates
     tokens, as in the `unicode61` tokenizer) and adds adjacent-token phrases,
@@ -632,63 +731,218 @@ local packs are not staged by accident.
     passes the filters.
 
   Ties break on cosine similarity, then document path order and chunk ordinal.
-  Each hit reports its fused
-  score, both ranks and its document's facets. A blank query or an invalid
-  filter or `top_k` raises `InvalidFilterError` before the query is embedded.
+  `rank_channels` returns the top `top_k` of each channel and of the fusion
+  with no diversity rule or size limit; the ablation layer reads it.
+- **One tool result.** Every read result that can grow with the corpus fits
+  one tool result: at most 45,000 UTF-8 bytes (`RESPONSE_MAX_BYTES`) and
+  1,600 lines (`RESPONSE_MAX_LINES`) of `response_text`, the one compact JSON
+  text block the MCP server sends, below the 51,200 bytes and 2,000 lines at
+  which a client such as OpenCode cuts a tool result. Every result is measured
+  as served (`fits_response`) before it is returned; the drafting packet
+  prices each addition by its exact bytes and measures the finished packet.
+- **Active pool.** A superseded document is left out wherever the document
+  that supersedes it passes the filters (`_active_pool`), so a copy or draft
+  stays reachable when filters leave out the version that replaces it.
+- **search** returns the fused ranking diversified by version family. Only
+  the active pool is ranked, so a long superseded draft cannot take the
+  channels' 300 places from its latest version. At most three chunks of one family
+  (`SEARCH_FAMILY_CAP`) are taken first; when that leaves fewer than `top_k`
+  hits, as when the filters name one document, the held-back chunks fill the
+  list. Hits keep fused-rank order. Each reports its fused score, both ranks,
+  its document's facets and `more_from_document`, the further ranked chunks of
+  its document the list does not show, counted after the list is cut to one
+  tool result. A blank query or an invalid filter or `top_k` raises
+  `InvalidFilterError` before the query is embedded.
 - **grep** is a literal, case-insensitive line search over section Markdown.
   Pattern and text are compared by `fold_text` (NFKC, Unicode dashes as `-`,
   case-folded), so `2016-2017` finds `2016–2017` and `km2` finds `km²`. A
   snippet is at most 400 characters of the line, centred on the first match.
-- **Glossary lookup.** Without a query, `lookup_glossary` lists every term
-  with its kind, aliases and whether any sense has a definition. With a
-  query, it returns the full entries whose folded term or alias contains the
-  folded query; no match is an empty list.
+  `max_matches` is 1 to 50 (`MAX_GREP_MATCHES`); the matches that fit one
+  tool result are returned.
+- **Glossary lookup.** Without a query, `lookup_glossary` lists terms with
+  their kind, aliases and whether any sense has a definition. With a query, it
+  returns the full entries whose folded term or alias contains the folded
+  query; no match is an empty list, and a query of more than 1,000 characters
+  is refused. Either list is one page from `offset` that fits one tool
+  result, with `total` and `next_offset`; an entry too large for a page of
+  its own keeps as many citations per sense as fit, counting the rest in
+  `omitted_citations`.
+- **Document pages.** `TopicSnapshot.list_documents` returns every document
+  passing the filters, with its source hash, for Python callers such as
+  `inspect` and the evaluation harness. `list_documents_page` returns one page
+  of them without hashes: `limit` from 1 to 100 (default 50) from `offset`,
+  fewer when more would not fit one tool result, with `total` and
+  `next_offset`. A summary is cut to 2,000 characters (`SUMMARY_CHARS`).
+- **Outlines and sections.** `outline(doc_id, offset)` returns the sections
+  from `offset` that fit one tool result, each heading path cut by
+  `heading_context`, with `total_sections` and `next_offset`.
+  `read_section(section_id, offset)` returns the section's Markdown from
+  character `offset`: the rest when it fits, else up to the last line break
+  that fits, with `total_chars` and `next_offset`. A section holds at most
+  32,000 characters, which in a script of two- or three-byte characters is
+  more than one tool result. Python callers, such as `inspect` and the
+  evaluation harness, read a whole outline with `full_outline(doc_id)` and a
+  whole section with `section_markdown(section_id)`, never through these
+  pages.
+- **Display fields.** Every result that shows a document title or heading
+  path beside other data (search hits, grep matches, document pages,
+  outlines, section parts, exemplars, candidates and supplemental sections)
+  cuts the title to 500 characters (`TITLE_CHARS`) and the heading path by
+  `heading_context`, so one long heading cannot push a match out of its
+  result. A result whose smallest form still does not fit is a
+  `SnapshotIntegrityError`, never an empty list.
+- **Topic summaries.** `summary()` lists each facet's values and the
+  deliverable types up to 50 each (`SUMMARY_MAX_NAMES`), fewer when more
+  would not fit, counting the rest in `omitted_values` and
+  `omitted_deliverable_types`.
+- **Topic guide.** `guide()` keeps the guide text and the facet names and
+  descriptions (cut to 300 characters, `GUIDE_DESCRIPTION_CHARS`, as are the
+  deliverable type descriptions), then as many deliverable types as fit, then
+  curator notes in path order while they fit (a note that does not fit is
+  left out, and its sections stay readable with `read_section`), then as many
+  values per facet as fit, then glossary terms in order;
+  `omitted_deliverable_types`, `omitted_curator_notes`,
+  `omitted_facet_values` and `omitted_glossary_terms` count what was left
+  out. The build keeps the guide text within 24,000 bytes, so a valid
+  snapshot's guide always fits.
+
+### Drafting packet
+
+`TopicSnapshot.prepare_draft(project_inputs, embed_query, deliverable_type,
+filters)` returns a `DraftPacket` that fits one tool result. Its short fields
+come first: the guidance, lessons, curator notes and `recurring_samples`, then
+the exemplars' Markdown. It makes no model call besides embedding the start
+of the inputs (8,000 characters) when an embedder is given, and works without
+one. Blank inputs or an invalid filter raise `InvalidFilterError` and an
+unknown type raises `NotFoundError` listing the topic's types with their
+document counts, all before any embedding; a type matches after
+`fold_facet_label`, and a blank type is no type.
+
+- **Pool.** Every citable document of the active pool that is not feedback; a
+  feedback document of the requested type stays, so a review can be drafted
+  as a review.
+- **Relevance.** The inputs are ranked with the hybrid ranking above, or BM25
+  alone without an embedder. The lexical query ORs the 48 distinct input words
+  held by the fewest chunks, since each word adds to a BM25 query's cost;
+  filler and generic drafting words (`please`, `write`, `whether`, `report`,
+  `project` and similar) are left out. With a requested type, its documents
+  are also ranked among themselves, so hundreds of documents of another type
+  cannot crowd them out of the channels; their relevance and their matched
+  sections come from that ranking. A
+  document's relevance sums `1 / (60 + rank)` over its best three chunks
+  (`RELEVANCE_CHUNKS`), so a long document does not outrank a closer short one
+  by its length alone, plus up to a quarter of a first-ranked chunk's score
+  for input words in its title, type and summary.
+- **Exemplars.** Up to three. With a requested type, its documents fill the
+  slots first, best first; a free slot takes the best relevant document
+  (relevance above zero) of another type when at most one exemplar is of the
+  requested type, or when that document reaches 0.6 of the best exemplar's
+  relevance (`CROSS_TYPE_RELEVANCE`). Without a type, the three best fill them. An
+  unordered version family fills one slot, and the exemplar lists its other
+  members in `family_doc_ids` (at most 24, the rest counted in
+  `omitted_family_members`); its summary is cut to 2,000 characters. The next
+  eight documents of other families are
+  `other_candidates`, with type, date, page count, summary and relevance.
+- **Sections.** Every exemplar carries its complete outline. Each entry has
+  its heading path, level, pages, length, `visual_count` and
+  `family_recurrence`; an included entry has its Markdown without visual
+  transcripts. `family_recurrence` reports the section's units that another
+  version family also holds (`recurring_unit_count`), the packet's exemplars
+  holding them, the most families holding any one of them out of the topic's
+  version families of deliverables (`corpus_family_count` of
+  `corpus_family_total`) and the newest date among the holders. A superseded
+  draft is not counted as a holder, so a clause its latest version dropped
+  does not count as house text. `recurring_samples` hold one entry per
+  recurring prose unit (two or more families; table header rows are not
+  house text) that an included section is the first to show, at most twelve:
+  that section's sample, which the build stores with each holder. A sample is
+  at most 16 words folded by `fold_unit` (so a line-end hyphen is joined and a
+  list marker dropped): the first words of the section's own unit of the
+  cluster, or, when the section holds the unit inside other text such as one
+  sentence of a longer paragraph, the longest run of words whose every 4-gram
+  is the unit's, so it stops where the section's own words begin. An agent, and the OpenCode check, can tell house text from a
+  project's own paragraph in a section that mixes both, in the exemplar's
+  own words. The envelope fits first, without outlines, notes or lessons: the
+  later exemplars move to the candidates, then candidates are dropped from
+  the end, and at most eight candidates are kept, moved exemplars first. Then
+  curator notes and lessons come in, each up to 6,000 bytes. Then, while the
+  exemplars' complete outlines do not fit, the last exemplar moves to the
+  candidates; a first exemplar left alone keeps as many outline entries as
+  fit, counting the entries cut in `omitted_outline_sections`, so every
+  exemplar after the first has its complete outline. Section text is then
+  packed whole, never cut, each addition kept only while the packet fits:
+  the first exemplar's input-matched sections (at most six), sections with
+  recurring units, and first and last two sections; up to two supplemental
+  sections; the rest of the first exemplar; then the other exemplars'
+  input-matched sections, recurring sections that show a unit no included
+  section shows yet, and first and last two sections; then the rest of them.
+  A section that does not fit is skipped, its entry kept, and counted in
+  `omitted_sections`; later, smaller ones may still fit. The packet is
+  serialized a handful of times, not once per section: the envelope and the
+  outlines are measured as served, each later addition is priced by the
+  bytes its JSON value adds within 512 bytes below the bound
+  (`PACKET_MARGIN_BYTES`, for the counters' digits), and the finished packet
+  is measured once, the last additions taken back if it still does not
+  fit.
+- **Supplemental sections.** Sections of deliverables of the active pool,
+  outside the exemplars' families and of the requested type, that hold the
+  most rare input words: words of four or more characters, not numbers, held
+  by at most two version families of deliverables (reviews, curator notes and
+  superseded drafts do not count). A named team
+  member's biography in a seventh proposal is the kind of section this finds.
+- **Guidance.** `lessons` are the feedback lessons reviewing the requested
+  type, or the first exemplar's type when none is requested, from every
+  feedback document of the topic whatever the filters (they are house rules
+  for the type), up to 6,000 bytes; `curator_notes` the topic's notes up to
+  6,000 bytes; each with a count of what was left out.
+  `drafting_guidance` (`DRAFTING_GUIDANCE`) tells the agent to take every fact
+  of the new work only from the user's inputs, reuse and adapt method text
+  where the inputs use the same method, weigh dates, families and recurrence
+  counts as provenance (asking the user when an institutional policy is
+  genuinely uncertain in an interactive session), follow the closest
+  exemplar's structure, apply the lessons and notes, read omitted sections
+  with `read_section`, and write a standalone deliverable without Arkive IDs.
 
 ## MCP server
 
 `arkive-rag serve a.arkive.db b.arkive.db` opens every snapshot into a
-`TopicCatalog` and refuses two snapshots with the same topic. It has ten
-tools:
+`TopicCatalog` and refuses two snapshots with the same topic. Every structured
+tool result is one text block of `response_text` (compact JSON) beside its
+structured content, so what the snapshot measured is what the client reads. It
+has ten tools:
 
-- `list_topics`: each topic's facets with their allowed values, and the
-  deliverable types that have a blueprint.
+- `list_topics(offset=0)`: one page of the served topics (`TopicPage`), each
+  with its title cut to 500 characters, its facets and allowed values and its
+  deliverable types, up to 50 of each and fewer when a summary would not fit
+  a page of its own. Only the topics on the page are summarised.
 - `get_topic_guide(topic)`: the cited guide, curator notes, facet
-  definitions, glossary terms and one summary per blueprint
-  (`deliverable_type`, `description`, `exemplar_count`). It carries no
-  outline, conventions, pitfalls or passages, which keeps it small for
-  question answering.
-- `get_blueprint(topic, deliverable_type)`: one full `Blueprint` (outline,
-  conventions, pitfalls, exemplar and feedback documents, standing
-  passages). The type matches after `fold_facet_label`, so case and
-  surrounding spaces do not matter; an unknown type is a `NotFoundError`
-  that names the valid types.
-- `list_documents`, `get_document_outline`, `search`, `grep`,
-  `read_section`, `view_page` and `lookup_glossary`.
+  definitions, glossary terms and each deliverable type with its description,
+  document count and feedback count.
+- `prepare_draft(topic, project_inputs, deliverable_type=None, filters=None)`:
+  the drafting packet above.
+- `list_documents(topic, filters=None, limit=50, offset=0)`: one document
+  page.
+- `get_document_outline(topic, doc_id, offset=0)` and
+  `read_section(topic, section_id, offset=0)`: one page of an outline, one part
+  of a section.
+- `search`, `grep`, `view_page` and `lookup_glossary(topic, query=None,
+  offset=0)`.
 
-`list_documents`, `search` and `grep` take `filters: dict[str, str] | None`.
 `view_page` returns the caption as text content and the page as `image/webp`
-image content. Domain errors become tool errors whose message names the valid
-topics, facets, values, deliverable types or pages. `arkive-rag inspect`
-still prints every blueprint in full.
+image content. The caption (`page_caption`) holds the title cut to 500
+characters, the visual summary and the native text within the byte bound and
+1,500 lines; the visual summary takes at most half of the room, and a part
+that does not fit is cut with a line counting the characters and lines left
+out. Domain errors become tool errors whose message names the valid topics,
+facets, values, deliverable types or pages: at most 40 of them with a count
+of the rest, and at most 200 characters of the caller's input.
 
-The server's instructions describe two modes. Answering questions cites
-`doc_id`, `section_id` and pages; the guide is suggested when scope, curator
-notes or missing material matter, not before every search. Drafting a
-deliverable calls `get_blueprint` and follows its outline, conventions and
-pitfalls; mirrors a cited exemplar section's heading levels and table column
-headers where layout matters, not its project-specific headings; takes
-every fact about the user's project (its client and other parties, people,
-places, dates, quantities, budgets, targets, findings, identifiers, file
-names) only from the user's inputs, which take precedence over a passage;
-treats the standing passages as the collection's own house text, reproducing
-them with their wording, without commentary about their origin, and keeping
-their organisation names, method references and attributions as written,
-while adapting or leaving out only the part of a passage that belongs to one
-particular project (its client, site, dates, quantities or results); reuses
-names, references and attributions from the corpus only when a standing
-passage holds them; lists every item the user's inputs enumerate in full;
-and leaves out Arkive document and section IDs. The `read_section` and
-`get_blueprint` descriptions say the same.
+The server's instructions are short. They name `list_topics` and facet
+filters; for questions, the read tools, citing `doc_id`, `section_id` and
+pages, and saying that the corpus does not establish a fact when `search` and
+`grep` find no evidence for it; and for drafting, `prepare_draft` with the
+user's full inputs, following the packet's guidance and reading omitted
+sections with `read_section`.
 
 Over `streamable-http` the server has no authentication, so `serve` refuses a
 host other than `127.0.0.1`, `localhost` or `::1` unless `--allow-nonlocal` is
@@ -697,7 +951,7 @@ given. The server reports the package version to clients.
 `search` needs `OPENAI_API_KEY` in the server environment and all served
 snapshots must share one embedding model and dimension. Without a key the
 server still starts; `search` returns an error that points to the offline
-tools.
+tools, and `prepare_draft` ranks with BM25 alone.
 
 The CLI's `search` and `grep` take repeated `--filter FACET=VALUE`; naming a
 facet twice is a usage error, because each facet takes one value.
@@ -855,12 +1109,13 @@ Markdown of each `exemplar_paths` document of the holdout snapshot, labelled
 with its path and without visual transcripts, then the run notes. Its
 instructions are the holdout's `instructions` followed by
 `EXEMPLAR_DRAFTING_RULES` in `evals/drafting.py`: the drafting obligations of
-the MCP server instructions, reworded for documents in the prompt.
+the MCP server, reworded for documents in the prompt.
 `tests/test_evals.py` pins, word for word, every drafting surface: the
-drafting part of `arkive_rag.server.INSTRUCTIONS` (mode 2), the `get_blueprint`
-and `read_section` tool descriptions as the server publishes them, and
-`EXEMPLAR_DRAFTING_RULES`, beside a map from each obligation to its phrase in
-the server's rules and in `EXEMPLAR_DRAFTING_RULES`. An edit to any of them
+drafting part of `arkive_rag.server.INSTRUCTIONS` (item 3), the packet's
+`DRAFTING_GUIDANCE`, the `prepare_draft` and `read_section` tool descriptions
+as the server publishes them, and `EXEMPLAR_DRAFTING_RULES`, beside a map from
+each obligation they share to its phrase in the server's text and in
+`EXEMPLAR_DRAFTING_RULES`. An edit to any of them
 fails the test until the pins are updated together. The test does not judge
 whether the texts mean the same thing. The report gives each arm's input tokens, so the cost of
 carrying the exemplars is visible beside the other arms.
@@ -1005,8 +1260,8 @@ The first two repeat deliverable types, reviewer feedback, defined and undefined
 acronyms, one acronym with two meanings, tool names, stated attributes,
 exact numbers and filenames. Each also has one standing section that recurs
 across projects: every coastal proposal ends with the same standard terms,
-and every campaign brief ends with the same disclosure, so their blueprints
-have standing passage candidates to select. They are built with the ordinary
+and every campaign brief ends with the same disclosure, so their drafting
+packets report recurring units. They are built with the ordinary
 `arkive-rag build` command; the snapshots are not tracked.
 
 `evals/example_packs/<collection>.eval.json` is the eval pack of each
@@ -1099,25 +1354,28 @@ non-interactively, on several topics at once. It needs Docker and
   phrase groups matched as in eval packs, an optional requirement that the
   answer names every facet of its topics (read from the served snapshots,
   because facets are induced per build), an optional requirement that the
-  answer reproduces a standing passage (`answer_reproduces_standing_passage_of`,
-  a topic: the passages come from the blueprint that the last completed
-  `get_blueprint` call on that topic returned, because passages and
-  deliverable types are induced per build; a passage counts when its text, or
-  its first 12 words for a longer one, appears in the answer as words after
-  `fold_for_quote`; when that blueprint holds no standing passage the
-  scenario fails a separate check, `precondition: blueprint has a standing
+  answer reproduces a recurring passage
+  (`answer_reproduces_recurring_passage_of`, a topic: the passages are the
+  `recurring_samples` of the packet that the last completed `prepare_draft`
+  call on that topic returned, because packets are built per request, so a
+  project paragraph copied from a section that also holds house text does not
+  count; a passage counts when ten of its words in a row, or all of a shorter
+  one, appear in the answer as words after `fold_for_quote`, so an agent may
+  adapt its opening words to the project; when that packet includes no such passage the
+  scenario fails a separate check, `precondition: packet has a recurring
   passage`, which marks the snapshot rather than the client), and an optional
   page (`page_image`: topic, `doc_id`, `page_number`) whose `view_page` call
   must return an image.
   Document IDs follow sorted path order, so they are stable across builds of
   one corpus. Every scenario also requires that the run ended with an answer
-  and no error event, and that no tool outside the `arkive` server was called. The shipped scenarios cover
+  and no error event, that no tool outside the `arkive` server was called, and
+  that OpenCode cut no Arkive tool result (`state.metadata.truncated`). The shipped scenarios cover
   topic and facet discovery, three glossary lookups (a defined term, a term
   the corpus never defines and a term with two meanings), a filtered listing
   with a facet the agent finds itself, recovery from an invalid filter value,
   an exact number found with `grep`, a chart value read through `view_page`,
-  a draft that must fetch the full blueprint with `get_blueprint` and
-  reproduce one of its standing passages, and a question that needs both
+  a draft that must fetch the drafting packet with `prepare_draft` and
+  reproduce one of its recurring passages, and a question that needs both
   topics.
 - **Results.** The runner parses the newline-delimited JSON events
   (`tool_use`, `text`, `step_finish`, `error`); the final answer is the text

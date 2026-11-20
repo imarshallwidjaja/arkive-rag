@@ -10,12 +10,12 @@ import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ArkiveError(Exception):
@@ -50,8 +50,8 @@ class RejectedOutputError(ArkiveError):
     """Generated output still broke its structural rules after one rerun naming them.
 
     Examples: a citation that resolves to no citable section, an unknown folder or document
-    ID, a facet that mixes path-bound and content-bound values, an empty blueprint outline,
-    or an observation batch whose quotes could not be located at all.
+    ID, a facet that mixes path-bound and content-bound values, a document left
+    unclassified, or an observation batch whose quotes could not be located at all.
     """
 
 
@@ -65,6 +65,33 @@ class InvalidFilterError(ArkiveError):
 
 class NotFoundError(ArkiveError):
     """A requested topic, document, section, or page does not exist."""
+
+
+# An error message reaches an MCP client as one tool result, so it echoes at most this much
+# of the caller's input and names at most this many valid choices.
+ERROR_ECHO_CHARS = 200
+ERROR_MAX_CHOICES = 40
+
+
+def echoed(text: str) -> str:
+    """The caller's input as an error message quotes it: `repr`, cut to `ERROR_ECHO_CHARS`
+    characters of the input with an ellipsis."""
+    if len(text) <= ERROR_ECHO_CHARS:
+        return repr(text)
+    return f"{text[:ERROR_ECHO_CHARS]!r}\u2026 ({len(text)} characters)"
+
+
+def choices(names: Iterable[str]) -> str:
+    """Valid choices as an error message lists them: the first `ERROR_MAX_CHOICES`, each on
+    one line (whitespace runs, newlines included, become one space) and cut like `echoed`
+    input, then a count of the rest."""
+    every = list(names)
+    lines = (" ".join(n.split()) for n in every[:ERROR_MAX_CHOICES])
+    shown = ", ".join(
+        n if len(n) <= ERROR_ECHO_CHARS else f"{n[:ERROR_ECHO_CHARS]}\u2026" for n in lines
+    )
+    rest = len(every) - ERROR_MAX_CHOICES
+    return f"{shown}, ... (+{rest} more)" if rest > 0 else shown
 
 
 SourceFormat = Literal["pdf", "docx", "pptx", "md"]
@@ -120,6 +147,20 @@ def fold_for_quote(text: str) -> str:
     text = _LINE_HYPHENATION.sub("", text)
     text = _EMPHASIS.sub("", _BLOCK_QUOTE_MARKERS.sub("", text)).replace("|", " ")
     return _WHITESPACE.sub(" ", fold_text(text)).strip()
+
+
+# Longest heading path shown as a label beside section text: in an observation batch, a chunk
+# breadcrumb or any induction prompt. A heading the transcript ran on for pages keeps its whole
+# Markdown in the section; only the label is cut, so it cannot blow a prompt or an embedding.
+MAX_HEADING_CONTEXT_CHARS = 500
+
+
+def heading_context(heading_path: str) -> str:
+    """`heading_path` as a label beside section text: itself, or its first
+    MAX_HEADING_CONTEXT_CHARS - 1 characters and an ellipsis."""
+    if len(heading_path) <= MAX_HEADING_CONTEXT_CHARS:
+        return heading_path
+    return heading_path[: MAX_HEADING_CONTEXT_CHARS - 1] + "\u2026"
 
 
 def document_id(rel_path: str) -> str:
@@ -213,16 +254,42 @@ class FacetDraft(_Frozen):
     values: list[FacetValueDraft]
 
 
-class DeliverableTypeDraft(_Frozen):
-    name: str
-    description: str
-    exemplar_doc_ids: list[str]
-    feedback_doc_ids: list[str]
+class DocumentRoleDraft(_Frozen):
+    """How one batch reads one document: its deliverable type, and the types of deliverable
+    it reviews or records lessons for when it is feedback."""
+
+    doc_id: str
+    deliverable_type: str
+    is_feedback: bool
+    feedback_for_types: list[str]
 
 
 class OrganisationDraft(_Frozen):
+    """The organisation one batch of document digests proposes."""
+
     facets: list[FacetDraft]
-    deliverable_types: list[DeliverableTypeDraft]
+    documents: list[DocumentRoleDraft]
+
+
+class CanonicalTypeDraft(_Frozen):
+    name: str
+    description: str
+    labels: list[str]
+
+
+class TypeCanonicalisationDraft(_Frozen):
+    """Every proposed deliverable type label mapped to one canonical type."""
+
+    types: list[CanonicalTypeDraft]
+
+
+class FeedbackLessonDraft(_Frozen):
+    statement: str
+    quote: str
+
+
+class FeedbackLessonsDraft(_Frozen):
+    lessons: list[FeedbackLessonDraft]
 
 
 class SenseDraft(_Frozen):
@@ -239,33 +306,6 @@ class GlossaryEntryDraft(_Frozen):
 
 class GlossaryDraft(_Frozen):
     entries: list[GlossaryEntryDraft]
-
-
-class BlueprintSectionDraft(_Frozen):
-    heading: str
-    purpose: str
-    citations: list[str]
-
-
-class GuidanceDraft(_Frozen):
-    statement: str
-    citations: list[str]
-
-
-class StandingPassageSelection(_Frozen):
-    """One standing passage candidate the agent keeps, by ID, with its label. The text and
-    citations come from the candidate, never from the agent."""
-
-    candidate_id: str
-    label: str
-
-
-class BlueprintDraft(_Frozen):
-    description: str
-    outline: list[BlueprintSectionDraft]
-    conventions: list[GuidanceDraft]
-    pitfalls: list[GuidanceDraft]
-    standing_passages: list[StandingPassageSelection]
 
 
 class GuideDraft(_Frozen):
@@ -300,6 +340,9 @@ class ObservationCard(_Frozen):
     summary: str
     attributes: tuple[StatedAttribute, ...]
     terms: tuple[TermObservation, ...]
+    # No induction step reads craft observations. They stay in the card and in the observation
+    # request, whose output schema is part of the build cache key, so cached observations of
+    # every page batch stay valid.
     craft: tuple[CraftObservation, ...]
 
 
@@ -539,10 +582,13 @@ class Facet(_Frozen):
 
 class GlossarySense(_Frozen):
     """One meaning of a term. `definition` is None when the corpus uses the term in the cited
-    sections but does not establish what it means there."""
+    sections but does not establish what it means there. `omitted_citations` counts citations
+    a glossary lookup left out to stay within one tool result; the stored glossary keeps every
+    citation, so it is 0 there."""
 
     definition: str | None
     citations: Annotated[tuple[str, ...], Field(min_length=1)]
+    omitted_citations: int = 0
 
 
 class GlossaryEntry(_Frozen):
@@ -552,59 +598,105 @@ class GlossaryEntry(_Frozen):
     senses: Annotated[tuple[GlossarySense, ...], Field(min_length=1)]
 
 
-class BlueprintSection(_Frozen):
-    heading: str
-    purpose: str
-    citations: Annotated[tuple[str, ...], Field(min_length=1)]
+# `sole`: the only member of its version family. In a larger family, `latest` supersedes every
+# other member, which is `superseded`; `unordered` members could not be ordered without guessing.
+VersionStatus = Literal["sole", "latest", "superseded", "unordered"]
 
 
-class BlueprintGuidance(_Frozen):
-    statement: str
-    citations: Annotated[tuple[str, ...], Field(min_length=1)]
+class DocumentRole(_Frozen):
+    """What a citable document is within its corpus.
 
-
-class StandingPassage(_Frozen):
-    """A block of exemplar text, such as a method background, a reference entry or a
-    disclaimer, that recurs in another exemplar document and that the blueprint agent selected
-    as standing house content. `text` is exactly as it appears in the section `citations[0]`;
-    every other citation is a section of another exemplar document where it recurs."""
-
-    label: str
-    text: str
-    citations: Annotated[tuple[str, ...], Field(min_length=2)]
-
-
-class Blueprint(_Frozen):
-    """How the corpus writes one recurring deliverable type. Outline, conventions and pitfalls
-    carry no project-specific values; standing passages are the only verbatim source text."""
+    `deliverable_type` is canonical across the corpus. A feedback document keeps its own type
+    and also names, in `feedback_for_types`, the types whose deliverables it reviews. A version
+    family groups drafts, revisions and exports of one deliverable; `family_id` is the ID of
+    its first member in path order, and `superseded_by` names the family's latest member (or,
+    for a byte-identical copy, the copy it duplicates).
+    """
 
     deliverable_type: str
+    is_feedback: bool
+    feedback_for_types: tuple[str, ...]
+    family_id: str
+    version_status: VersionStatus
+    superseded_by: str | None
+
+
+class DeliverableType(_Frozen):
+    name: str
     description: str
-    exemplar_doc_ids: Annotated[tuple[str, ...], Field(min_length=1)]
-    feedback_doc_ids: tuple[str, ...]
-    outline: Annotated[tuple[BlueprintSection, ...], Field(min_length=1)]
-    conventions: tuple[BlueprintGuidance, ...]
-    pitfalls: tuple[BlueprintGuidance, ...]
-    standing_passages: tuple[StandingPassage, ...]
+
+
+class FeedbackLesson(_Frozen):
+    """A transferable reviewer criticism or resolution from a feedback document, located in
+    `section_id` and confirmed there, for deliverables of `target_types`."""
+
+    statement: str
+    source_doc_id: str
+    section_id: str
+    doc_title: str
+    target_types: tuple[str, ...]
+
+
+UnitKind = Literal["prose", "table_header"]
+
+
+class ClusterHolder(_Frozen):
+    """One section holding a recurring unit. For a prose unit, `sample` is the opening words
+    of the unit as this section writes it (`passages.recurring_units` defines them); a table
+    header row has no sample."""
+
+    section_id: str
+    sample: str | None
+
+
+class UnitCluster(_Frozen):
+    """A text unit that recurs across documents. `text` is the first holder's unit exactly as
+    written; `holders` are every section that holds it, in path order, the first holder's
+    section first among its document's. Every holder of a prose unit has a nonblank sample,
+    and no holder of a table header row has one."""
+
+    cluster_id: int
+    kind: UnitKind
+    text: str
+    holders: tuple[ClusterHolder, ...]
+
+    @model_validator(mode="after")
+    def _samples_match_kind(self) -> Self:
+        prose = self.kind == "prose"
+        for h in self.holders:
+            valid = bool(h.sample and h.sample.strip()) if prose else h.sample is None
+            if not valid:
+                rule = "needs a nonblank sample" if prose else "has no sample"
+                raise ValueError(
+                    f"recurring unit {self.cluster_id}: holder {h.section_id} of a {self.kind}"
+                    f" unit {rule}"
+                )
+        return self
+
+    @property
+    def section_ids(self) -> tuple[str, ...]:
+        return tuple(h.section_id for h in self.holders)
 
 
 class BuildReport(_Frozen):
     """What the build reduced or skipped without failing.
 
-    The first three counts are the contracted reductions: observations discarded because
-    their quote could not be located after one rerun, glossary definitions the support check
-    did not confirm (stored as `definition=None`), and blueprint conventions or pitfalls it
-    did not confirm (dropped). `judge_refusals` counts support and binding questions the
-    decision model refused, by operation; `pruned_facet_values` and `pruned_facets` name what
-    binding left empty.
+    The first three counts are the contracted reductions: observations and feedback lessons
+    discarded because their quote could not be located after one rerun, glossary definitions
+    the support check did not confirm (stored as `definition=None`), and feedback lessons it
+    did not confirm (dropped). `judge_refusals` counts decision questions the decision model
+    refused, by operation; `pruned_facet_values` and `pruned_facets` name what binding left
+    empty. `truncated_curator_notes` counts curator notes an induction prompt could not show
+    in full; the snapshot stores every note verbatim.
     """
 
     discarded_unlocated_quotes: int
     unsupported_definitions: int
-    dropped_blueprint_statements: int
+    dropped_feedback_lessons: int
     judge_refusals: dict[str, int]
     pruned_facet_values: list[str]
     pruned_facets: list[str]
+    truncated_curator_notes: int
 
 
 # Compiled corpus.
@@ -645,7 +737,6 @@ class CompiledDocument(_Frozen):
     # The date as printed, or the metadata date's ISO form when nothing is printed.
     doc_date: str | None
     date: DocumentDate | None
-    deliverable_type: str
     summary: str
     # Facet name to the document's sorted values, in facet definition order.
     facets: dict[str, tuple[str, ...]]
@@ -653,6 +744,8 @@ class CompiledDocument(_Frozen):
     chunks: tuple[Chunk, ...]
     pages: tuple[RenderedPage, ...]
     is_curator_note: bool
+    # A curator note's role is its card's type, no feedback and a family of its own.
+    role: DocumentRole
 
 
 @dataclass(frozen=True)
@@ -668,7 +761,9 @@ class CompiledCorpus:
     guide_markdown: str
     facets: tuple[Facet, ...]
     glossary: tuple[GlossaryEntry, ...]
-    blueprints: tuple[Blueprint, ...]
+    deliverable_types: tuple[DeliverableType, ...]
+    feedback_lessons: tuple[FeedbackLesson, ...]
+    unit_clusters: tuple[UnitCluster, ...]
     build_settings: Mapping[str, Any]
     build_report: BuildReport
     documents: tuple[CompiledDocument, ...]
@@ -696,12 +791,19 @@ def corpus_fingerprint(documents: Iterable[tuple[str, str]]) -> str:
 
 
 class FacetSummary(_Frozen):
+    """A facet and its first values; `omitted_values` counts the rest, which
+    `get_topic_guide` and an unknown-value error also name."""
+
     name: str
     binding: FacetBinding
     values: list[str]
+    omitted_values: int
 
 
 class TopicSummary(_Frozen):
+    """One served topic as `list_topics` shows it. Facet values and deliverable types are
+    listed up to `snapshot.SUMMARY_MAX_NAMES` each, the rest counted."""
+
     topic: str
     title: str
     created_at: str
@@ -709,36 +811,62 @@ class TopicSummary(_Frozen):
     arkive_version: str
     document_count: int
     facets: list[FacetSummary]
-    blueprints: list[str]
+    deliverable_types: list[str]
+    omitted_deliverable_types: int
     glossary_terms: int
 
 
-class BlueprintSummary(_Frozen):
+class TopicPage(_Frozen):
+    """One page of `list_topics`: the served topics from `offset` that fit one tool result,
+    out of `total`; `next_offset` is None on the last page."""
+
+    topics: list[TopicSummary]
+    total: int
+    offset: int
+    next_offset: int | None
+
+
+class DeliverableTypeSummary(_Frozen):
+    """A canonical deliverable type: how many citable documents have it, and how many
+    feedback documents review deliverables of it."""
+
     deliverable_type: str
     description: str
-    exemplar_count: int
+    document_count: int
+    feedback_count: int
 
 
 class TopicGuide(_Frozen):
-    """The orientation view of a topic. Blueprints appear as summaries; `get_blueprint`
-    returns one in full."""
+    """The orientation view of a topic, within one tool result. Facet and deliverable type
+    descriptions are cut to `snapshot.GUIDE_DESCRIPTION_CHARS`; deliverable types that do not
+    fit are counted in `omitted_deliverable_types`; curator notes that do not fit are left out
+    and counted in `omitted_curator_notes` (each note's sections stay readable with
+    `read_section`); each facet lists at most as many values as fit, the rest counted in
+    `omitted_facet_values`; glossary terms that do not fit are counted in
+    `omitted_glossary_terms` (`lookup_glossary` pages them)."""
 
     topic: str
     title: str
     guide_markdown: str
     curator_notes: list[CuratorNote]
+    omitted_curator_notes: int
     facets: list[Facet]
-    blueprints: list[BlueprintSummary]
+    omitted_facet_values: int
+    deliverable_types: list[DeliverableTypeSummary]
+    omitted_deliverable_types: int
     glossary_terms: list[str]
+    omitted_glossary_terms: int
 
 
-class DocumentInfo(_Frozen):
-    """`doc_date` is as printed (or the metadata date); `date` is its calendar form and
-    where it came from, None when the printed date is ambiguous or no date is known."""
+class DocumentListItem(_Frozen):
+    """One document as `list_documents` pages it. `doc_date` is as printed (or the metadata
+    date); `date` is its calendar form and where it came from, None when the printed date is
+    ambiguous or no date is known. The version fields follow `DocumentRole`. A title longer
+    than `snapshot.TITLE_CHARS` or a summary longer than `snapshot.SUMMARY_CHARS` ends with an
+    ellipsis where it was cut."""
 
     doc_id: str
     rel_path: str
-    sha256: str
     format: str
     title: str
     doc_date: str | None
@@ -747,7 +875,28 @@ class DocumentInfo(_Frozen):
     summary: str
     page_count: int
     is_curator_note: bool
+    is_feedback: bool
+    feedback_for_types: list[str]
+    family_id: str
+    version_status: VersionStatus
+    superseded_by: str | None
     facets: dict[str, list[str]]
+
+
+class DocumentInfo(DocumentListItem):
+    """A document with the SHA-256 of its source bytes."""
+
+    sha256: str
+
+
+class DocumentPage(_Frozen):
+    """One page of `list_documents`. `next_offset` is None on the last page."""
+
+    documents: list[DocumentListItem]
+    total: int
+    offset: int
+    limit: int
+    next_offset: int | None
 
 
 class SectionOutlineItem(_Frozen):
@@ -760,8 +909,14 @@ class SectionOutlineItem(_Frozen):
 
 
 class DocumentOutline(_Frozen):
+    """One page of a document's outline: `sections` from `offset`, as many as fit one tool
+    result, out of `total_sections`; `next_offset` is None on the last page."""
+
     document: DocumentInfo
     sections: list[SectionOutlineItem]
+    total_sections: int
+    offset: int
+    next_offset: int | None
 
 
 class SearchHit(_Frozen):
@@ -777,6 +932,8 @@ class SearchHit(_Frozen):
     rrf_score: float
     lexical_rank: int | None
     dense_rank: int | None
+    # Further ranked chunks of the same document that this result list does not show.
+    more_from_document: int
     content: str
 
 
@@ -793,6 +950,10 @@ class GrepMatch(_Frozen):
 
 
 class SectionReadView(_Frozen):
+    """One section's Markdown from character `offset`, as much as fits one tool result, cut at
+    a line break where one falls in it. `next_offset` is None once the part reaches the end of
+    the section's `total_chars`."""
+
     section_id: str
     doc_id: str
     doc_title: str
@@ -801,6 +962,9 @@ class SectionReadView(_Frozen):
     page_end: int
     facets: dict[str, list[str]]
     markdown: str
+    offset: int
+    next_offset: int | None
+    total_chars: int
     prev_section_id: str | None
     next_section_id: str | None
 
@@ -824,10 +988,126 @@ class GlossaryTermSummary(_Frozen):
 
 
 class GlossaryLookup(_Frozen):
-    """Without a query, `terms` lists every glossary term and `matches` is empty. With one,
+    """Without a query, `terms` lists glossary terms and `matches` is empty. With one,
     `matches` holds the full entries whose term or an alias contains the query after folding
-    (empty when none does) and `terms` is empty."""
+    (empty when none does) and `terms` is empty. Either list is one page from `offset`:
+    `total` counts every term or match, and `next_offset` is None on the last page."""
 
     query: str | None
     terms: list[GlossaryTermSummary]
     matches: list[GlossaryEntry]
+    total: int
+    offset: int
+    next_offset: int | None
+
+
+# Drafting packet.
+
+
+class FamilyRecurrence(_Frozen):
+    """Where the recurring text units of one exemplar section also appear, counted by
+    version family so that drafts of one deliverable count once.
+
+    `recurring_unit_count` counts the section's units whose text another version family also
+    holds. Only deliverables hold units (a feedback document quoting one does not), and a
+    superseded draft is not counted as a holder. `exemplar_doc_ids` are the packet's exemplars
+    holding at least one of them, this one included. `corpus_family_count` is the most version
+    families holding any one of those units, out of `corpus_family_total` version families of
+    deliverables in the topic, and `latest_holder_date` the newest calendar date among the
+    documents holding them.
+    """
+
+    recurring_unit_count: int
+    exemplar_doc_ids: list[str]
+    corpus_family_count: int
+    corpus_family_total: int
+    latest_holder_date: str | None
+
+
+class ExemplarSection(_Frozen):
+    """One outline entry of an exemplar. `markdown` holds the section without its visual
+    transcripts when `included`, else None; `visual_count` counts those transcripts."""
+
+    section_id: str
+    ordinal: int
+    heading_path: str
+    level: int
+    page_start: int
+    page_end: int
+    char_count: int
+    visual_count: int
+    included: bool
+    family_recurrence: FamilyRecurrence | None
+    markdown: str | None
+
+
+class DraftExemplar(_Frozen):
+    """A prior deliverable chosen as a model for the new one, with its complete outline
+    (`omitted_outline_sections` is 0 unless it is the only exemplar and its outline alone
+    could not fit the packet).
+    `family_doc_ids` are the other members of its version family, at most
+    `snapshot.MAX_FAMILY_DOC_IDS`, with the rest counted in `omitted_family_members`. A summary
+    longer than `snapshot.SUMMARY_CHARS` ends with an ellipsis where it was cut."""
+
+    doc_id: str
+    rel_path: str
+    title: str
+    doc_date: str | None
+    date: DocumentDate | None
+    deliverable_type: str
+    facets: dict[str, list[str]]
+    page_count: int
+    summary: str
+    relevance_score: float
+    version_status: VersionStatus
+    family_doc_ids: list[str]
+    omitted_family_members: int
+    sections: list[ExemplarSection]
+    omitted_outline_sections: int
+
+
+class SupplementalSection(_Frozen):
+    """A section of a document outside the exemplars that holds rare terms of the inputs."""
+
+    doc_id: str
+    doc_title: str
+    date: DocumentDate | None
+    section_id: str
+    heading_path: str
+    markdown: str
+
+
+class DraftCandidate(_Frozen):
+    doc_id: str
+    title: str
+    deliverable_type: str
+    date: DocumentDate | None
+    page_count: int
+    summary: str
+    relevance_score: float
+
+
+class DraftPacket(_Frozen):
+    """Everything `prepare_draft` returns for drafting one deliverable, within one tool result
+    (`snapshot.fits_response`); a section left out for that reason keeps its outline entry and
+    counts in `omitted_sections`. The short guidance, lessons, curator notes and recurring
+    samples come before the exemplars' bulky Markdown.
+
+    `recurring_samples` are the opening words of the recurring prose units
+    (`FamilyRecurrence`) that the included exemplar sections hold in two or more version
+    families, one per unit, as the first included section holding it writes them, folded by
+    `passages.fold_unit`: house text an agent can tell apart from a project's own paragraphs
+    in a section that mixes both."""
+
+    topic: str
+    deliverable_type: str | None
+    drafting_guidance: str
+    lessons: list[FeedbackLesson]
+    omitted_lessons: int
+    curator_notes: list[CuratorNote]
+    omitted_curator_notes: int
+    recurring_samples: list[str]
+    exemplars: list[DraftExemplar]
+    supplemental_sections: list[SupplementalSection]
+    other_candidates: list[DraftCandidate]
+    omitted_sections: int

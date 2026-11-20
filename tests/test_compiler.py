@@ -59,23 +59,22 @@ from arkive_rag.compiler import (
 from arkive_rag.induction import OrganiseCorpus, WriteGuide, binding_evidence
 from arkive_rag.llm import BuildCache
 from arkive_rag.models import (
+    MAX_HEADING_CONTEXT_CHARS,
     MAX_RENDER_SIDE_PX,
     ArkiveError,
-    BlueprintDraft,
-    BlueprintSectionDraft,
     CardHeader,
     ChunkPiece,
     ConversionError,
     CorpusDocument,
     CraftDraft,
-    DeliverableTypeDraft,
     DocumentDate,
     DocumentReading,
+    DocumentRole,
+    DocumentRoleDraft,
     Facet,
     FacetDraft,
     FacetValue,
     FacetValueDraft,
-    GuidanceDraft,
     GuideDraft,
     ObservationCard,
     ObservationDraft,
@@ -132,6 +131,18 @@ def write_files(root: Path, files: dict[str, str]) -> Path:
 
 
 # Discovery.
+
+
+def sole_role(document: CorpusDocument) -> DocumentRole:
+    """The role of a document that is its own version family and reviews nothing."""
+    return DocumentRole(
+        deliverable_type=document.reading.card.deliverable_type,
+        is_feedback=False,
+        feedback_for_types=(),
+        family_id=document.doc_id,
+        version_status="sole",
+        superseded_by=None,
+    )
 
 
 def test_discovery_lists_supported_files_in_sorted_order_and_skips_hidden(tmp_path: Path) -> None:
@@ -214,7 +225,8 @@ def test_curator_notes_get_a_deterministic_card_and_searchable_guidance_chunks(
         document_id("p103-reef-sonar/AGENTS.md"),
         True,
     )
-    assert (guidance.title, guidance.deliverable_type) == ("Status", "curator note")
+    assert (guidance.title, guidance.role.deliverable_type) == ("Status", "curator note")
+    assert (guidance.role.family_id, guidance.role.version_status) == (guidance.doc_id, "sole")
     assert guidance.summary == "The reef Sentinel-2 case study has not been written yet."
     assert {c.kind for c in guidance.chunks} == {"guidance"}
     assert "case study has not been written" in guidance.chunks[0].content
@@ -662,15 +674,10 @@ def test_binding_numbers_chunks_and_builds_breadcrumbs_from_bound_facets() -> No
 
     memo = document_id("p1/memo.pdf")
     printed = DocumentDate(iso="2025-11-20", basis="printed")
-    doc = bind_document(
-        CorpusDocument(
-            memo,
-            "p1/memo.pdf",
-            reading_of(drafts, "Memo", printed_date="20/11/2025", date=printed),
-        ),
-        facets,
-        assignment,
+    source = CorpusDocument(
+        memo, "p1/memo.pdf", reading_of(drafts, "Memo", printed_date="20/11/2025", date=printed)
     )
+    doc = bind_document(source, facets, assignment, sole_role(source))
 
     assert doc.facets == {"client": ("Contoso Ports", "Northwind Marine")}
     assert (doc.doc_date, doc.date) == ("20/11/2025", printed)
@@ -689,11 +696,10 @@ def test_binding_numbers_chunks_and_builds_breadcrumbs_from_bound_facets() -> No
     assert "Rainfall chart" in visual.content and "330.9" in visual.content
     # A document that prints no date shows its metadata date as written.
     embedded = DocumentDate(iso="2024-03-01", basis="metadata")
-    unfaceted = bind_document(
-        CorpusDocument(document_id("memo.pdf"), "memo.pdf", reading_of(drafts, "M", date=embedded)),
-        (),
-        {},
+    plain = CorpusDocument(
+        document_id("memo.pdf"), "memo.pdf", reading_of(drafts, "M", date=embedded)
     )
+    unfaceted = bind_document(plain, (), {}, sole_role(plain))
     assert unfaceted.chunks[0].breadcrumb == "[Doc: M (pp. 2-3) | Section: Climate]"
     assert (unfaceted.doc_date, unfaceted.date) == ("2024-03-01", embedded)
 
@@ -853,9 +859,10 @@ def test_a_runaway_heading_is_cut_only_where_it_labels_section_text() -> None:
     reading = reading_of(drafts, "Memo")
 
     (batch,) = observation_batches(reading.sections)
-    doc = bind_document(CorpusDocument(document_id("m.pdf"), "m.pdf", reading), (), {})
+    source = CorpusDocument(document_id("m.pdf"), "m.pdf", reading)
+    doc = bind_document(source, (), {}, sole_role(source))
 
-    label = heading.strip()[: compiler.MAX_HEADING_CONTEXT_CHARS - 1] + "…"
+    label = heading.strip()[: MAX_HEADING_CONTEXT_CHARS - 1] + "…"
     assert [s.heading_path for s in batch] == [label]
     assert {c.breadcrumb for c in doc.chunks} == {f"[Doc: Memo (pp. 1-1) | Section: {label}]"}
     # The section keeps its whole heading.
@@ -874,19 +881,24 @@ CLIENTS = FacetDraft(
     ],
 )
 MEMO = "p1/2024-memo.md"
-MEMO_TYPE = DeliverableTypeDraft(
-    name="memorandum",
-    description="Memo.",
-    exemplar_doc_ids=[document_id(MEMO)],
-    feedback_doc_ids=[],
-)
-MEMO_BLUEPRINT = BlueprintDraft(
-    description="A survey memo.",
-    outline=[BlueprintSectionDraft(heading="Results", purpose="Findings.", citations=[sec(MEMO)])],
-    conventions=[GuidanceDraft(statement="State areas in hectares.", citations=[sec(MEMO)])],
-    pitfalls=[],
-    standing_passages=[],
-)
+
+
+def memo_organisation(body: dict[str, Any]) -> OrganisationDraft:
+    """The client facet, and every document of the request's batch: the memo a memorandum,
+    any other document a proposal."""
+    text = body["input"][0]["content"][0]["text"]
+    roles = [
+        DocumentRoleDraft(
+            doc_id=doc_id,
+            deliverable_type="memorandum" if doc_id == document_id(MEMO) else "proposal",
+            is_feedback=False,
+            feedback_for_types=[],
+        )
+        for doc_id in re.findall(r"^(doc_[0-9a-f]{10}) \|", text, re.MULTILINE)
+    ]
+    return OrganisationDraft(facets=[CLIENTS], documents=roles)
+
+
 _TOKEN = re.compile(r"\[doc_[0-9a-f]{10}:doc_[0-9a-f]{10}_sec_\d+\]")
 
 
@@ -898,10 +910,7 @@ def cite_last_section(body: dict[str, Any]) -> GuideDraft:
 
 def scripted_api() -> ScriptedOpenAI:
     api = ScriptedOpenAI()
-    api.defaults["OrganisationDraft"] = OrganisationDraft(
-        facets=[CLIENTS], deliverable_types=[MEMO_TYPE]
-    )
-    api.defaults["final_output"] = MEMO_BLUEPRINT
+    api.defaults["OrganisationDraft"] = memo_organisation
     api.defaults["GuideDraft"] = cite_last_section
     return api
 
@@ -935,29 +944,32 @@ def test_unchanged_corpus_rebuilds_from_the_cache_without_provider_requests(
 
     assert api.request_count == requests_after_first
     assert (second.documents, second.guide_markdown) == (first.documents, first.guide_markdown)
-    assert (second.facets, second.blueprints) == (first.facets, first.blueprints)
-    # Every operation of all three passes was made once: two observations, organisation, one
-    # binding judgement per citable document, one blueprint agent run and its support check,
-    # the guide, and the embeddings.
+    assert (second.facets, second.deliverable_types) == (first.facets, first.deliverable_types)
+    assert second.unit_clusters == first.unit_clusters
+    # Every operation of all three passes was made once: two observations, one organisation
+    # batch and its type canonicalisation, one binding judgement per citable document, the
+    # guide, and the embeddings. The two documents share no text or title, so no version pair
+    # is judged.
     assert formats(api) == [
         "GuideDraft",
         "ObservationDraft",
         "ObservationDraft",
         "OrganisationDraft",
-        "final_output",
+        "TypeCanonicalisationDraft",
     ]
-    assert len(api.requests("/decisions")) == 3 and len(api.requests("/embeddings")) == 1
+    assert len(api.requests("/decisions")) == 2 and len(api.requests("/embeddings")) == 1
     efforts = {
         b["text"]["format"]["name"]: b["reasoning"]["effort"] for b in api.requests("/responses")
     }
     assert efforts == {
         "ObservationDraft": "low",
         "OrganisationDraft": "medium",
-        "final_output": "medium",
+        "TypeCanonicalisationDraft": "medium",
         "GuideDraft": "medium",
     }
-    assert first.blueprints[0].conventions[0].statement == "State areas in hectares."
-    assert first.build_settings["efforts"]["write_blueprint"] == "medium"
+    assert [t.name for t in first.deliverable_types] == ["memorandum", "proposal"]
+    assert first.build_settings["efforts"]["canonicalise_types"] == "medium"
+    assert first.build_settings["efforts"]["extract_feedback_lessons"] == "low"
     assert first.build_settings["model"] == "gpt-6.1-sol"
 
 
@@ -1002,7 +1014,7 @@ def test_a_subset_corpus_does_not_reuse_the_full_corpus_induction(tmp_path: Path
 
     # The reading of a.md is reused; organisation and the guide are requested again, and the
     # guide cites only the subset's documents.
-    assert formats(api, start) == ["GuideDraft", "OrganisationDraft"]
+    assert formats(api, start) == ["GuideDraft", "OrganisationDraft", "TypeCanonicalisationDraft"]
     assert _TOKEN.findall(corpus.guide_markdown) == [f"[{document_id('a.md')}:{sec('a.md')}]"]
 
 
@@ -1029,7 +1041,7 @@ def test_pdf_compiles_through_render_transcribe_and_observation(tmp_path: Path) 
     corpus = compile_corpus(tmp_path / "corpus", FakeGateway(), topic="t", title="T")
 
     (doc,) = corpus.documents
-    assert (doc.format, doc.title, doc.deliverable_type) == ("pdf", "Rainfall", "memorandum")
+    assert (doc.format, doc.title, doc.role.deliverable_type) == ("pdf", "Rainfall", "memorandum")
     assert [p.page_number for p in doc.pages] == [1, 2]
     assert all(p.webp_bytes[8:12] == b"WEBP" for p in doc.pages)
     assert "330.9" in doc.pages[0].native_text
@@ -1957,7 +1969,7 @@ def test_a_metadata_date_reaches_organisation_binding_and_the_guide(tmp_path: Pa
 
     compile_corpus(corpus_dir, gateway, topic="t", title="T")
 
-    label = "Date: 2025-06-30 (file metadata)"
+    label = "2025-06-30 (file metadata)"
     (organise,) = gateway.of_type(OrganiseCorpus)
     (guide,) = gateway.of_type(WriteGuide)
     assert label in organise.text() and label in guide.text()

@@ -28,30 +28,33 @@ from arkive_rag.compiler import (
     parse_markdown_blocks,
 )
 from arkive_rag.induction import (
+    ORDER_OPERATION,
+    VERSION_OPERATION,
+    CanonicaliseTypes,
+    ExtractFeedbackLessons,
     OrganiseCorpus,
-    WriteBlueprint,
     WriteGlossary,
     WriteGuide,
 )
-from arkive_rag.llm import AgentRequest, OpenAIGateway, StructuredRequest, Tool
+from arkive_rag.llm import OpenAIGateway, StructuredRequest
 from arkive_rag.models import (
-    BlueprintDraft,
-    BlueprintSectionDraft,
+    CanonicalTypeDraft,
     CraftDraft,
-    DeliverableTypeDraft,
+    DocumentRoleDraft,
     FacetDraft,
     FacetValueDraft,
+    FeedbackLessonDraft,
+    FeedbackLessonsDraft,
     GlossaryDraft,
     GlossaryEntryDraft,
-    GuidanceDraft,
     GuideDraft,
     ObservationDraft,
     OrganisationDraft,
     PageExtraction,
     SenseDraft,
-    StandingPassageSelection,
     StatedAttribute,
     TermDraft,
+    TypeCanonicalisationDraft,
     document_id,
     fold_for_quote,
 )
@@ -60,7 +63,8 @@ from arkive_rag.snapshot import write_snapshot
 TEST_BASE_URL = "https://api.openai.test/v1"
 SCRIPTED_EMBEDDING_DIMENSIONS = 8
 # Synthetic documents state what the fake gateway observes in plain lines: `Key: value`
-# attributes, `Convention:` / `Reviewer:` craft lines, and `**Term** (alias) means ...` terms.
+# attributes, `Convention:` / `Reviewer:` craft lines (a `Reviewer:` line is also a feedback
+# lesson), and `**Term** (alias) means ...` terms.
 _KEY_LINE = re.compile(r"([A-Z][A-Za-z]{1,19}): (\S.*)")
 _CRAFT_KEYS = {"Convention": "convention", "Reviewer": "reviewer_feedback", "Caveat": "caveat"}
 _BOLD_TERM = re.compile(r"\*\*([^*]+)\*\*(?: \(([^)]+)\))?")
@@ -87,17 +91,41 @@ def hash_embedding(text: str, dimensions: int) -> NDArray[np.float32]:
     return vector / norm
 
 
-def generic_heading(heading_path: str) -> str:
-    """A blueprint outline heading without the exemplar's own title: a document's top-level
-    heading names the project, so it becomes the generic opening section."""
-    *parents, last = heading_path.split(" > ")
-    return last if parents else "Title and summary"
+# A version token in a title, such as `v0.9` or `V2`.
+_VERSION_TOKEN = re.compile(r"\bv(\d+(?:\.\d+)*)\b", re.IGNORECASE)
+_PAIR = re.compile(r"Document (doc_[0-9a-f]{10}) .*Document (doc_[0-9a-f]{10})")
+_CARD_TITLE = re.compile(r"=== (doc_[0-9a-f]{10}) ===\n(?:.*\n)*?Title: (.*)")
+
+JudgeRule = Callable[[str, str], float | None]
 
 
-def _call(tool: Tool, **args: str) -> Any:
-    result = tool.invoke(args)
-    assert isinstance(result, str), "the source tools return text"
-    return json.loads(result)
+def card_titles(evidence: str) -> dict[str, str]:
+    """Each document ID of version evidence with the title its card shows."""
+    return {m[1]: m[2] for m in _CARD_TITLE.finditer(evidence)}
+
+
+def _version(title: str) -> tuple[int, ...] | None:
+    match = _VERSION_TOKEN.search(title)
+    return tuple(int(p) for p in match[1].split(".")) if match else None
+
+
+def same_deliverable(evidence: str, predicate: str) -> float:
+    """Fake rule for version pairs: titles equal once a version token is removed."""
+    a, b = _PAIR.search(predicate).groups()  # type: ignore[union-attr]
+    titles = card_titles(evidence)
+
+    def stem(title: str) -> str:
+        return " ".join(_VERSION_TOKEN.sub("", title).casefold().split())
+
+    return 0.9 if stem(titles[a]) == stem(titles[b]) else 0.1
+
+
+def later_version(evidence: str, predicate: str) -> float:
+    """Fake rule for ordering: the first document's title has the higher version token."""
+    a, b = _PAIR.search(predicate).groups()  # type: ignore[union-attr]
+    titles = card_titles(evidence)
+    va, vb = _version(titles[a]), _version(titles[b])
+    return 0.9 if va is not None and vb is not None and va > vb else 0.1
 
 
 class FakeGateway:
@@ -107,11 +135,12 @@ class FakeGateway:
     the native text layer as Markdown blocks. Observation reads the synthetic line conventions
     above. Organisation makes one path-bound facet from the top-level folders (named by a
     `Folders: <name>` line in a root curator note, else `project`), one content-bound facet per
-    attribute with two or more values, and one deliverable type per observed type. The
-    blueprint agent calls the tools it is given and selects every standing passage candidate
-    of its request except `Key: value` lines (such as a `Convention:` line), labelled with
-    the heading of the candidate's first section. `judge` answers 0.9 when every double-quoted
-    span of a predicate occurs in the evidence, else 0.1.
+    attribute with two or more values, gives each document its observed type, and makes a
+    document whose type says "review" feedback for the batch's other types. Canonicalisation
+    keeps every label as its own type. Feedback lessons are the `Reviewer:` lines. `judge`
+    answers version questions by `same_deliverable` and `later_version`, and any other
+    question 0.9 when every double-quoted span of a predicate occurs in the evidence, else
+    0.1; `judge_rules` replaces the rule of an operation.
 
     Each `*_script` queues responses consumed before the deterministic answer. Every request
     is kept in `requests`, its operation name in `calls`, and judge questions in `judged`.
@@ -126,16 +155,24 @@ class FakeGateway:
         page_script: Sequence[PageExtraction] = (),
         observe_script: Sequence[ObservationDraft] = (),
         organise_script: Sequence[OrganisationDraft] = (),
+        types_script: Sequence[TypeCanonicalisationDraft] = (),
+        lesson_script: Sequence[FeedbackLessonsDraft] = (),
         glossary_script: Sequence[GlossaryDraft] = (),
-        blueprint_script: Sequence[BlueprintDraft] = (),
         guide_script: Sequence[str] = (),
+        judge_rules: Mapping[str, JudgeRule] | None = None,
     ) -> None:
         self.page_script = list(page_script)
         self.observe_script = list(observe_script)
         self.organise_script = list(organise_script)
+        self.types_script = list(types_script)
+        self.lesson_script = list(lesson_script)
         self.glossary_script = list(glossary_script)
-        self.blueprint_script = list(blueprint_script)
         self.guide_script = list(guide_script)
+        self.judge_rules: dict[str, JudgeRule] = {
+            VERSION_OPERATION: same_deliverable,
+            ORDER_OPERATION: later_version,
+            **(judge_rules or {}),
+        }
         self.requests: list[object] = []
         self.calls: list[str] = []
         self.judged: list[tuple[str, str, list[str]]] = []
@@ -177,13 +214,32 @@ class FakeGateway:
                 return headers[0]
             case OrganiseCorpus():
                 return self._pop(self.organise_script) or self.organise(request)
+            case CanonicaliseTypes(labels=labels):
+                scripted = self._pop(self.types_script)
+                return scripted or TypeCanonicalisationDraft(
+                    types=[
+                        CanonicalTypeDraft(
+                            name=t.label, description=f"A {t.label}.", labels=[t.label]
+                        )
+                        for t in labels
+                    ]
+                )
+            case ExtractFeedbackLessons(sections=sections):
+                scripted_lessons = self._pop(self.lesson_script)
+                return scripted_lessons or FeedbackLessonsDraft(
+                    lessons=[
+                        FeedbackLessonDraft(statement=line.removeprefix("Reviewer: "), quote=line)
+                        for section in sections
+                        for line in section.markdown.splitlines()
+                        if line.startswith("Reviewer: ")
+                    ]
+                )
             case WriteGlossary():
                 return self._pop(self.glossary_script) or self.glossary(request)
             case WriteGuide(topic=topic, catalog=catalog):
                 markdown = self._pop(self.guide_script)
                 if markdown is None:
-                    sections = [(e.doc_id, s.section_id) for e in catalog for s in e.sections][:2]
-                    cited = " ".join(f"[{d}:{s}]" for d, s in sections)
+                    cited = " ".join(f"[{e.doc_id}:{e.first_section_id}]" for e in catalog[:2])
                     markdown = f"# {topic}\n\nThe corpus covers several documents {cited}."
                 return GuideDraft(guide_markdown=markdown)
         raise AssertionError(f"unexpected request {request!r}")
@@ -229,8 +285,7 @@ class FakeGateway:
     def organise(self, request: OrganiseCorpus) -> OrganisationDraft:
         facets: list[FacetDraft] = []
         top = sorted({f for f in request.folders if "/" not in f})
-        root_notes = [n.content for n in request.notes if "/" not in n.scope_path]
-        named = [m[1] for note in root_notes if (m := _FOLDER_FACET.search(note))]
+        named = [m[1] for m in [_FOLDER_FACET.search(request.notes)] if m]
         if len(top) >= 2:
             name = named[0] if named else "project"
             values = [
@@ -239,8 +294,8 @@ class FakeGateway:
             ]
             facets.append(FacetDraft(name=name, description=f"The {name} folder.", values=values))
         stated: dict[str, set[str]] = {}
-        for digest in request.cards:
-            for attribute in digest.card.attributes:
+        for digest in request.digests:
+            for attribute in digest.attributes:
                 stated.setdefault(attribute.name, set()).add(attribute.value)
         for name in sorted(stated):
             if name in _NOT_FACETS or len(stated[name]) < 2:
@@ -258,21 +313,21 @@ class FakeGateway:
             facets.append(
                 FacetDraft(name=name, description=f"The {name} a document states.", values=values)
             )
-        by_type: dict[str, list[str]] = {}
-        for digest in request.cards:
-            if digest.card.deliverable_type != "document":
-                by_type.setdefault(digest.card.deliverable_type, []).append(digest.doc_id)
-        feedback = sorted(d for t, ids in by_type.items() if "review" in t for d in ids)
-        types = [
-            DeliverableTypeDraft(
-                name=name,
-                description=f"A {name}.",
-                exemplar_doc_ids=ids,
-                feedback_doc_ids=[] if "review" in name else feedback,
+        reviewed = sorted(
+            {d.observed_type for d in request.digests if "review" not in d.observed_type}
+        )
+        documents = [
+            DocumentRoleDraft(
+                doc_id=d.doc_id,
+                deliverable_type=d.observed_type,
+                is_feedback="review" in d.observed_type,
+                feedback_for_types=(reviewed or [d.observed_type])
+                if "review" in d.observed_type
+                else [],
             )
-            for name, ids in sorted(by_type.items())
+            for d in request.digests
         ]
-        return OrganisationDraft(facets=facets, deliverable_types=types)
+        return OrganisationDraft(facets=facets, documents=documents)
 
     def glossary(self, request: WriteGlossary) -> GlossaryDraft:
         entries: list[GlossaryEntryDraft] = []
@@ -294,60 +349,13 @@ class FakeGateway:
             )
         return GlossaryDraft(entries=entries)
 
-    def run_agent[T: BaseModel](self, request: AgentRequest[T]) -> T:
-        self._record(request, request.operation)
-        assert isinstance(request, WriteBlueprint), f"unexpected agent request {request!r}"
-        scripted = self._pop(self.blueprint_script)
-        return cast(T, scripted or self.blueprint(request))
-
-    def blueprint(self, request: WriteBlueprint) -> BlueprintDraft:
-        tools = {t.name: t for t in request.tools}
-        dtype = request.deliverable_type
-        _call(tools["grep"], pattern=dtype.name)
-
-        def lines(doc_ids: Sequence[str], key: str) -> list[GuidanceDraft]:
-            found: dict[str, list[str]] = {}
-            for doc_id in doc_ids:
-                for section in _call(tools["outline"], doc_id=doc_id)["sections"]:
-                    read = _call(tools["read_section"], section_id=section["section_id"])
-                    for line in read["markdown"].splitlines():
-                        if line.startswith(f"{key}: "):
-                            statement = line.removeprefix(f"{key}: ")
-                            found.setdefault(statement, []).append(section["section_id"])
-            return [GuidanceDraft(statement=s, citations=c) for s, c in found.items()]
-
-        first = _call(tools["outline"], doc_id=dtype.exemplar_doc_ids[0])
-        conventions = lines(dtype.exemplar_doc_ids, "Convention")
-        pitfalls = lines(dtype.feedback_doc_ids, "Reviewer")
-        selected = [
-            StandingPassageSelection(
-                candidate_id=c.candidate_id,
-                label=generic_heading(
-                    _call(tools["read_section"], section_id=c.citations[0])["heading_path"]
-                ),
-            )
-            for c in request.standing_candidates
-            if not _KEY_LINE.fullmatch(c.text)
-        ]
-        return BlueprintDraft(
-            description=f"How the collection writes a {dtype.name}.",
-            outline=[
-                BlueprintSectionDraft(
-                    heading=generic_heading(s["heading_path"]),
-                    purpose=f"Covers {generic_heading(s['heading_path'])}.",
-                    citations=[s["section_id"]],
-                )
-                for s in first["sections"]
-            ],
-            conventions=conventions,
-            pitfalls=pitfalls,
-            standing_passages=selected,
-        )
-
     def judge(self, operation: str, evidence: str, predicates: Sequence[str]) -> list[float | None]:
         with self._lock:
             self.calls.append(operation)
             self.judged.append((operation, evidence, list(predicates)))
+        rule = self.judge_rules.get(operation)
+        if rule is not None:
+            return [rule(evidence, predicate) for predicate in predicates]
         haystack = fold_for_quote(evidence)
         return [
             0.9
@@ -459,8 +467,22 @@ def _default_structured(schema_name: str, body: dict[str, Any]) -> BaseModel:
             terms=[],
             craft=[],
         )
+    text = body["input"][0]["content"][0]["text"]
     if schema_name == "OrganisationDraft":
-        return OrganisationDraft(facets=[], deliverable_types=[])
+        # Every document of the batch, from its digest line, as a memorandum.
+        doc_ids = re.findall(r"^(doc_[0-9a-f]{10}) \|", text, re.MULTILINE)
+        roles = [
+            DocumentRoleDraft(
+                doc_id=d, deliverable_type="memorandum", is_feedback=False, feedback_for_types=[]
+            )
+            for d in doc_ids
+        ]
+        return OrganisationDraft(facets=[], documents=roles)
+    if schema_name == "TypeCanonicalisationDraft":
+        labels = re.findall(r"^- (.+?) \(", text, re.MULTILINE)
+        return TypeCanonicalisationDraft(
+            types=[CanonicalTypeDraft(name=t, description=t, labels=[t]) for t in labels]
+        )
     if schema_name == "GuideDraft":
         # The first citation token the request's catalog lists.
         cited = _CATALOG_CITATION.search(json.dumps(body))

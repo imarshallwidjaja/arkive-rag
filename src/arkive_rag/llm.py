@@ -3,8 +3,8 @@ meter and spend limit.
 
 Domain modules own prompts, output schemas and reasoning effort through request objects; the
 gateway owns transport, retries, caching and metering. Single-shot structured calls (`run`) and
-bounded agent runs (`run_agent`) are separate operations: a request never carries an optional
-tool list.
+free-text agent conversations (`converse`, used by the evaluation harness) are separate
+operations: a structured request never carries a tool list.
 """
 
 from __future__ import annotations
@@ -67,8 +67,11 @@ DEFAULT_EMBEDDING_DIMENSIONS = 1536
 EMBEDDING_BATCH_SIZE = 128
 # About 35k tokens per request, far below the provider's 300k-token batch ceiling.
 EMBEDDING_BATCH_CHARS = 100_000
-# The Decisions API accepts 1 to 400 questions per request.
+# The Decisions API accepts 1 to 400 questions per request. A request also keeps its
+# evidence and questions together within `MAX_JUDGE_REQUEST_CHARS`, about 30k tokens, the
+# bound every induction prompt keeps.
 MAX_JUDGE_PREDICATES = 400
+MAX_JUDGE_REQUEST_CHARS = 90_000
 # Waits between the five attempts of one provider operation.
 RETRY_DELAYS_SECONDS = (2.0, 5.0, 12.0, 25.0)
 BUILD_REQUEST_TIMEOUT_SECONDS = 180.0
@@ -177,30 +180,6 @@ class Tool:
     invoke: Callable[[dict[str, Any]], ToolResult | Awaitable[ToolResult]]
 
 
-class AgentRequest[T: BaseModel](Protocol):
-    """One bounded agent run with read-only tools, ending in structured output.
-
-    `source_digest` is a SHA-256 over everything the tools can read; it is part of the cache
-    key, so a result computed while the tools saw one source set never answers another.
-    """
-
-    @property
-    def operation(self) -> str: ...
-    @property
-    def output(self) -> type[T]: ...
-    @property
-    def effort(self) -> Effort: ...
-    @property
-    def max_turns(self) -> int: ...
-    @property
-    def tools(self) -> Sequence[Tool]: ...
-    @property
-    def source_digest(self) -> str: ...
-    @property
-    def instructions(self) -> str: ...
-    def text(self) -> str: ...
-
-
 TOOL_CALL_ARGUMENTS_CHARS = 2_000
 TOOL_CALL_RESULT_HEAD_CHARS = 200
 
@@ -258,8 +237,6 @@ class LanguageGateway(Protocol):
     def describe(self) -> dict[str, str]: ...
 
     def run[T: BaseModel](self, request: StructuredRequest[T]) -> T: ...
-
-    def run_agent[T: BaseModel](self, request: AgentRequest[T]) -> T: ...
 
     def judge(self, operation: str, evidence: str, predicates: Sequence[str]) -> list[float | None]:
         """One probability per predicate, in order; None where the provider refused it."""
@@ -981,12 +958,33 @@ class OpenAIGateway:
         """Decisions `predicate` questions over shared evidence, in order.
 
         Each answer is the probability that the predicate holds, or None where the provider
-        refused that question. Empty predicates make no request; more than
-        `MAX_JUDGE_PREDICATES` are split across requests.
+        refused that question. Empty predicates make no request. Predicates are sent in order
+        in requests of at most `MAX_JUDGE_PREDICATES` questions whose evidence and questions
+        together hold at most `MAX_JUDGE_REQUEST_CHARS` characters; evidence that leaves no
+        room for one of the questions is the caller's error (`ValueError`), raised before any
+        request.
         """
+        room = MAX_JUDGE_REQUEST_CHARS - len(evidence)
+        too_long = [p for p in predicates if len(p) > room]
+        if too_long:
+            raise ValueError(
+                f"{operation}: {len(evidence)} characters of evidence leave {room} for a"
+                f" question, and a question has {len(too_long[0])}"
+            )
+        batches: list[list[str]] = []
+        used = 0
+        for predicate in predicates:
+            if (
+                not batches
+                or len(batches[-1]) == MAX_JUDGE_PREDICATES
+                or used + len(predicate) > room
+            ):
+                batches.append([])
+                used = 0
+            batches[-1].append(predicate)
+            used += len(predicate)
         results: list[float | None] = []
-        for start in range(0, len(predicates), MAX_JUDGE_PREDICATES):
-            batch = list(predicates[start : start + MAX_JUDGE_PREDICATES])
+        for batch in batches:
             results += self._judge_batch(operation, evidence, batch)
         return results
 
@@ -1125,60 +1123,6 @@ class OpenAIGateway:
 
     # Agent runs.
 
-    def run_agent[T: BaseModel](self, request: AgentRequest[T]) -> T:
-        """A bounded Agents SDK run ending in `request.output`, on its own event loop.
-
-        Not finishing within `max_turns`, a non-completed response, a model behaviour error,
-        or a provider or budget error raises `ProviderError`. A tool exception other than
-        invalid input propagates unchanged; a `ProviderError` from a tool is one.
-        """
-        tools = _canonical_tools(request.tools)
-        instructions, text, schema = request.instructions, request.text(), request.output
-        tool_specs = json.dumps(
-            [[t.name, t.description, dict(t.parameters)] for t in tools], sort_keys=True
-        )
-        cache_key = BuildCache.key(
-            request.operation,
-            self._model,
-            request.effort,
-            instructions,
-            text,
-            json.dumps(schema.model_json_schema(), sort_keys=True),
-            str(request.max_turns),
-            tool_specs,
-            request.source_digest,
-        )
-        cached = self._cached_model(cache_key, schema)
-        if cached is not None:
-            return cached
-        label = f"{request.operation} on {self._model}"
-
-        async def run() -> T:
-            async with self._async_client_factory() as client:
-                try:
-                    output = await self._agent_run(
-                        client,
-                        operation=request.operation,
-                        effort=request.effort,
-                        instructions=instructions,
-                        text=text,
-                        tools=tools,
-                        max_turns=request.max_turns,
-                        output_type=schema,
-                        tally=_RunTally(),
-                    )
-                except MaxTurnsExceeded as exc:
-                    raise ProviderError(
-                        f"{label} did not finish within {request.max_turns} turns"
-                    ) from exc
-                except AgentsException as exc:
-                    raise ProviderError(f"{label} failed: {exc}") from exc
-            if not isinstance(output, schema):
-                raise ProviderError(f"{label} returned no {schema.__name__}")
-            return output
-
-        return self._store_model(cache_key, asyncio.run(run()))
-
     async def converse(
         self,
         *,
@@ -1221,7 +1165,6 @@ class OpenAIGateway:
                     text=prompt,
                     tools=_canonical_tools(tools),
                     max_turns=max_turns,
-                    output_type=None,
                     tally=tally,
                 )
             except MaxTurnsExceeded:
@@ -1245,7 +1188,6 @@ class OpenAIGateway:
         text: str,
         tools: Sequence[Tool],
         max_turns: int,
-        output_type: type[BaseModel] | None,
         tally: _RunTally,
     ) -> object:
         label = f"{operation} on {self._model}"
@@ -1282,7 +1224,6 @@ class OpenAIGateway:
                 reasoning=Reasoning(effort=effort), max_tokens=AGENT_MAX_OUTPUT_TOKENS
             ),
             tools=[_sdk_tool(tool, tally) for tool in tools],
-            output_type=output_type,
         )
         try:
             result = await Runner.run(

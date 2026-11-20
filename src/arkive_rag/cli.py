@@ -89,9 +89,6 @@ def build(
             " calls in flight can pass it, and the estimate ignores the long-context surcharge."
         ),
     ] = None,
-    trace: Annotated[
-        bool, typer.Option(help="Send Agents SDK traces of agent runs to the OpenAI dashboard.")
-    ] = False,
 ) -> None:
     """Compile CORPUS_DIR into a snapshot file."""
     slug = topic or _slug(corpus_dir.resolve().name)
@@ -102,7 +99,7 @@ def build(
         check_build_paths(corpus_dir, output, *([cache] if cache else []))
         build_cache = BuildCache(cache) if cache else None
         try:
-            gateway = OpenAIGateway(cache=build_cache, meter=meter, trace=trace)
+            gateway = OpenAIGateway(cache=build_cache, meter=meter)
             corpus = compile_corpus(
                 corpus_dir,
                 gateway,
@@ -127,20 +124,44 @@ def inspect(snapshot: Path) -> None:
     """Print a JSON summary of a snapshot."""
     with _domain_errors(), TopicSnapshot.open(snapshot) as snap:
         documents = snap.list_documents()
-        outlines = [snap.outline(d.doc_id) for d in documents]
+        families: dict[str, list[dict[str, str | None]]] = {}
+        for d in documents:
+            families.setdefault(d.family_id, []).append(
+                {
+                    "doc_id": d.doc_id,
+                    "version_status": d.version_status,
+                    "superseded_by": d.superseded_by,
+                }
+            )
         _echo_json(
             {
-                **snap.summary().model_dump(),
+                "topic": snap.topic,
+                "title": snap.title,
+                "created_at": snap.created_at,
+                "corpus_fingerprint": snap.corpus_fingerprint,
+                "arkive_version": snap.arkive_version,
+                "document_count": len(documents),
+                "glossary_terms": len(snap.glossary),
                 "embedding_model": snap.embedding_model,
                 "embedding_dimensions": snap.embedding_dimensions,
                 "build_settings": snap.build_settings,
                 "build_report": snap.build_report.model_dump(),
                 "facets": [f.model_dump() for f in snap.facets],
                 "glossary": [e.model_dump() for e in snap.glossary],
-                "blueprints": [b.model_dump() for b in snap.blueprints],
+                "deliverable_types": [t.model_dump() for t in snap.type_summaries()],
+                "version_families": [
+                    {"family_id": family_id, "members": members}
+                    for family_id, members in families.items()
+                    if len(members) > 1
+                ],
+                "feedback_lessons": [lesson.model_dump() for lesson in snap.feedback_lessons],
+                "recurring_units": snap.recurring_unit_count,
                 "documents": [
-                    {**o.document.model_dump(exclude={"summary"}), "sections": len(o.sections)}
-                    for o in outlines
+                    {
+                        **d.model_dump(exclude={"summary"}),
+                        "sections": len(snap.full_outline(d.doc_id)),
+                    }
+                    for d in documents
                 ],
             }
         )

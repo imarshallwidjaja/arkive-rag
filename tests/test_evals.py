@@ -34,7 +34,8 @@ from arkive_rag.models import (
 )
 from arkive_rag.passages import shingles
 from arkive_rag.server import INSTRUCTIONS, TopicCatalog, create_mcp_server
-from arkive_rag.snapshot import TopicSnapshot
+from arkive_rag.snapshot import DRAFTING_GUIDANCE, TopicSnapshot
+from evals import agents as eval_agents
 from evals import drafting
 from evals import run as eval_run
 from evals.ablation import first_satisfying_rank, run_layer1, summarize_ranks
@@ -166,6 +167,11 @@ def test_example_collection_packs_match_their_collections_and_hold_out_their_ref
                 summary="",
                 page_count=0,
                 is_curator_note=source.is_curator_note,
+                is_feedback=False,
+                feedback_for_types=[],
+                family_id=holdout.reference_doc_id,
+                version_status="sole",
+                superseded_by=None,
                 facets={},
             )
             check_reference_held_out(holdout, reference)
@@ -753,84 +759,75 @@ def test_exemplars_prompt_labels_documents_by_path_without_visuals_and_ends_with
     assert prompt.endswith("RUN NOTES:\n- area: 812 km2")
 
 
-# Each drafting obligation of the MCP server's instructions: the phrase that carries it there
-# and in the exemplars-in-context rules.
+# Each drafting obligation the MCP server and the exemplars-in-context rules share: the phrase
+# that carries it in the server's drafting text (its instructions and the drafting packet's
+# guidance) and in the exemplars-in-context rules.
 DRAFTING_OBLIGATIONS = {
     "follow_shared_structure": (
-        "follow its outline, conventions and reviewer pitfalls",
+        "Match the closest applicable exemplar's structure, heading hierarchy",
         "Follow the structure and conventions the documents share",
     ),
-    "mirror_layout": (
-        "mirror its heading levels and generic table column headers",
-        "Mirror the documents' heading levels and generic table column headers",
-    ),
-    "no_project_specific_headings": (
-        "Do not reuse project-specific headings or facts",
-        "Do not reuse their project-specific headings or facts",
+    "apply_reviewer_feedback": (
+        "Apply the lessons",
+        "avoid what any reviewer feedback among them criticises",
     ),
     "project_facts_from_inputs_only": (
-        "comes only from the user's inputs",
+        "for the new work only from the user's inputs",
         "comes only from the run notes",
     ),
-    "project_facts_take_precedence": ("This rule takes precedence", "This rule takes precedence"),
-    "house_wording_as_written": (
-        "keep their organisation names, method references and attributions as written",
-        "keep its organisation names, method references and attributions as written",
+    "reuse_house_method_text": (
+        "Reuse and adapt the exemplars' domain methodology explanations",
+        "Reproduce it where it applies",
     ),
-    "corpus_wording_only_as_house_text": (
-        "Reuse other wording only from standing passages",
-        "Reuse other wording, names, references and attributions from the documents only within",
-    ),
-    "enumerations_in_full": ("list every item in full", "list every item in full"),
-    "standalone": ("Write a standalone deliverable", "Write a standalone deliverable"),
+    "enumerations_in_full": ("Enumerate listed items in full", "list every item in full"),
+    "standalone": ("Write a clean standalone deliverable", "Write a standalone deliverable"),
 }
 
 
-# The server's drafting rules as `EXEMPLAR_DRAFTING_RULES` was last reconciled with them.
+# The server's drafting instructions as `EXEMPLAR_DRAFTING_RULES` was last reconciled with them.
 SERVER_DRAFTING_RULES = """\
-2. Drafting a new deliverable from the user's own inputs:
-   - Call get_blueprint for the deliverable type and follow its outline, conventions
-     and reviewer pitfalls.
-   - For each section whose layout matters, read one of its cited exemplar sections
-     with read_section and mirror its heading levels and generic table column headers.
-     Do not reuse project-specific headings or facts. Reuse other wording only from
-     standing passages.
-   - Every fact about the user's project (its client and other parties, people, places,
-     dates, quantities, budgets, targets, findings, identifiers, file names) comes only
-     from the user's inputs. This rule takes precedence over the next one.
-   - The blueprint's standing passages are the collection's own house text. Reproduce
-     them with their wording, without commentary about where they come from, and keep
-     their organisation names, method references and attributions as written. Adapt or
-     leave out only the part of a passage that belongs to one particular project (its
-     client, site, dates, quantities or results), using the user's inputs. Names,
-     references and attributions from the corpus may be reused only when they appear in
-     a standing passage.
-   - Where the user's inputs enumerate items (files, deliverables, parameters,
-     results), list every item in full, never as patterns or "etc.".
-   - Write a standalone deliverable: no Arkive doc_id or section_id, and no mention of
-     the exemplar or feedback documents.
+3. Drafting a deliverable: call prepare_draft with the user's full project_inputs, never
+   summarised, and follow the drafting_guidance, exemplars, lessons and curator_notes it
+   returns. Use read_section for an outline entry it did not include.
 """
+
+# The drafting packet's guidance, as pinned with the rules.
+PINNED_DRAFTING_GUIDANCE = """\
+- Take every fact, measurement, date, quantity, parameter, personnel list and deliverable
+  file name for the new work only from the user's inputs. Enumerate listed items in full and
+  never invent unstated measurements or results.
+- Reuse and adapt the exemplars' domain methodology explanations, equations, literature
+  references, generic table structures and technical caveats wherever the user's inputs use
+  the same method, instrument, sensor or workflow.
+- Treat each exemplar's date, facets and deliverable_type and each section's
+  family_recurrence (exemplar_doc_ids and corpus_family_count) as factual provenance. A
+  clause shared across several independent version families is established house text; a
+  clause found in only one family (corpus_family_count 1) may be a newly adopted standard or
+  a project- or modality-specific requirement. Weigh dates, client and project scope and the
+  input modality: for example, do not copy audio or speech retention rules when no audio was
+  recorded, or tool-usage disclosures confirmed only for another project. When working with a
+  user and an institutional policy is genuinely uncertain, ask; when producing a standalone
+  deliverable directly, omit unconfirmed claims that could misstate the project or the
+  organisation.
+- Match the closest applicable exemplar's structure, heading hierarchy and concise register,
+  without meta-commentary about the inputs. Apply the lessons and curator notes. Call
+  read_section for any relevant outline entry with included false. Write a clean standalone
+  deliverable with no doc_id or section_id tokens."""
 
 
 # The drafting guidance of the server's tool descriptions, as the server publishes them.
 SERVER_DRAFTING_TOOL_DESCRIPTIONS = {
-    "get_blueprint": (
-        "The full writing blueprint for one deliverable type: section outline with cited\n"
-        "exemplar sections, conventions, reviewer pitfalls, exemplar and feedback documents,\n"
-        "and standing passages: the collection's house text, which recurs in another exemplar\n"
-        "document, exactly as it appears in its first cited section. When drafting, keep a\n"
-        "passage's organisation names, method references and attributions as written, and\n"
-        "adapt only the part that belongs to one particular project. The type is matched\n"
-        "ignoring case and surrounding spaces."
+    "prepare_draft": (
+        "Everything needed to draft one new deliverable from the user's inputs: up to three\n"
+        "prior exemplars ranked against them, each with its complete outline and as much whole\n"
+        "section text as fits, other candidates, reviewer lessons, curator notes and drafting\n"
+        "guidance, with provenance (dates, version families, recurrence counts). Pass the\n"
+        "user's full inputs as project_inputs. deliverable_type is optional and matched\n"
+        "ignoring case; an unknown type lists the valid ones. Works without OPENAI_API_KEY."
     ),
     "read_section": (
-        "Full Markdown of one section, with the IDs of its neighbouring sections.\n\n"
-        "When drafting a new deliverable, mirror an exemplar section's heading levels and\n"
-        "generic table column headers, but not its project-specific headings or facts. Reuse\n"
-        "other wording, names, references and attributions only from the blueprint's standing\n"
-        "passages, which are house text kept as written apart from\n"
-        "their project-specific parts; take every fact about the user's project from the\n"
-        "user's inputs, and never cite doc_id or section_id in the deliverable.\n"
+        "Markdown of one section, with the IDs of its neighbouring sections. A section too\n"
+        "long for one result comes in parts: pass next_offset as offset for the next part."
     ),
 }
 
@@ -868,11 +865,12 @@ def test_exemplars_in_context_rules_carry_the_pinned_drafting_rules_of_the_serve
     descriptions = anyio.run(published_descriptions)
     # Every drafting surface is pinned word for word: an edit to any of them fails here until
     # the pins, the obligation map and, where an obligation changed, the rules move together.
-    assert INSTRUCTIONS[INSTRUCTIONS.index("2. Drafting") :] == SERVER_DRAFTING_RULES
+    assert INSTRUCTIONS[INSTRUCTIONS.index("3. Drafting") :] == SERVER_DRAFTING_RULES
+    assert DRAFTING_GUIDANCE == PINNED_DRAFTING_GUIDANCE
     for name, pinned in SERVER_DRAFTING_TOOL_DESCRIPTIONS.items():
         assert descriptions[name] == pinned, name
     assert EXEMPLAR_DRAFTING_RULES == PINNED_EXEMPLAR_DRAFTING_RULES
-    server_text = " ".join(SERVER_DRAFTING_RULES.split())
+    server_text = " ".join(f"{SERVER_DRAFTING_RULES} {DRAFTING_GUIDANCE}".split())
     rules_text = " ".join(EXEMPLAR_DRAFTING_RULES.split())
     for name, (server, rules) in DRAFTING_OBLIGATIONS.items():
         assert server in server_text, name
@@ -914,6 +912,11 @@ def reference_doc(**overrides: Any) -> DocumentInfo:
         "summary": "Estuary proposal.",
         "page_count": 1,
         "is_curator_note": False,
+        "is_feedback": False,
+        "feedback_for_types": [],
+        "family_id": "doc_001",
+        "version_status": "sole",
+        "superseded_by": None,
         "facets": {},
     }
     return DocumentInfo.model_validate(fields | overrides)
@@ -1611,6 +1614,33 @@ def test_qa_evidence_labels_the_sections_each_anchor_covers_and_refuses_oversize
     )
 
 
+def test_harness_reads_every_section_whole_however_the_mcp_views_page_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 500 sections need several outline pages, and 20,000 three-byte characters several
+    # section parts, in the MCP views; the harness reads neither through them.
+    wide = "\u6587" * 20_000
+    sections = "".join(
+        f"\n## Part {i}\n\n{wide if i == 250 else f'Text {i}.'}\n" for i in range(500)
+    )
+    path = compile_snapshot(tmp_path, {"p1/manual.md": f"# Manual\n\n{sections}"})
+    manual = document_id("p1/manual.md")
+    monkeypatch.setattr(eval_agents, "QA_EVIDENCE_MAX_CHARS", 1_000_000)
+
+    with TopicSnapshot.open(path) as snapshot:
+        assert snapshot.outline(manual).next_offset is not None
+        assert snapshot.read_section(f"{manual}_sec_252").next_offset is not None
+        markdowns = drafting.section_markdowns(snapshot, manual)
+        evidence = qa_evidence(snapshot, qa_case("whole", [{"doc_id": manual, "pages": None}]))
+
+    assert len(markdowns) == 501
+    assert (
+        markdowns[251] == f"## Part 250\n\n{wide}" and markdowns[-1] == "## Part 499\n\nText 499."
+    )
+    assert evidence.count("--- p1/manual.md") == 501
+    assert wide in evidence and evidence.endswith("## Part 499\n\nText 499.")
+
+
 def test_eval_cli_refuses_a_qa_case_whose_evidence_is_over_the_judge_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2143,7 +2173,8 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
         ("grep", grep, 0),
     ]
     assert mcp_call[0]["result_chars"] > 200 and len(mcp_call[0]["result_head"]) == 200
-    assert mcp_call[0]["result_head"].startswith(f'{{\n  "doc_id": "{HARBOUR_MEMO}"')
+    # The server renders a result as one compact JSON text block.
+    assert mcp_call[0]["result_head"].startswith(f'[{{"doc_id":"{HARBOUR_MEMO}"')
     assert qa_rows[0]["judge"]["claims"][1] == {
         "claim": "The memo is from 2019.",
         "status": "unverifiable",
@@ -2446,7 +2477,8 @@ def test_eval_cli_refuses_outputs_it_cannot_write_and_inputs_it_cannot_convert_o
             db.execute("DELETE FROM chunks WHERE doc_id = ?", doc_id)
             db.execute("DELETE FROM sections WHERE doc_id = ?", doc_id)
             db.execute("DELETE FROM glossary")
-            db.execute("DELETE FROM blueprints")
+            db.execute("DELETE FROM cluster_sections")
+            db.execute("DELETE FROM feedback_lessons")
             db.execute("UPDATE corpus_meta SET value = 'Guide.' WHERE key = 'guide_markdown'")
         message = refused(hollow, tmp_path / "o", "--layer", "3")
         assert f"holdout 'estuary-proposal': {empty} has no sections in --snapshot" in message

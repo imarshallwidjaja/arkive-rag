@@ -6,15 +6,13 @@ draft with the rubric and two lexical-overlap measures, and sends the round's co
 to one blind judge call. Agent runs go through `evals.agents.run_agent`; the judge goes through
 `OpenAIGateway.run`.
 
-The two measures compare wording, not meaning. They share with induction's standing passages
-the unit, shingle and containment functions of `arkive_rag.passages` (`standing_units`, word
-shingles of `fold_for_quote` text, `containment`, `without_visual_transcripts`) and its
-thresholds (`STANDING_MIN_WORDS`, `STANDING_RECURRENCE_CONTAINMENT`). They differ from
-recurring-candidate discovery (`standing_candidates`) in three ways: a unit loses its leading
-list marker (`LIST_MARKER`) before it is folded; a unit is held when the union of every holdout
+The two measures compare wording, not meaning. They share with induction's recurring units the
+unit, folding, shingle and containment functions of `arkive_rag.passages` (`standing_units`,
+`fold_unit`, word shingles, `containment`, `without_visual_transcripts`) and its thresholds
+(`STANDING_MIN_WORDS`, `STANDING_RECURRENCE_CONTAINMENT`). They differ from recurrence
+discovery (`recurring_units`) in one way: a unit is held when the union of every holdout
 section's shingles contains enough of its shingles, where discovery tests each section of
-another document on its own; and no folder rule applies, where discovery asks for recurrence in
-another top-level folder when the exemplars span folders.
+another document on its own.
 """
 
 from __future__ import annotations
@@ -174,7 +172,7 @@ def compile_holdout_snapshot(
 def section_markdowns(snapshot: TopicSnapshot, doc_id: str) -> list[str]:
     """One document's section Markdown in reading order; empty for a document without
     sections, such as an empty curator note."""
-    return [snapshot.read_section(s.section_id).markdown for s in snapshot.outline(doc_id).sections]
+    return [snapshot.section_markdown(s.section_id) for s in snapshot.full_outline(doc_id)]
 
 
 # Lexical-overlap measures.
@@ -205,8 +203,7 @@ def _prose_units(markdown: str) -> list[_ProseUnit]:
     for unit in _passages.standing_units(markdown):
         if unit.header:
             continue
-        marker = _passages.LIST_MARKER.match(unit.text)
-        folded = fold_for_quote(unit.text[marker.end() :] if marker else unit.text)
+        folded = _passages.fold_unit(unit.text)
         units.append(
             _ProseUnit(unit.text, len(_passages.WORD.findall(folded)), _passages.shingles(folded))
         )
@@ -402,11 +399,12 @@ def rubric_diagnostics(
 
 # Exemplars in context.
 
-# The drafting obligations of the MCP server's instructions (`arkive_rag.server.INSTRUCTIONS`),
-# reworded for documents in the prompt instead of tools. A test pins word for word the drafting
-# part of those instructions, the `get_blueprint` and `read_section` tool descriptions as the
-# server publishes them, and this text, beside a map of the obligations, so an edit to any of
-# them fails until the pins are updated together.
+# The drafting obligations the MCP server gives (`arkive_rag.server.INSTRUCTIONS` and the
+# drafting packet's `arkive_rag.snapshot.DRAFTING_GUIDANCE`), reworded for documents in the
+# prompt instead of tools. A test pins word for word the drafting part of those instructions,
+# the packet guidance, the `prepare_draft` and `read_section` tool descriptions as the server
+# publishes them, and this text, beside a map of the obligations they share, so an edit to any
+# of them fails until the pins are updated together.
 EXEMPLAR_DRAFTING_RULES = """\
 The prompt holds prior deliverables of the same collection, each labelled with its file path,
 followed by the run notes of the new project.

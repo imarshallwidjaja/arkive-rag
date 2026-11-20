@@ -679,7 +679,7 @@ def _check_inputs(
                     raise typer.BadParameter(str(exc)) from exc
             references = {h.holdout_id: snap.document(h.reference_doc_id) for h in holdouts}
             section_counts = {
-                d.rel_path: len(snap.outline(d.doc_id).sections)
+                d.rel_path: len(snap.full_outline(d.doc_id))
                 for d in (snap.list_documents() if holdouts else ())
             }
     except ArkiveError as exc:

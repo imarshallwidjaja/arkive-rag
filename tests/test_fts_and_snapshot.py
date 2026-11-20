@@ -2,34 +2,48 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 import stat
+import time
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 from numpy.typing import NDArray
 
 from arkive_rag import __version__
+from arkive_rag import snapshot as snapshot_module
 from arkive_rag.compiler import compile_corpus
 from arkive_rag.models import (
+    DraftPacket,
+    FamilyRecurrence,
     InvalidFilterError,
     NotFoundError,
     ProviderError,
     SearchHit,
     SnapshotIntegrityError,
     UnsafePathError,
+    choices,
     document_id,
 )
 from arkive_rag.snapshot import (
+    DRAFTING_GUIDANCE,
+    MAX_GREP_MATCHES,
+    MAX_OTHER_CANDIDATES,
     MAX_TOP_K,
+    RESPONSE_MAX_BYTES,
     SCHEMA_VERSION,
     SNIPPET_CHARS,
     TopicSnapshot,
     build_fts5_query,
+    fits_response,
+    response_text,
     write_snapshot,
 )
 from tests.support import (
@@ -244,6 +258,15 @@ def test_rank_channels_order_one_embedding_by_each_channel_and_handle_empty_snap
             "dense_only": [],
             "hybrid_rrf": [],
         }
+
+
+def test_error_choices_show_each_value_on_one_line() -> None:
+    multiline = "Region\n\n  north\r\nof the\tbay\n" * 3
+    listed = choices([multiline, "south", "x" * 300])
+
+    assert "\n" not in listed and "\r" not in listed and "\t" not in listed
+    assert listed.startswith("Region north of the bay Region north of the bay")
+    assert listed.endswith(f", south, {'x' * 200}\u2026")
 
 
 def test_filter_errors_name_the_valid_facets_and_values(snapshot: TopicSnapshot) -> None:
@@ -483,10 +506,13 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     stale = tmp_path / "stale.arkive.db"
     shutil.copy(path, stale)
     with sqlite3.connect(stale) as db:
-        db.execute("UPDATE corpus_meta SET value = '4.0' WHERE key = 'schema_version'")
+        # A snapshot of the previous schema: its tables exist, but they lack this schema's
+        # meaning, so opening it asks for a rebuild instead of reading it.
+        db.execute("UPDATE corpus_meta SET value = '5.0' WHERE key = 'schema_version'")
     db.close()
     with pytest.raises(
-        SnapshotIntegrityError, match=r"schema version '4\.0'; Arkive \S+ reads schema 5\.0 only"
+        SnapshotIntegrityError,
+        match=r"schema version '5\.0'; Arkive \S+ reads schema 6\.0 only, so rebuild",
     ):
         TopicSnapshot.open(stale)
     with pytest.raises(SnapshotIntegrityError, match="does not exist"):
@@ -530,7 +556,7 @@ def test_document_dates_round_trip_with_their_basis(tmp_path: Path) -> None:
     db.close()
 
 
-def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path) -> None:
+def test_facets_glossary_roles_lessons_units_and_build_records_round_trip(tmp_path: Path) -> None:
     corpus_dir = tmp_path / "corpus"
     for rel_path, text in MARKETING_CORPUS.items():
         (corpus_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
@@ -540,140 +566,135 @@ def test_facets_glossary_blueprints_and_build_records_round_trip(tmp_path: Path)
     write_snapshot(corpus, output)
 
     with TopicSnapshot.open(output) as snap:
-        assert SCHEMA_VERSION == "5.0"
+        assert SCHEMA_VERSION == "6.0"
         assert tuple(snap.facets) == corpus.facets
         assert tuple(snap.glossary) == corpus.glossary
-        assert tuple(snap.blueprints) == corpus.blueprints
+        assert tuple(snap.deliverable_types) == corpus.deliverable_types
+        assert tuple(snap.feedback_lessons) == corpus.feedback_lessons
         assert snap.build_settings == dict(corpus.build_settings)
         assert snap.build_report == corpus.build_report
         assert snap.guide_markdown == corpus.guide_markdown
-        assert {d.doc_id: d.facets for d in snap.list_documents()}[SPRING_REVIEW] == {
+        documents = {d.doc_id: d for d in snap.list_documents()}
+        assert documents[SPRING_REVIEW].facets == {
             "campaign": ["spring-launch"],
             "author": ["Sam Okafor"],
             "channel": ["Social"],
         }
+        for doc in corpus.documents:
+            stored = documents[doc.doc_id]
+            assert (
+                stored.deliverable_type,
+                stored.is_feedback,
+                tuple(stored.feedback_for_types),
+                stored.family_id,
+                stored.version_status,
+                stored.superseded_by,
+            ) == tuple(doc.role.model_dump().values())
         summary = snap.summary()
+        guide = snap.guide()
     assert [(f.name, f.binding) for f in summary.facets] == [
         ("campaign", "path"),
         ("author", "content"),
         ("channel", "content"),
     ]
-    assert (summary.blueprints, summary.glossary_terms) == (["campaign brief", "review notes"], 3)
+    assert (summary.deliverable_types, summary.glossary_terms) == (
+        ["campaign brief", "review notes"],
+        3,
+    )
+    assert [t.model_dump() for t in guide.deliverable_types] == [
+        {
+            "deliverable_type": "campaign brief",
+            "description": "A campaign brief.",
+            "document_count": 2,
+            "feedback_count": 1,
+        },
+        {
+            "deliverable_type": "review notes",
+            "description": "A review notes.",
+            "document_count": 1,
+            "feedback_count": 0,
+        },
+    ]
 
 
 @pytest.mark.parametrize(
-    ("table", "column", "old", "new", "message"),
+    ("sql", "message"),
     [
         (
-            "glossary",
-            "entry_json",
-            f"{LOYALTY_BRIEF}_sec_002",
-            f"{LOYALTY_BRIEF}_sec_099",
+            f"UPDATE glossary SET entry_json = replace(entry_json, '{LOYALTY_BRIEF}_sec_002',"
+            f" '{LOYALTY_BRIEF}_sec_099') WHERE ordinal = 1",
             f"cites '{LOYALTY_BRIEF}_sec_099'",
         ),
         # The curator note's sections are not citable.
         (
-            "glossary",
-            "entry_json",
-            f"{LOYALTY_BRIEF}_sec_002",
-            f"{CAMPAIGN_NOTE}_sec_001",
+            f"UPDATE glossary SET entry_json = replace(entry_json, '{LOYALTY_BRIEF}_sec_002',"
+            f" '{CAMPAIGN_NOTE}_sec_001') WHERE ordinal = 1",
             f"cites '{CAMPAIGN_NOTE}_sec_001'",
         ),
+        ("UPDATE glossary SET entry_json = '{}' WHERE ordinal = 1", "row is malformed"),
+        # `prepare_draft` resolves a folded type, so it must name one type.
         (
-            "blueprints",
-            "blueprint_json",
-            f'"{LOYALTY_BRIEF}"',
-            f'"{CAMPAIGN_NOTE}"',
-            f"names document '{CAMPAIGN_NOTE}'",
-        ),
-        ("blueprints", "blueprint_json", '"outline"', '"sketch"', "row is malformed"),
-        # The spring brief's fourth section is cited only by the campaign brief's standing
-        # passage.
-        (
-            "blueprints",
-            "blueprint_json",
-            f'"{SPRING_BRIEF}_sec_004"',
-            f'"{SPRING_BRIEF}_sec_099"',
-            f"cites '{SPRING_BRIEF}_sec_099'",
+            "UPDATE deliverable_types SET name = ' Campaign BRIEF' WHERE name = 'review notes';"
+            " UPDATE documents SET deliverable_type = ' Campaign BRIEF'"
+            " WHERE deliverable_type = 'review notes'",
+            "deliverable types 'campaign brief' and ' Campaign BRIEF' fold alike",
         ),
         (
-            "blueprints",
-            "blueprint_json",
-            f'"{SPRING_BRIEF}_sec_004"',
-            f'"{SPRING_REVIEW}_sec_001"',
-            f"standing passage citing '{SPRING_REVIEW}_sec_001', which is not a section of the"
-            " blueprint's exemplars",
+            "UPDATE documents SET deliverable_type = 'press release'"
+            f" WHERE doc_id = '{LOYALTY_BRIEF}'",
+            f"document {LOYALTY_BRIEF} has an inconsistent role",
         ),
-        # Both citations then name the loyalty brief: a passage must recur in another exemplar.
         (
-            "blueprints",
-            "blueprint_json",
-            f'"{SPRING_BRIEF}_sec_004"',
-            f'"{LOYALTY_BRIEF}_sec_003"',
-            "standing passage 'Disclosure' whose citations name fewer than two exemplar documents",
+            f"UPDATE documents SET is_feedback = 0 WHERE doc_id = '{SPRING_REVIEW}'",
+            f"document {SPRING_REVIEW} has an inconsistent role",
         ),
-        # `get_blueprint` resolves a folded type, so it must name one blueprint.
         (
-            "blueprints",
-            "blueprint_json",
-            '"campaign brief"',
-            '" Review NOTES"',
-            "blueprints ' Review NOTES' and 'review notes' have the same deliverable type",
+            f"UPDATE feedback_lessons SET section_id = '{LOYALTY_BRIEF}_sec_002'",
+            "does not cite a section of a feedback document",
+        ),
+        (
+            f"UPDATE documents SET family_id = '{LOYALTY_BRIEF}', version_status = 'unordered'"
+            f" WHERE doc_id = '{SPRING_BRIEF}'",
+            f"version family {LOYALTY_BRIEF}: a family of one must be sole",
+        ),
+        (
+            f"UPDATE documents SET family_id = '{SPRING_BRIEF}' WHERE doc_id = '{LOYALTY_BRIEF}'",
+            f"version family {SPRING_BRIEF}: its ID is not its first member in path order",
+        ),
+        (
+            f"DELETE FROM cluster_sections WHERE section_id LIKE '{SPRING_BRIEF}%'",
+            "is not held by citable sections of two documents",
+        ),
+        (
+            "INSERT INTO cluster_sections SELECT cluster_id, section_id, 99, 'x' FROM"
+            " (SELECT min(cluster_id) AS cluster_id FROM unit_clusters WHERE kind = 'prose'),"
+            f" (SELECT section_id FROM sections WHERE doc_id = '{SPRING_REVIEW}' LIMIT 1)",
+            "is held by a feedback document",
+        ),
+        (
+            "UPDATE cluster_sections SET sample = ' ' WHERE cluster_id IN"
+            " (SELECT cluster_id FROM unit_clusters WHERE kind = 'prose')",
+            "each holder of a prose unit needs a nonblank sample",
+        ),
+        # Two briefs superseding each other: a cycle with no latest member.
+        (
+            f"UPDATE documents SET family_id = '{LOYALTY_BRIEF}', version_status = 'superseded',"
+            f" superseded_by = CASE doc_id WHEN '{LOYALTY_BRIEF}' THEN '{SPRING_BRIEF}'"
+            f" ELSE '{LOYALTY_BRIEF}' END WHERE doc_id IN ('{LOYALTY_BRIEF}', '{SPRING_BRIEF}')",
+            f"version family {LOYALTY_BRIEF}: a member is superseded by a superseded member",
         ),
     ],
 )
-def test_glossary_and_blueprint_rows_are_validated_when_a_snapshot_opens(
-    tmp_path: Path, table: str, column: str, old: str, new: str, message: str
-) -> None:
-    corpus_dir = tmp_path / "corpus"
-    for rel_path, text in MARKETING_CORPUS.items():
-        (corpus_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (corpus_dir / rel_path).write_text(text, encoding="utf-8")
-    output = tmp_path / "campaigns.arkive.db"
-    write_snapshot(compile_corpus(corpus_dir, FakeGateway(), topic="c", title="C"), output)
-    with sqlite3.connect(output) as db:
-        changed = db.execute(
-            f"UPDATE {table} SET {column} = replace({column}, ?, ?) WHERE ordinal = 1", (old, new)
-        ).rowcount
-    db.close()
-
-    assert changed == 1
-    with pytest.raises(SnapshotIntegrityError, match=message):
-        TopicSnapshot.open(output)
-
-
-def test_guide_summarises_blueprints_and_one_blueprint_is_read_in_full_by_folded_type(
-    tmp_path: Path,
+def test_knowledge_rows_are_validated_when_a_snapshot_opens(
+    tmp_path: Path, sql: str, message: str
 ) -> None:
     path = compile_snapshot(tmp_path, MARKETING_CORPUS, topic="campaigns")
+    with sqlite3.connect(path) as db:
+        db.executescript(sql)
+    db.close()
 
-    with TopicSnapshot.open(path) as snap:
-        guide = snap.guide()
-        brief = snap.blueprint("  Campaign BRIEF ")
-        with pytest.raises(
-            NotFoundError,
-            match="no blueprint for deliverable type 'press release'; valid types: campaign"
-            " brief, review notes",
-        ):
-            snap.blueprint("press release")
-        assert brief == snap.blueprints[0]
-
-    assert [b.model_dump() for b in guide.blueprints] == [
-        {
-            "deliverable_type": "campaign brief",
-            "description": "How the collection writes a campaign brief.",
-            "exemplar_count": 2,
-        },
-        {
-            "deliverable_type": "review notes",
-            "description": "How the collection writes a review notes.",
-            "exemplar_count": 1,
-        },
-    ]
-    assert brief.outline and brief.conventions
-    assert [p.citations for p in brief.standing_passages] == [
-        (f"{LOYALTY_BRIEF}_sec_004", f"{SPRING_BRIEF}_sec_004")
-    ]
+    with pytest.raises(SnapshotIntegrityError, match=re.escape(message)):
+        TopicSnapshot.open(path)
 
 
 def test_glossary_lookup_by_term_alias_list_and_miss(tmp_path: Path) -> None:
@@ -684,19 +705,172 @@ def test_glossary_lookup_by_term_alias_list_and_miss(tmp_path: Path) -> None:
         by_term = snap.lookup_glossary("cta")
         by_alias = snap.lookup_glossary("Call To Action")
         miss = snap.lookup_glossary("net promoter score")
+        past_end = snap.lookup_glossary(offset=3)
         with pytest.raises(InvalidFilterError, match="blank"):
             snap.lookup_glossary("  ")
+        with pytest.raises(InvalidFilterError, match="offset"):
+            snap.lookup_glossary(offset=-1)
 
     assert [(t.term, t.defined, t.aliases) for t in listing.terms] == [
         ("Churn", True, []),
         ("CTA", True, ["call to action"]),
         ("ICP", False, []),
     ]
+    assert (listing.total, listing.offset, listing.next_offset) == (3, 0, None)
     assert listing.matches == []
     assert [e.term for e in by_term.matches] == ["CTA"] and by_term.terms == []
     assert by_alias.matches == by_term.matches
     assert len(by_term.matches[0].senses) == 2
-    assert (miss.query, miss.matches, miss.terms) == ("net promoter score", [], [])
+    assert (miss.query, miss.matches, miss.terms, miss.total) == ("net promoter score", [], [], 0)
+    assert (past_end.terms, past_end.total, past_end.next_offset) == ([], 3, None)
+
+
+def test_a_glossary_page_stays_within_the_response_bound(tmp_path: Path) -> None:
+    terms = "\n\n".join(
+        f"**TERM{n:04d}** means a long defined measure number {n}. " + "Detail. " * 40
+        for n in range(500)
+    )
+    path = compile_snapshot(tmp_path, {"p1/terms.md": f"# Terms\n\n{terms}"}, topic="terms")
+
+    with TopicSnapshot.open(path) as snap:
+        listing = snap.lookup_glossary()
+        first = snap.lookup_glossary("term")
+        assert first.next_offset is not None
+        pages = [first]
+        while pages[-1].next_offset is not None:
+            pages.append(snap.lookup_glossary("term", offset=pages[-1].next_offset))
+
+    assert len(listing.model_dump_json().encode()) <= RESPONSE_MAX_BYTES
+    assert all(len(p.model_dump_json().encode()) <= RESPONSE_MAX_BYTES for p in pages)
+    assert sum(len(p.matches) for p in pages) == first.total == 500
+
+
+def test_document_pages_omit_hashes_validate_limits_and_shrink_to_the_response_bound(
+    tmp_path: Path,
+) -> None:
+    files = {
+        f"p{n:02d}/memo.md": f"# Memo {n}\n\n" + f"Long summary line {n} of the memo. " * 60
+        for n in range(30)
+    }
+    path = compile_snapshot(tmp_path, files, topic="memos")
+
+    with TopicSnapshot.open(path) as snap:
+        everything = snap.list_documents()
+        page = snap.list_documents_page(limit=7, offset=21)
+        last = snap.list_documents_page(limit=7, offset=28)
+        wide = snap.list_documents_page(limit=100)
+        for bad in ({"limit": 0}, {"limit": 101}, {"offset": -1}):
+            with pytest.raises(InvalidFilterError):
+                snap.list_documents_page(**bad)  # type: ignore[arg-type]
+
+    assert len(everything) == 30 and all(d.sha256 for d in everything)
+    assert [d.doc_id for d in page.documents] == [d.doc_id for d in everything[21:28]]
+    assert (page.total, page.offset, page.limit, page.next_offset) == (30, 21, 7, 28)
+    assert "sha256" not in page.documents[0].model_dump()
+    assert (len(last.documents), last.next_offset) == (2, None)
+    assert len(wide.model_dump_json().encode()) <= RESPONSE_MAX_BYTES
+    assert wide.next_offset == len(wide.documents) < 30
+
+
+def test_grep_returns_at_most_fifty_matches(snapshot: TopicSnapshot) -> None:
+    assert MAX_GREP_MATCHES == 50
+    assert len(snapshot.grep("a", max_matches=MAX_GREP_MATCHES)) <= 50
+    for bad in (0, MAX_GREP_MATCHES + 1):
+        with pytest.raises(InvalidFilterError, match="between 1 and 50"):
+            snapshot.grep("bathymetry", max_matches=bad)
+
+
+VERSIONED = {
+    "p1/drafts/survey-report-v0.9.md": (
+        "# Survey Report v0.9\n\nDate: 2025-03-01\n\n"
+        + "\n\n".join(
+            f"## Line {i}\n\nGauge reading {i} on the tidal survey line." for i in range(6)
+        )
+    ),
+    "p1/survey-report.md": (
+        "# Survey Report v1.0\n\nDate: 2025-04-01\n\n"
+        + "\n\n".join(
+            f"## Line {i}\n\nGauge reading {i} on the tidal survey line." for i in range(6)
+        )
+    ),
+    "p2/other.md": "# Other\n\nA tidal note about something else entirely.",
+}
+
+
+def test_search_collapses_superseded_drafts_caps_families_and_backfills(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, VERSIONED, topic="versions")
+    draft, final = (
+        document_id("p1/drafts/survey-report-v0.9.md"),
+        document_id("p1/survey-report.md"),
+    )
+    embed = FakeGateway().embed_query
+
+    with TopicSnapshot.open(path) as snap:
+        assert snap.document(draft).superseded_by == final
+        hits = snap.search("gauge reading tidal survey line", embed, top_k=4)
+        alone = snap.search("gauge reading", embed, filters={"project": "p1"}, top_k=6)
+        ranked = snap.rank_channels("gauge reading tidal survey line", embed, top_k=8)
+
+    # The superseded draft is left behind its latest version, and the final report shows
+    # three chunks before the other document gets a place.
+    counts = {d: sum(h.doc_id == d for h in hits) for d in {h.doc_id for h in hits}}
+    assert counts == {final: 3, document_id("p2/other.md"): 1}
+    # Hits keep fused-rank order and count what their document has beyond the list.
+    assert [h.rrf_score for h in hits] == sorted((h.rrf_score for h in hits), reverse=True)
+    assert {h.doc_id: h.more_from_document for h in hits}[final] == 7 - 3
+    # Filters that leave one family still fill top_k from it.
+    assert len(alone) == 6 and {h.doc_id for h in alone} == {final}
+    # The ablation channels stay raw: the draft's chunks rank there.
+    assert draft in {h.doc_id for h in ranked["hybrid_rrf"]}
+
+
+def test_a_long_superseded_draft_cannot_crowd_its_latest_version_out_of_search(
+    tmp_path: Path,
+) -> None:
+    def report(version: str, date: str, lines: int, words: str) -> str:
+        body = "\n\n".join(f"## Line {i}\n\n{words} {i}." for i in range(lines))
+        return f"# Survey Report {version}\n\nDate: {date}\n\n{body}"
+
+    files = {
+        "p1/drafts/report-v1.md": report("v1", "2025-01-10", 320, "Gauge reading tidal line"),
+        "p1/report-v2.md": report(
+            "v2", "2025-02-10", 4, "The final record of the gauge reading on the tidal line"
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="drafts")
+    draft, final = (document_id(p) for p in files)
+
+    with TopicSnapshot.open(path) as snap:
+        assert snap.document(draft).superseded_by == final
+        hits = snap.search("gauge reading tidal line", FakeGateway().embed_query, top_k=5)
+
+    # The draft's 320 chunks would fill both ranking channels; only the latest is ranked.
+    assert hits and {h.doc_id for h in hits} == {final}
+
+
+def test_search_results_stay_within_the_response_bound(tmp_path: Path) -> None:
+    files = {
+        f"p{n:02d}/long.md": f"# Long {n}\n\n" + " ".join([f"tidal gauge reading site{n}"] * 300)
+        for n in range(20)
+    }
+    path = compile_snapshot(tmp_path, files, topic="long")
+
+    embed = FakeGateway().embed_query
+    with TopicSnapshot.open(path) as snap:
+        hits = snap.search("tidal gauge reading", embed, top_k=MAX_TOP_K)
+        ranking = snap._rank(
+            build_fts5_query("tidal gauge reading"),
+            embed("tidal gauge reading"),
+            snap._active_pool(None),
+        )
+        ranked = Counter(snap._hits[i]["doc_id"] for i in ranking.order)
+
+    assert 1 <= len(hits) < MAX_TOP_K and fits_response(hits)
+    assert len(response_text(hits).encode()) <= RESPONSE_MAX_BYTES
+    # Each hit counts the ranked chunks of its document the cut list does not show.
+    shown = Counter(h.doc_id for h in hits)
+    assert all(h.more_from_document == ranked[h.doc_id] - shown[h.doc_id] for h in hits)
+    assert any(h.more_from_document for h in hits)
 
 
 @pytest.mark.parametrize(
@@ -782,3 +956,645 @@ def test_sqlite_errors_after_opening_are_integrity_errors(tmp_path: Path) -> Non
         db.close()
         with pytest.raises(SnapshotIntegrityError, match="cannot read the snapshot"):
             query(snap, "rainfall")
+
+
+# Drafting packets.
+
+
+def memo(title: str, deliverable: str, sections: Sequence[tuple[str, str]], date: str = "") -> str:
+    head = f"# {title}\n\nDeliverable: {deliverable}\n" + (f"Date: {date}\n" if date else "")
+    return head + "".join(f"\n## {heading}\n\n{body}\n" for heading, body in sections)
+
+
+def packet_bytes(packet: DraftPacket) -> int:
+    return len(response_text(packet).encode())
+
+
+GDV_INPUTS = (
+    "Map groundwater dependent vegetation for the Sentinel lease with NDVI anomaly trends,"
+    " dry season composites and a field validation plan."
+)
+
+
+def test_draft_ranking_prefers_the_closer_document_over_the_longer_one(tmp_path: Path) -> None:
+    generic = "Remote sensing analysis of water and vegetation across the region."
+    files = {
+        "a/waterbodies.md": memo(
+            "Regional Waterbodies Memo",
+            "technical memorandum",
+            [(f"Basin {i}", f"{generic} Basin {i} vegetation map.") for i in range(40)],
+        ),
+        "b/gdv.md": memo(
+            "Lease GDV Memo",
+            "technical memorandum",
+            [
+                ("Method", "Groundwater dependent vegetation mapped with NDVI anomaly trends."),
+                ("Composites", "Dry season composites of the Sentinel lease."),
+                ("Validation", "A field validation plan for groundwater dependent vegetation."),
+            ],
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="gdv")
+    gdv, waterbodies = document_id("b/gdv.md"), document_id("a/waterbodies.md")
+    embedded: list[str] = []
+
+    def embed(text: str) -> NDArray[np.float32]:
+        embedded.append(text)
+        return FakeGateway().embed_query(text)
+
+    with TopicSnapshot.open(path) as snap:
+        offline = snap.prepare_draft(GDV_INPUTS, None)
+        online = snap.prepare_draft(GDV_INPUTS, embed, deliverable_type="Technical Memorandum")
+        lexical = snap._draft_terms(GDV_INPUTS, snap.list_documents())[0] or ""
+        matched = snap._lexical_ranks(lexical, None)
+        chunks = {d: sum(snap._hits[i]["doc_id"] == d for i in matched) for d in (gdv, waterbodies)}
+
+    # The long memo has many more matching chunks, but relevance sums each document's best
+    # three, so the closer short memo ranks first, with and without an embedder.
+    assert chunks[waterbodies] > chunks[gdv]
+    assert [e.doc_id for e in offline.exemplars] == [gdv, waterbodies]
+    assert [e.doc_id for e in online.exemplars] == [gdv, waterbodies]
+    assert offline.exemplars[0].relevance_score > offline.exemplars[1].relevance_score
+    assert embedded == [GDV_INPUTS] and online.deliverable_type == "technical memorandum"
+    # The short memo is included whole, in order, without its visual transcripts.
+    first = online.exemplars[0]
+    assert all(s.included for s in first.sections) and online.omitted_sections >= 0
+    assert [s.markdown for s in first.sections][
+        1
+    ] == "## Method\n\nGroundwater dependent vegetation mapped with NDVI anomaly trends."
+
+
+def test_draft_requests_are_validated_before_any_embedding(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, MARKETING_CORPUS, topic="campaigns")
+    calls: list[str] = []
+
+    def embed(text: str) -> NDArray[np.float32]:
+        calls.append(text)
+        return FakeGateway().embed_query(text)
+
+    with TopicSnapshot.open(path) as snap:
+        with pytest.raises(InvalidFilterError, match="project_inputs must not be blank"):
+            snap.prepare_draft(" \n", embed)
+        with pytest.raises(InvalidFilterError, match="unknown facet"):
+            snap.prepare_draft("A brief.", embed, filters={"stage": "draft"})
+        with pytest.raises(
+            NotFoundError,
+            match=re.escape(
+                "unknown deliverable type 'press release'; valid types: campaign brief (2),"
+                " review notes (1)"
+            ),
+        ):
+            snap.prepare_draft("A brief.", embed, deliverable_type="press release")
+        # A blank type is no type.
+        untyped = snap.prepare_draft("A brief for lapsed members.", None, deliverable_type=" ")
+    assert calls == []
+    assert untyped.deliverable_type is None
+
+
+def test_feedback_documents_give_lessons_and_draft_only_as_their_own_type(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, MARKETING_CORPUS, topic="campaigns")
+
+    with TopicSnapshot.open(path) as snap:
+        brief = snap.prepare_draft(
+            "A social brief for first-time buyers.", None, deliverable_type="campaign brief"
+        )
+        review = snap.prepare_draft(
+            "Review notes on a social brief.", None, deliverable_type="review notes"
+        )
+
+    assert {e.doc_id for e in brief.exemplars} == {LOYALTY_BRIEF, SPRING_BRIEF}
+    assert SPRING_REVIEW not in {c.doc_id for c in brief.other_candidates}
+    (lesson,) = brief.lessons
+    assert (lesson.statement, lesson.source_doc_id, lesson.target_types) == (
+        "Cut the jargon from the opening line.",
+        SPRING_REVIEW,
+        ("campaign brief",),
+    )
+    assert [n.scope_path for n in brief.curator_notes] == ["AGENTS.md"]
+    # Asked for its own type, the review is the first exemplar; at most one exemplar of the
+    # requested type lets the best other deliverables fill the slots.
+    assert review.exemplars[0].doc_id == SPRING_REVIEW
+    assert {e.deliverable_type for e in review.exemplars[1:]} == {"campaign brief"}
+    # The disclosure both briefs end with recurs in two version families of the topic.
+    (loyalty,) = [e for e in brief.exemplars if e.doc_id == LOYALTY_BRIEF]
+    disclosure = loyalty.sections[-1]
+    assert disclosure.family_recurrence == FamilyRecurrence(
+        recurring_unit_count=1,
+        exemplar_doc_ids=[e.doc_id for e in brief.exemplars],
+        corpus_family_count=2,
+        # The review is feedback, so it is no family a unit could recur in.
+        corpus_family_total=2,
+        latest_holder_date=None,
+    )
+    assert loyalty.sections[1].family_recurrence is None
+    assert brief.drafting_guidance == DRAFTING_GUIDANCE
+
+
+PROPOSAL_CLAUSE = (
+    "All survey data remain confidential to the client and are held for seven years under"
+    " the house records policy."
+)
+DRAFT_ONLY_CLAUSE = (
+    "This draft clause about interim staffing appears only in two versions of one proposal"
+    " and nowhere else in the collection."
+)
+
+
+def test_family_recurrence_counts_version_families_not_duplicate_drafts(tmp_path: Path) -> None:
+    def proposal(title: str, date: str, scope: str) -> str:
+        return memo(title, "survey proposal", [("Scope", scope), ("Terms", PROPOSAL_CLAUSE)], date)
+
+    estuary_scope = f"Survey of the estuary channel. {DRAFT_ONLY_CLAUSE}"
+    files = {
+        "a/proposal-v1.md": proposal("Estuary Proposal v1", "2025-01-10", estuary_scope),
+        "a/proposal-v2.md": proposal("Estuary Proposal v2", "2025-02-10", estuary_scope),
+        "b/proposal.md": proposal("Harbour Proposal", "2024-06-01", "Survey of the harbour."),
+    }
+    path = compile_snapshot(tmp_path, files, topic="proposals")
+    v1, v2, harbour = (document_id(p) for p in files)
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(
+            "Estuary survey proposal.", None, deliverable_type="survey proposal"
+        )
+
+    # The superseded first version takes no exemplar slot; the latest one names it.
+    assert {e.doc_id for e in packet.exemplars} == {v2, harbour}
+    (latest,) = [e for e in packet.exemplars if e.doc_id == v2]
+    assert (latest.version_status, latest.family_doc_ids) == ("latest", [v1])
+    scope, terms = latest.sections[1], latest.sections[2]
+    # Recurring only between two versions of one deliverable is no recurrence across families.
+    assert scope.family_recurrence is None
+    assert terms.family_recurrence is not None
+    assert (
+        terms.family_recurrence.corpus_family_count,
+        terms.family_recurrence.corpus_family_total,
+    ) == (2, 2)
+    assert set(terms.family_recurrence.exemplar_doc_ids) == {v2, harbour}
+    assert terms.family_recurrence.latest_holder_date == "2025-02-10"
+
+
+def test_unordered_family_members_share_one_exemplar_slot(tmp_path: Path) -> None:
+    body = [("Scope", "Survey of the canal locks and the towpath walls.")]
+    files = {
+        "a/report.md": memo("Canal Report", "survey report", body),
+        "b/report.md": memo("Canal Report", "survey report", [*body, ("Annex", "Extra table.")]),
+    }
+    path = compile_snapshot(tmp_path, files, topic="canal")
+    first, second = (document_id(p) for p in files)
+
+    with TopicSnapshot.open(path) as snap:
+        assert {snap.document(d).version_status for d in (first, second)} == {"unordered"}
+        packet = snap.prepare_draft("Canal locks survey report.", None)
+
+    (exemplar,) = packet.exemplars
+    other = second if exemplar.doc_id == first else first
+    assert exemplar.family_doc_ids == [other]
+    assert other not in {c.doc_id for c in packet.other_candidates}
+
+
+def test_a_competitive_neighbour_of_another_type_fills_a_free_slot(tmp_path: Path) -> None:
+    night = "Night time noise from the depot yard measured at the nearest bedroom window."
+    files = {
+        "a/letter-1.md": memo("Depot Letter", "noise assessment letter", [("Noise", night)]),
+        "b/letter-2.md": memo("Yard Letter", "noise assessment letter", [("Noise", night)]),
+        "c/report.md": memo("Depot Report", "technical report", [("Results", night)]),
+        "d/memo.md": memo("Fee Memo", "fee memorandum", [("Fees", "Hourly rates and invoicing.")]),
+    }
+    path = compile_snapshot(tmp_path, files, topic="acoustic")
+    report, fees = document_id("c/report.md"), document_id("d/memo.md")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(
+            "Depot yard night time noise at the nearest bedroom window.",
+            None,
+            deliverable_type="noise assessment letter",
+        )
+
+    types = [e.deliverable_type for e in packet.exemplars]
+    # The report is as relevant as the letters, so it takes the third slot; the fee memo is
+    # not competitive and stays a candidate.
+    assert types == ["noise assessment letter", "noise assessment letter", "technical report"]
+    assert packet.exemplars[2].doc_id == report
+    assert [c.doc_id for c in packet.other_candidates] == [fees]
+
+
+def test_a_long_exemplar_packs_whole_sections_by_priority_within_the_bound(
+    tmp_path: Path,
+) -> None:
+    filler = " ".join(f"Observation {i} of the seabed condition was logged." for i in range(28))
+    long_sections = [(f"Chapter {i}", f"Chapter {i}. {filler}") for i in range(60)]
+    for k in (30, 31, 32):
+        long_sections[k] = ("Dredge spoil", f"Berth pocket dredge spoil volumes, part {k}.")
+    long_sections[-1] = ("Terms", f"{PROPOSAL_CLAUSE} {filler}")
+    bio = "Priya Okafor leads hydrographic surveys and holds the chartered surveyor grade."
+    files = {
+        "a/big.md": memo("Berth Pocket Report", "survey report", long_sections),
+        "b/small.md": memo(
+            "Apron Report",
+            "survey report",
+            [("Scope", "Survey of the quay apron."), ("Terms", PROPOSAL_CLAUSE)],
+        ),
+        "c/other.md": memo(
+            "Quay Report",
+            "survey report",
+            [(f"Berth {k}", f"Berth pocket survey of quay {k}.") for k in range(3)],
+        ),
+        "e/another.md": memo(
+            "Jetty Report",
+            "survey report",
+            [(f"Pocket {k}", f"Berth pocket survey at jetty {k}.") for k in range(3)],
+        ),
+        "d/team.md": memo(
+            "Lagoon Report", "survey report", [("Lagoon", "Lagoon depths."), ("Team", bio)]
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="berth")
+    big, team = document_id("a/big.md"), document_id("d/team.md")
+    inputs = "Berth pocket dredge spoil survey report. Team: Priya Okafor (hydrographer)."
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(inputs, None, deliverable_type="survey report")
+        sections = {s.section_id: s for s in snap._sections.values()}
+
+    assert fits_response(packet)
+    first = packet.exemplars[0]
+    assert first.doc_id == big and first.omitted_outline_sections == 0
+    # The outline is complete; what is included is whole, never cut.
+    assert len(first.sections) == 61
+    included = [s for s in first.sections if s.included]
+    assert 0 < len(included) < 61 and packet.omitted_sections > 0
+    for entry in included:
+        assert entry.markdown == sections[entry.section_id].markdown.strip()
+    # Priority: the input-matched section, the recurring terms, and the first and last two.
+    titles = {s.heading_path.split(" > ")[-1] for s in included}
+    assert {"Dredge spoil", "Terms", "Chapter 0", "Chapter 58"} <= titles
+    assert first.sections[0].included and first.sections[-1].included
+    # The rare name in the inputs brings the team section of a document outside the exemplars.
+    assert team not in {e.doc_id for e in packet.exemplars}
+    (bio_section,) = packet.supplemental_sections
+    assert (bio_section.doc_id, bio_section.markdown) == (team, f"## Team\n\n{bio}")
+
+
+def test_an_outline_too_long_for_the_packet_is_cut_and_says_so(tmp_path: Path) -> None:
+    sections = [(f"Clause {i} of the schedule of rates", f"Rate {i}.") for i in range(400)]
+    files = {
+        "a/schedule.md": memo("Rates Schedule", "schedule", sections),
+        "b/schedule.md": memo("Other Schedule", "schedule", sections[:3]),
+    }
+    path = compile_snapshot(tmp_path, files, topic="rates")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft("Schedule of rates clauses.", None)
+
+    assert fits_response(packet)
+    # The second exemplar's outline did not fit beside the first, so it is a candidate.
+    (first,) = packet.exemplars
+    assert first.doc_id == document_id("a/schedule.md")
+    assert first.omitted_outline_sections > 0
+    assert len(first.sections) + first.omitted_outline_sections == 401
+    assert [c.doc_id for c in packet.other_candidates] == [document_id("b/schedule.md")]
+
+
+def test_outlines_give_way_from_the_last_exemplar_after_notes_and_lessons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def report(name: str) -> str:
+        parts = [
+            (f"Part {i} {'w' * 20}", f"Harbour soundings part {i} for {name}.") for i in range(75)
+        ]
+        return memo(f"{name} Harbour Survey Report", "survey report", parts)
+
+    files = {
+        **{f"{c}/report.md": report(c) for c in ("a", "b", "c")},
+        **{
+            f"notes-{i}/AGENTS.md": f"# Note {i}\n\n" + f"Curator guidance {i}. " * 60
+            for i in range(10)
+        },
+        **{
+            f"reviews/r{i}.md": f"# Review {i}\n\nDeliverable: survey report review\n\nReviewer: "
+            + f"State every harbour datum in each part, lesson {i}. " * 6
+            for i in range(10)
+        },
+        **{
+            f"other/o{i}.md": memo(f"Other {i}", "letter", [("Body", "Harbour letter. " * 30)])
+            for i in range(10)
+        },
+    }
+    path = compile_snapshot(tmp_path, files, topic="fair")
+    long_parts = [
+        (f"Part {i}", "Harbour soundings. " + "The seabed was logged. " * 20) for i in range(340)
+    ]
+    long_path = compile_snapshot(
+        tmp_path / "long",
+        {"long/long.md": memo("Long Harbour Report", "long report", long_parts)},
+        topic="long",
+    )
+    measured = Counter[str]()
+    real = snapshot_module.response_text
+
+    def counting(result: Any) -> str:
+        measured[type(result).__name__] += 1
+        return real(result)
+
+    monkeypatch.setattr(snapshot_module, "response_text", counting)
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(
+            "Harbour survey report soundings.", None, deliverable_type="survey report"
+        )
+        drafts = measured["DraftPacket"]
+    with TopicSnapshot.open(long_path) as snap:
+        started = time.perf_counter()
+        long = snap.prepare_draft("Harbour soundings.", None)
+        elapsed = time.perf_counter() - started
+
+    assert fits_response(packet) and fits_response(long)
+    # Notes and lessons came first; the outlines of three, then two exemplars did not fit
+    # beside them, so the last ones gave way and the first keeps its complete outline.
+    assert packet.curator_notes and packet.lessons
+    (first,) = packet.exemplars
+    assert (len(first.sections), first.omitted_outline_sections) == (76, 0)
+    # The moved exemplars lead the other candidates, which stay at most eight.
+    moved = {document_id(f"{c}/report.md") for c in "abc"} - {first.doc_id}
+    assert {c.doc_id for c in packet.other_candidates[:2]} == moved
+    assert len(packet.other_candidates) == MAX_OTHER_CANDIDATES
+    # Packing measures the packet a handful of times, not once per section.
+    assert drafts <= 8
+    (only,) = long.exemplars
+    assert (
+        only.omitted_outline_sections > 0
+        and len(only.sections) + only.omitted_outline_sections == 341
+    )
+    assert elapsed < 0.5
+
+
+def test_a_filter_that_leaves_only_a_copy_drafts_from_the_copy(tmp_path: Path) -> None:
+    body = [("Scope", "Survey of the canal locks and the towpath walls.")]
+    report = memo("Canal Report", "survey report", body)
+    files = {"p1/report.md": report, "p2/report.md": report, "p3/other.md": memo("O", "x", body)}
+    path = compile_snapshot(tmp_path, files, topic="copies")
+    first, copy = document_id("p1/report.md"), document_id("p2/report.md")
+
+    with TopicSnapshot.open(path) as snap:
+        assert snap.document(copy).superseded_by == first
+        both = snap.prepare_draft("Canal locks survey report.", None)
+        filtered = snap.prepare_draft("Canal locks survey report.", None, filters={"project": "p2"})
+
+    # With both in the pool the copy gives way to its first; filtered to the copy, it is the
+    # exemplar.
+    assert copy not in {e.doc_id for e in both.exemplars}
+    assert [e.doc_id for e in filtered.exemplars] == [copy]
+
+
+def test_house_lessons_apply_whatever_the_filters_and_follow_the_first_exemplars_type(
+    tmp_path: Path,
+) -> None:
+    path = compile_snapshot(tmp_path, MARKETING_CORPUS, topic="campaigns")
+
+    with TopicSnapshot.open(path) as snap:
+        filtered = snap.prepare_draft(
+            "A loyalty brief for lapsed members.",
+            None,
+            deliverable_type="campaign brief",
+            filters={"campaign": "loyalty-relaunch"},
+        )
+        untyped = snap.prepare_draft("A loyalty brief for lapsed members.", None)
+
+    # The review sits in another campaign, yet its lesson is a house rule for briefs.
+    assert [e.doc_id for e in filtered.exemplars] == [LOYALTY_BRIEF]
+    assert [lesson.source_doc_id for lesson in filtered.lessons] == [SPRING_REVIEW]
+    assert untyped.exemplars[0].deliverable_type == "campaign brief"
+    assert [lesson.source_doc_id for lesson in untyped.lessons] == [SPRING_REVIEW]
+
+
+DELETED_CLAUSE = (
+    "Interim staffing is drawn from the regional pool and approved by the project director"
+    " before mobilisation."
+)
+
+
+def test_recurrence_counts_no_superseded_draft_and_samples_only_house_text(
+    tmp_path: Path,
+) -> None:
+    def proposal(title: str, date: str, scope: str, terms: str) -> str:
+        return memo(title, "survey proposal", [("Scope", scope), ("Terms", terms)], date)
+
+    files = {
+        # The first version held a clause its latest version dropped.
+        "a/proposal-v1.md": proposal(
+            "Estuary Proposal v1", "2025-01-10", DELETED_CLAUSE, PROPOSAL_CLAUSE
+        ),
+        "a/proposal-v2.md": proposal(
+            "Estuary Proposal v2", "2025-02-10", "Survey of the estuary.", PROPOSAL_CLAUSE
+        ),
+        "b/proposal.md": proposal(
+            "Harbour Proposal",
+            "2024-06-01",
+            f"Survey of the harbour for the port authority.\n\n{DELETED_CLAUSE}",
+            PROPOSAL_CLAUSE,
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="proposals")
+    harbour = document_id("b/proposal.md")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(
+            "Harbour survey proposal for the port authority.",
+            None,
+            deliverable_type="survey proposal",
+        )
+
+    (exemplar,) = [e for e in packet.exemplars if e.doc_id == harbour]
+    scope, terms = exemplar.sections[1], exemplar.sections[2]
+    # Only a superseded draft shares the dropped clause, so it recurs in no other family.
+    assert scope.included and scope.family_recurrence is None
+    assert terms.family_recurrence is not None
+    assert packet.recurring_samples == [
+        "all survey data remain confidential to the client and are held for seven years under the"
+    ]
+
+
+def test_recurring_samples_quote_the_included_exemplar_and_skip_table_headers(
+    tmp_path: Path,
+) -> None:
+    tail = (
+        " for seven years under the house records policy, after which the survey team destroys"
+        " every copy and certifies the deletion to the client in writing."
+    )
+    table = "| Metric | Value |\n| --- | --- |\n| Depth | 3 m |"
+    files = {
+        # The first in path order, so its wording represents the recurring unit.
+        "a/estuary.md": memo(
+            "Estuary Proposal",
+            "survey proposal",
+            [
+                ("Terms", f"The hydrographic survey records remain private to the client{tail}"),
+                ("Results", table),
+            ],
+        ),
+        "b/harbour.md": memo(
+            "Harbour Proposal",
+            "survey proposal",
+            [
+                (
+                    "Terms",
+                    "The hydro-\ngraphic survey records remain confidential to the client" + tail,
+                ),
+                ("Results", table),
+            ],
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="samples")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft("Harbour proposal.", None, deliverable_type="survey proposal")
+
+    assert packet.exemplars[0].doc_id == document_id("b/harbour.md")
+    assert all(s.included for e in packet.exemplars for s in e.sections)
+    # One sample per recurring prose unit, in the first exemplar's words with its line-end
+    # hyphen joined; the table header recurs too but is no house text.
+    assert packet.recurring_samples == [
+        "the hydrographic survey records remain confidential to the client for seven years under"
+        " the house records"
+    ]
+
+
+def test_a_recurring_sample_comes_from_its_own_holder_at_the_far_end_of_a_chain(
+    tmp_path: Path,
+) -> None:
+    # Seven 8-word windows sliding one word at a time: each says the same as the next, so the
+    # chain is one recurring unit, though its two ends share no 4-gram.
+    words = "every survey record stays with the client under the house retention policy for seven"
+    windows = [" ".join(words.split()[k : k + 8]) for k in range(7)]
+    files = {
+        f"p{k}/proposal.md": memo(
+            f"Proposal {name}",
+            "survey proposal",
+            [("Scope", f"Survey of the {name} basin."), ("Terms", f"{window.capitalize()}.")],
+        )
+        for k, (name, window) in enumerate(
+            zip(["Arden", "Brook", "Cove", "Dune", "Esker", "Fjord", "Gully"], windows, strict=True)
+        )
+    }
+    path = compile_snapshot(tmp_path, files, topic="chain")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(
+            "Gully basin proposal.", None, deliverable_type="survey proposal"
+        )
+
+    assert packet.exemplars[0].doc_id == document_id("p6/proposal.md")
+    assert packet.recurring_samples == [windows[6]]
+
+
+def test_a_recurring_section_keeps_its_priority_when_the_first_exemplar_shows_none(
+    tmp_path: Path,
+) -> None:
+    house = "The seabed record covers the stated dates and certifies nothing later than those."
+    cyrillic = "\u0417\u0430\u043f\u0438\u0441\u044c " * 4_500
+    filler = "Filler text of the long chapter. " * 560
+    files = {
+        "a/alpha.md": memo(
+            "Alpha Harbour", "report", [("Scope", "Short."), ("Record", f"{house}\n\n{cyrillic}")]
+        ),
+        "b/beta.md": memo(
+            "Beta",
+            "report",
+            [
+                ("Intro", "Short."),
+                ("Filler one", filler),
+                ("Terms", f"{house}\n\n" + "Standing terms of the house. " * 260),
+                ("Filler two", filler),
+                ("Filler three", filler),
+            ],
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="priority")
+    alpha, beta = document_id("a/alpha.md"), document_id("b/beta.md")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft("Alpha harbour", None)
+
+    first, second = packet.exemplars
+    assert (first.doc_id, second.doc_id) == (alpha, beta)
+    record = first.sections[2]
+    terms = next(s for s in second.sections if s.heading_path.endswith("Terms"))
+    # The first exemplar's recurring section is too large to include, so the unit it holds is
+    # not shown; the second exemplar's section holding it comes before its boundary sections.
+    assert record.family_recurrence is not None and not record.included
+    assert terms.included
+    assert not all(s.included for s in second.sections)
+
+
+def test_documents_of_the_requested_type_are_ranked_among_themselves(tmp_path: Path) -> None:
+    dense = "Harbour tide gauge datum."
+    files = {
+        **{
+            f"memos/memo-{n:02d}.md": memo(
+                f"Memo {n}", "technical memorandum", [(f"Part {k}", dense) for k in range(10)]
+            )
+            for n in range(40)
+        },
+        "proposals/a.md": memo(
+            "Coastal Proposal A", "survey proposal", [("Scope", "Works on the coast.")]
+        ),
+        "proposals/b.md": memo(
+            "Coastal Proposal B",
+            "survey proposal",
+            [
+                ("Scope", "Works on the coast."),
+                ("Gauges", f"{'Context of the works. ' * 40} {dense}"),
+            ],
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="ranking")
+    other, matching = document_id("proposals/a.md"), document_id("proposals/b.md")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(dense, None, deliverable_type="survey proposal")
+
+    # Four hundred memo chunks rank above the proposal's matching chunk over the whole pool;
+    # ranked among the proposals, its chunk counts, so it is the first exemplar.
+    assert [e.doc_id for e in packet.exemplars[:2]] == [matching, other]
+    assert packet.exemplars[0].relevance_score > packet.exemplars[1].relevance_score
+
+
+def test_drafting_words_and_reviews_do_not_make_rare_terms(tmp_path: Path) -> None:
+    files = {
+        "a/memo.md": memo("Memo", "memo", [("Team", "Zephyrine leads the survey crew.")]),
+        "b/review.md": memo("Review", "review notes", [("Notes", "Zephyrine was praised.")]),
+        "c/other.md": memo("Other", "memo", [("Body", "Please write whether based on this.")]),
+    }
+    path = compile_snapshot(tmp_path, files, topic="rare")
+    reviewed = {document_id("b/review.md")}
+
+    with TopicSnapshot.open(path) as snap:
+        deliverables = [d for d in snap.list_documents() if d.doc_id not in reviewed]
+        query, rare = snap._draft_terms(
+            "Please write the report based on this, whether or not Zephyrine leads.", deliverables
+        )
+
+    assert query is not None
+    assert not {"please", "write", "whether", "based", "report"} & set(re.findall(r"\w+", query))
+    # The review's section is no source of rare-word sections.
+    assert rare["zephyrine"] == {f"{document_id('a/memo.md')}_sec_002"}
+
+
+def test_a_free_slot_takes_only_a_relevant_document_of_another_type(tmp_path: Path) -> None:
+    files = {
+        "a/letter.md": memo(
+            "Depot Letter", "noise letter", [("Noise", "Night noise at the yard.")]
+        ),
+        "b/fees.md": memo("Fee Schedule", "fee schedule", [("Rates", "Hourly rates.")]),
+    }
+    path = compile_snapshot(tmp_path, files, topic="slots")
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(
+            "Night noise at the yard.", None, deliverable_type="noise letter"
+        )
+
+    # One exemplar of the requested type leaves free slots, but the fee schedule shares no
+    # word with the inputs, so it stays a candidate.
+    assert [e.doc_id for e in packet.exemplars] == [document_id("a/letter.md")]
+    assert [c.doc_id for c in packet.other_candidates] == [document_id("b/fees.md")]

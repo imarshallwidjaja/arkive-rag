@@ -83,27 +83,40 @@ DISCLOSURE = (
 )
 
 
-def _blueprint_output(*passages: str) -> str:
+PROJECT_PARAGRAPH = (
+    "Pellow Bakery opens its third shop in Truro this spring with a sourdough class for the"
+    " whole street."
+)
+
+
+def _packet_output(samples: Sequence[str], *sections: str) -> str:
+    """A drafting packet whose one exemplar includes each section, with `samples` as its
+    `recurring_samples`."""
     return json.dumps(
         {
             "deliverable_type": "Campaign brief",
-            "standing_passages": [
-                {"label": "Disclosure", "text": t, "citations": ["doc_002_sec_007"]}
-                for t in passages
+            "recurring_samples": list(samples),
+            "exemplars": [
+                {
+                    "doc_id": "doc_002",
+                    "sections": [
+                        {"section_id": f"doc_002_sec_{n:03d}", "included": True, "markdown": text}
+                        for n, text in enumerate(sections, start=1)
+                    ],
+                }
             ],
         }
     )
 
 
-def test_shipped_drafting_scenario_needs_the_full_blueprint_and_a_standing_passage() -> None:
+def test_shipped_drafting_scenario_needs_the_packet_and_a_recurring_passage() -> None:
     (draft,) = [
         s
         for s in ScenarioFile.load(runner.DEFAULT_SCENARIOS).scenarios
-        if s.scenario_id == "draft-from-blueprint"
+        if s.scenario_id == "draft-from-packet"
     ]
     topic = {"topic": "creator-campaigns"}
-    request = topic | {"deliverable_type": "campaign brief"}
-    header = "| Metric | Target |\n| --- | --- |"
+    request = topic | {"project_inputs": "Pellow Bakery, spring 2027, GBP 9,000, email."}
 
     def brief(mandatories: str) -> str:
         return _event(
@@ -113,58 +126,74 @@ def test_shipped_drafting_scenario_needs_the_full_blueprint_and_a_standing_passa
             f" Measures: ... Mandatories: {mandatories}",
         )
 
-    # Emphasis, quotes and case do not matter; a long passage needs only its first 12 words,
-    # so a fact the agent adapts later in the passage still counts.
+    # Ten words of a recurring passage in a row count, whatever its opening: here the agent
+    # adapted the first three words to the newsletter. Emphasis, quotes and case do not
+    # matter.
     reproduced = brief(
-        "*Every creator post made under this brief is labelled Paid Partnership* in the"
-        " newsletter header."
+        "*Every newsletter issue made under this brief is labelled Paid Partnership in its"
+        " first line* of the header."
     )
     unreproduced = brief("say the post is sponsored.")
+    # The disclosure section also holds the exemplar's own project paragraph; copying that
+    # paragraph is not house text.
+    copied_project = brief(PROJECT_PARAGRAPH)
+    mixed = f"## Disclosure\n\n{PROJECT_PARAGRAPH}\n\n{DISCLOSURE}"
+    sample = " ".join(DISCLOSURE.split()[:16])
     guide = _tool("arkive_get_topic_guide", topic)
-    blueprint = _tool("arkive_get_blueprint", request, output=_blueprint_output(DISCLOSURE))
-    with_header = _tool("arkive_get_blueprint", request, output=_blueprint_output(header))
-    bare = _tool("arkive_get_blueprint", request, output=_blueprint_output())
-    unknown = _tool("arkive_get_blueprint", topic | {"deliverable_type": "press kit"}, "error")
+    packet = _tool(
+        "arkive_prepare_draft",
+        request,
+        output=_packet_output([sample], "## Objective\n\nGrow.", mixed),
+    )
+    single_family = _tool("arkive_prepare_draft", request, output=_packet_output([], mixed))
+    unknown = _tool("arkive_prepare_draft", topic | {"deliverable_type": "press kit"}, "error")
 
-    assert _failed(draft, parse_events([guide, blueprint, reproduced])) == []
-    assert _failed(draft, parse_events([with_header, brief("| metric | target |")])) == []
-    assert _failed(draft, parse_events([blueprint, unreproduced])) == [
-        "answer reproduces a standing passage"
-    ]
-    # A blueprint without standing passages fails a precondition of the snapshot, named as
-    # such, rather than the agent's reproduction check.
-    outcomes = evaluate(draft, parse_events([bare, reproduced]), 0, FACETS)
+    assert _failed(draft, parse_events([guide, packet, reproduced])) == []
+    for answer in (unreproduced, copied_project):
+        assert _failed(draft, parse_events([packet, answer])) == [
+            "answer reproduces a recurring passage"
+        ]
+    # A packet whose included sections recur in no other version family fails a precondition
+    # of the snapshot, named as such, rather than the agent's reproduction check.
+    outcomes = evaluate(draft, parse_events([single_family, reproduced]), 0, FACETS)
     (missing,) = [o for o in outcomes if not o.passed]
-    assert missing.check == "precondition: blueprint has a standing passage"
+    assert missing.check == "precondition: packet has a recurring passage"
     assert "the served snapshot, not the agent, fails this scenario" in missing.detail
-    # The guide holds only blueprint summaries, so a draft from it alone misses the checks.
+    # The guide holds no exemplar text, so a draft from it alone misses the checks.
     assert _failed(draft, parse_events([guide, reproduced])) == [
-        "called: get_blueprint",
-        "answer reproduces a standing passage",
+        "called: prepare_draft",
+        "answer reproduces a recurring passage",
     ]
     assert _failed(draft, parse_events([unknown, reproduced])) == [
-        "called: get_blueprint",
+        "called: prepare_draft",
         "topics queried",
-        "answer reproduces a standing passage",
+        "answer reproduces a recurring passage",
     ]
-    # Only a blueprint of the scenario's topic counts, and of those the last one fetched.
+    # Only a packet of the scenario's topic counts, and of those the last one fetched.
     elsewhere = _tool(
-        "arkive_get_blueprint",
-        {"topic": "coastal-survey-projects", "deliverable_type": "proposal"},
-        output=_blueprint_output(DISCLOSURE),
-    )
-    other_type = _tool(
-        "arkive_get_blueprint",
-        topic | {"deliverable_type": "post-campaign review"},
-        output=_blueprint_output(header),
+        "arkive_prepare_draft",
+        {"topic": "coastal-survey-projects", "project_inputs": "A proposal."},
+        output=_packet_output([sample], mixed),
     )
     assert _failed(draft, parse_events([guide, elsewhere, reproduced])) == [
-        "answer reproduces a standing passage"
+        "answer reproduces a recurring passage"
     ]
-    assert _failed(draft, parse_events([blueprint, other_type, reproduced])) == [
-        "answer reproduces a standing passage"
+    assert _failed(draft, parse_events([packet, single_family, reproduced])) == [
+        "precondition: packet has a recurring passage"
     ]
-    assert _failed(draft, parse_events([other_type, blueprint, reproduced])) == []
+    assert _failed(draft, parse_events([single_family, packet, reproduced])) == []
+
+
+def test_a_truncated_arkive_result_fails_every_scenario() -> None:
+    truncated = json.loads(_tool("arkive_list_documents", {"topic": "survey"}))
+    truncated["part"]["state"]["metadata"]["truncated"] = True
+    answer = _event("text", type="text", text="Done.")
+
+    assert _failed(_scenario(), parse_events([json.dumps(truncated), answer])) == [
+        "no Arkive result truncated"
+    ]
+    whole = _tool("arkive_list_documents", {"topic": "survey"})
+    assert _failed(_scenario(), parse_events([whole, answer])) == []
 
 
 def test_scenario_file_refuses_duplicates_unknown_tools_and_undeclared_topics() -> None:
@@ -185,7 +214,7 @@ def test_scenario_file_refuses_duplicates_unknown_tools_and_undeclared_topics() 
     with pytest.raises(ValidationError, match="undeclared topics"):
         load(case | {"topics_queried": ["campaigns"]})
     with pytest.raises(ValidationError, match="undeclared topics"):
-        load(case | {"answer_reproduces_standing_passage_of": "campaigns"})
+        load(case | {"answer_reproduces_recurring_passage_of": "campaigns"})
     with pytest.raises(ValidationError, match="required_tools"):
         load(case | {"required_tools": ["read"]})
     with pytest.raises(ValidationError, match="condition"):
@@ -278,7 +307,7 @@ def test_a_run_that_meets_every_expectation_passes_every_check() -> None:
     )
     outcomes = evaluate(scenario, transcript, 0, FACETS)
     assert all(o.passed for o in outcomes), [o for o in outcomes if not o.passed]
-    assert len(outcomes) == 11
+    assert len(outcomes) == 12
 
 
 def test_each_kind_of_failure_names_its_check() -> None:

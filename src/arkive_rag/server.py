@@ -7,68 +7,53 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
-from typing import Self
+from typing import Annotated, Self
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ImageContent, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent
+from pydantic import BaseModel
 
 from arkive_rag import __version__
 from arkive_rag.models import (
     ArkiveError,
-    Blueprint,
-    DocumentInfo,
     DocumentOutline,
+    DocumentPage,
+    DraftPacket,
     GlossaryLookup,
     GrepMatch,
     NotFoundError,
     SearchHit,
     SectionReadView,
     TopicGuide,
-    TopicSummary,
+    TopicPage,
+    choices,
+    echoed,
 )
-from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
+from arkive_rag.snapshot import (
+    QueryEmbedder,
+    TopicSnapshot,
+    page_caption,
+    response_text,
+    topic_page,
+)
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 INSTRUCTIONS = """\
-Arkive serves curated reference collections ("topics"). Call list_topics first if the
-topic slug is unknown; it lists each topic's facets and the deliverable types that have a
-blueprint. Facets are ways to filter a topic, such as client, project, author or
-campaign; list_documents, search and grep accept `filters`, a mapping from facet name to
-one value or alias, and combine several facets with AND. Then follow the mode that
-matches the user's request:
-
-1. Answering questions about the corpus:
-   - Use search for semantic or keyword queries and grep for exact strings, numbers or
-     filenames. get_topic_guide helps when the collection's scope, its curator notes or
-     missing material matter. Call lookup_glossary when a term, acronym or abbreviation
-     is unclear. Use read_section for full context and view_page only when a chart, map,
-     table layout or visual detail matters.
-   - Cite every fact from the corpus by doc_id and section_id, with page numbers where
-     the source has rendered pages. Markdown sources have no pages.
-
-2. Drafting a new deliverable from the user's own inputs:
-   - Call get_blueprint for the deliverable type and follow its outline, conventions
-     and reviewer pitfalls.
-   - For each section whose layout matters, read one of its cited exemplar sections
-     with read_section and mirror its heading levels and generic table column headers.
-     Do not reuse project-specific headings or facts. Reuse other wording only from
-     standing passages.
-   - Every fact about the user's project (its client and other parties, people, places,
-     dates, quantities, budgets, targets, findings, identifiers, file names) comes only
-     from the user's inputs. This rule takes precedence over the next one.
-   - The blueprint's standing passages are the collection's own house text. Reproduce
-     them with their wording, without commentary about where they come from, and keep
-     their organisation names, method references and attributions as written. Adapt or
-     leave out only the part of a passage that belongs to one particular project (its
-     client, site, dates, quantities or results), using the user's inputs. Names,
-     references and attributions from the corpus may be reused only when they appear in
-     a standing passage.
-   - Where the user's inputs enumerate items (files, deliverables, parameters,
-     results), list every item in full, never as patterns or "etc.".
-   - Write a standalone deliverable: no Arkive doc_id or section_id, and no mention of
-     the exemplar or feedback documents.
+Arkive serves curated reference collections ("topics").
+1. Call list_topics when the topic slug or its facets are unknown. Facets filter a topic
+   (client, project, author and the like): list_documents, search, grep and prepare_draft
+   accept `filters`, a mapping from facet name to one value or alias; facets combine with AND.
+2. Answering questions: use search for meaning and grep for exact strings, numbers or file
+   names, read_section for context, get_topic_guide for scope and curator notes,
+   lookup_glossary for unclear terms, and view_page when a chart, map or layout matters.
+   Cite doc_id, section_id and pages. When search and grep find no evidence for a requested
+   fact or mechanism, say that the corpus does not establish it and stop searching rather
+   than inferring an answer from adjacent workflows.
+3. Drafting a deliverable: call prepare_draft with the user's full project_inputs, never
+   summarised, and follow the drafting_guidance, exemplars, lessons and curator_notes it
+   returns. Use read_section for an outline entry it did not include.
 """
 
 
@@ -97,7 +82,9 @@ class TopicCatalog:
 
     def get(self, topic: str) -> TopicSnapshot:
         if topic not in self._topics:
-            raise NotFoundError(f"unknown topic {topic!r}; valid topics: {', '.join(self._topics)}")
+            raise NotFoundError(
+                f"unknown topic {echoed(topic)}; valid topics: {choices(self._topics)}"
+            )
         return self._topics[topic]
 
     def close(self) -> None:
@@ -117,6 +104,20 @@ class TopicCatalog:
         self.close()
 
 
+def _structured(result: BaseModel | Sequence[BaseModel]) -> CallToolResult:
+    """A structured tool result whose text block is `response_text`, the compact JSON the
+    snapshot measures its results by, so a result that fits its budget reaches the client
+    whole. A list result is structured as `{"result": [...]}`, as the SDK wraps one."""
+    if isinstance(result, BaseModel):
+        structured = result.model_dump(mode="json")
+    else:
+        structured = {"result": [item.model_dump(mode="json") for item in result]}
+    return CallToolResult(
+        content=[TextContent(type="text", text=response_text(result))],
+        structured_content=structured,
+    )
+
+
 @contextmanager
 def _as_tool_errors() -> Iterator[None]:
     try:
@@ -129,92 +130,106 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
     server = MCPServer(name="arkive-rag", instructions=INSTRUCTIONS, version=__version__)
 
     @server.tool()
-    def list_topics() -> list[TopicSummary]:
-        """List the topics this server serves, with their facets and allowed facet values."""
-        return [snapshot.summary() for snapshot in catalog.snapshots]
+    def list_topics(offset: int = 0) -> Annotated[CallToolResult, TopicPage]:
+        """List the topics this server serves, with their facets, allowed facet values and
+        deliverable types (the first 50 of each; omitted_* counts the rest). Pass next_offset
+        as offset for the next page of topics."""
+        with _as_tool_errors():
+            return _structured(topic_page(catalog.snapshots, offset))
 
     @server.tool()
-    def get_topic_guide(topic: str) -> TopicGuide:
+    def get_topic_guide(topic: str) -> Annotated[CallToolResult, TopicGuide]:
         """Cited overview of a topic: its scope, curator notes, facet definitions, glossary
-        terms and a summary of each deliverable blueprint (type, description, number of
-        exemplars). get_blueprint returns a blueprint in full."""
+        terms and its deliverable types with document and feedback counts. Notes, facet values
+        and terms that do not fit are counted in its omitted_* fields."""
         with _as_tool_errors():
-            return catalog.get(topic).guide()
+            return _structured(catalog.get(topic).guide())
 
     @server.tool()
-    def get_blueprint(topic: str, deliverable_type: str) -> Blueprint:
-        """The full writing blueprint for one deliverable type: section outline with cited
-        exemplar sections, conventions, reviewer pitfalls, exemplar and feedback documents,
-        and standing passages: the collection's house text, which recurs in another exemplar
-        document, exactly as it appears in its first cited section. When drafting, keep a
-        passage's organisation names, method references and attributions as written, and
-        adapt only the part that belongs to one particular project. The type is matched
-        ignoring case and surrounding spaces."""
+    def prepare_draft(
+        topic: str,
+        project_inputs: str,
+        deliverable_type: str | None = None,
+        filters: dict[str, str] | None = None,
+    ) -> Annotated[CallToolResult, DraftPacket]:
+        """Everything needed to draft one new deliverable from the user's inputs: up to three
+        prior exemplars ranked against them, each with its complete outline and as much whole
+        section text as fits, other candidates, reviewer lessons, curator notes and drafting
+        guidance, with provenance (dates, version families, recurrence counts). Pass the
+        user's full inputs as project_inputs. deliverable_type is optional and matched
+        ignoring case; an unknown type lists the valid ones. Works without OPENAI_API_KEY."""
         with _as_tool_errors():
-            return catalog.get(topic).blueprint(deliverable_type)
+            return _structured(
+                catalog.get(topic).prepare_draft(
+                    project_inputs, embed_query, deliverable_type=deliverable_type, filters=filters
+                )
+            )
 
     @server.tool()
-    def list_documents(topic: str, filters: dict[str, str] | None = None) -> list[DocumentInfo]:
-        """List documents in a topic. `filters` maps facet names to one value or alias each;
-        several facets combine with AND."""
+    def list_documents(
+        topic: str, filters: dict[str, str] | None = None, limit: int = 50, offset: int = 0
+    ) -> Annotated[CallToolResult, DocumentPage]:
+        """One page of a topic's documents in path order, with their deliverable type,
+        feedback role and version family. `filters` maps facet names to one value or alias
+        each; several facets combine with AND. Pass next_offset as offset for the next page."""
         with _as_tool_errors():
-            return catalog.get(topic).list_documents(filters=filters)
+            return _structured(
+                catalog.get(topic).list_documents_page(filters=filters, limit=limit, offset=offset)
+            )
 
     @server.tool()
-    def get_document_outline(topic: str, doc_id: str) -> DocumentOutline:
-        """Document metadata and its section outline with page ranges."""
+    def get_document_outline(
+        topic: str, doc_id: str, offset: int = 0
+    ) -> Annotated[CallToolResult, DocumentOutline]:
+        """Document metadata and one page of its section outline with page ranges. Pass
+        next_offset as offset for the next page of a long outline."""
         with _as_tool_errors():
-            return catalog.get(topic).outline(doc_id)
+            return _structured(catalog.get(topic).outline(doc_id, offset=offset))
 
     @server.tool()
     def search(
         topic: str, query: str, filters: dict[str, str] | None = None, top_k: int = 8
-    ) -> list[SearchHit]:
+    ) -> Annotated[CallToolResult, list[SearchHit]]:
         """Hybrid keyword and semantic search over chunks, optionally restricted by facet
-        `filters`. Needs OPENAI_API_KEY on the server."""
+        `filters`, with at most three chunks per version family unless fewer hits remain.
+        Needs OPENAI_API_KEY on the server."""
         with _as_tool_errors():
             snapshot = catalog.get(topic)
             if embed_query is None:
                 raise ToolError(
                     "semantic search needs OPENAI_API_KEY on the server. grep, list_documents,"
-                    " get_document_outline, read_section, view_page and lookup_glossary work"
-                    " without it."
+                    " get_document_outline, read_section, view_page, lookup_glossary and"
+                    " prepare_draft work without it."
                 )
-            return snapshot.search(query, embed_query, filters=filters, top_k=top_k)
+            return _structured(snapshot.search(query, embed_query, filters=filters, top_k=top_k))
 
     @server.tool()
     def grep(
         topic: str, pattern: str, filters: dict[str, str] | None = None, max_matches: int = 20
-    ) -> list[GrepMatch]:
+    ) -> Annotated[CallToolResult, list[GrepMatch]]:
         """Case-insensitive literal search for exact strings, numbers and filenames,
-        optionally restricted by facet `filters`."""
+        optionally restricted by facet `filters`; at most 50 matches."""
         with _as_tool_errors():
-            return catalog.get(topic).grep(pattern, filters=filters, max_matches=max_matches)
+            return _structured(
+                catalog.get(topic).grep(pattern, filters=filters, max_matches=max_matches)
+            )
 
     @server.tool()
-    def read_section(topic: str, section_id: str) -> SectionReadView:
-        """Full Markdown of one section, with the IDs of its neighbouring sections.
-
-        When drafting a new deliverable, mirror an exemplar section's heading levels and
-        generic table column headers, but not its project-specific headings or facts. Reuse
-        other wording, names, references and attributions only from the blueprint's standing
-        passages, which are house text kept as written apart from
-        their project-specific parts; take every fact about the user's project from the
-        user's inputs, and never cite doc_id or section_id in the deliverable.
-        """
+    def read_section(
+        topic: str, section_id: str, offset: int = 0
+    ) -> Annotated[CallToolResult, SectionReadView]:
+        """Markdown of one section, with the IDs of its neighbouring sections. A section too
+        long for one result comes in parts: pass next_offset as offset for the next part."""
         with _as_tool_errors():
-            return catalog.get(topic).read_section(section_id)
+            return _structured(catalog.get(topic).read_section(section_id, offset=offset))
 
     @server.tool()
     def view_page(topic: str, doc_id: str, page_number: int) -> list[TextContent | ImageContent]:
-        """Rendered page image (WebP) with its native text and visual summary."""
+        """Rendered page image (WebP) with its visual summary and native text; text too long
+        for one result is cut and says how much it left out."""
         with _as_tool_errors():
             page = catalog.get(topic).view_page(doc_id, page_number)
-        caption = (
-            f"{page.doc_title} ({page.doc_id}) page {page.page_number} of {page.page_count}\n\n"
-            f"Visual summary:\n{page.visual_summary or '(none)'}\n\n"
-            f"Native text:\n{page.native_text}"
-        )
+        caption = page_caption(page)
         image = base64.b64encode(page.webp_bytes).decode()
         return [
             TextContent(type="text", text=caption),
@@ -222,12 +237,15 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
         ]
 
     @server.tool()
-    def lookup_glossary(topic: str, query: str | None = None) -> GlossaryLookup:
-        """The topic's glossary. Without `query`, every term with whether a sense has a
-        definition. With `query`, the full entries whose term or alias contains it: each sense has
-        section citations. A null definition means no definition was established from its
-        cited evidence; it does not prove the corpus never defines the term."""
+    def lookup_glossary(
+        topic: str, query: str | None = None, offset: int = 0
+    ) -> Annotated[CallToolResult, GlossaryLookup]:
+        """The topic's glossary, one page from `offset`. Without `query`, each term with
+        whether a sense has a definition. With `query`, the full entries whose term or alias
+        contains it: each sense has section citations. A null definition means no definition
+        was established from its cited evidence; it does not prove the corpus never defines
+        the term."""
         with _as_tool_errors():
-            return catalog.get(topic).lookup_glossary(query)
+            return _structured(catalog.get(topic).lookup_glossary(query, offset=offset))
 
     return server

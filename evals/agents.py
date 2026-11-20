@@ -392,8 +392,7 @@ def qa_evidence(snapshot: TopicSnapshot, case: QACase) -> str:
         return "(no source anchors listed)"
     blocks: dict[str, str] = {}
     for anchor in case.source_anchors:
-        outline = snapshot.outline(anchor.doc_id)
-        document = outline.document
+        document = snapshot.document(anchor.doc_id)
         if anchor.pages is not None and anchor.pages[1] > document.page_count:
             extent = (
                 f"has {document.page_count} pages"
@@ -406,7 +405,7 @@ def qa_evidence(snapshot: TopicSnapshot, case: QACase) -> str:
             )
         overlapping = [
             s
-            for s in outline.sections
+            for s in snapshot.full_outline(anchor.doc_id)
             if anchor.pages is None
             or not (s.page_end < anchor.pages[0] or s.page_start > anchor.pages[1])
         ]
@@ -419,7 +418,7 @@ def qa_evidence(snapshot: TopicSnapshot, case: QACase) -> str:
         for section in overlapping:
             if section.section_id in blocks:
                 continue
-            markdown = snapshot.read_section(section.section_id).markdown
+            markdown = snapshot.section_markdown(section.section_id)
             blocks[section.section_id] = (
                 f"--- {document.rel_path} ({document.doc_id}), section {section.section_id},"
                 f" pages {section.page_start}-{section.page_end} ---\n{markdown}"

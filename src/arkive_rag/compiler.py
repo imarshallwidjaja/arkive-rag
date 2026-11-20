@@ -4,8 +4,9 @@
    the generation model, check the transcript against the native text layer, stitch pages
    into sections and chunk pieces, and write an observation card. A reading holds no corpus
    IDs and no path.
-2. Induction (`arkive_rag.induction.induce`, corpus-wide): facets, facet binding, glossary,
-   blueprints and the topic guide.
+2. Induction (`arkive_rag.induction.induce`, corpus-wide): facets, deliverable types and
+   feedback roles, facet binding, version families, feedback lessons, the glossary, recurring
+   text units and the topic guide.
 3. Binding (`bind_document`): section and chunk IDs, breadcrumbs from the bound facets, then
    embeddings.
 
@@ -57,6 +58,7 @@ from arkive_rag.models import (
     CuratorNote,
     DocumentDate,
     DocumentReading,
+    DocumentRole,
     Facet,
     MissingDependencyError,
     ObservationCard,
@@ -76,6 +78,7 @@ from arkive_rag.models import (
     document_id,
     fold_for_quote,
     fold_text,
+    heading_context,
     iso_date,
     parse_printed_date,
 )
@@ -106,10 +109,6 @@ PREV_CONTEXT_CHARS = 1200
 # Sections are packed in order into observation batches of about this many characters; a
 # larger section is a batch of its own.
 OBSERVE_BATCH_CHARS = 24_000
-# Longest heading path shown as a label beside section text, in an observation batch or a
-# chunk breadcrumb. A heading the transcript ran on for pages keeps its whole Markdown in the
-# section; only the label is cut, so it cannot blow a batch or an embedding input.
-MAX_HEADING_CONTEXT_CHARS = 500
 # Page rendering. The page image is part of every `transcribe_page` cache key, so changing the
 # scale or quality re-transcribes every page of every cached corpus.
 PDF_RENDER_SCALE = 2.0
@@ -1580,14 +1579,6 @@ def _visual_summary(extraction: PageExtraction) -> str:
     return "\n".join(lines)
 
 
-def heading_context(heading_path: str) -> str:
-    """`heading_path` as a label beside section text: itself, or its first
-    MAX_HEADING_CONTEXT_CHARS - 1 characters and an ellipsis."""
-    if len(heading_path) <= MAX_HEADING_CONTEXT_CHARS:
-        return heading_path
-    return heading_path[: MAX_HEADING_CONTEXT_CHARS - 1] + "\u2026"
-
-
 def observation_batches(sections: Sequence[ReadSection]) -> list[tuple[BatchSection, ...]]:
     """Sections packed in order into batches of at most `OBSERVE_BATCH_CHARS` characters.
 
@@ -1992,9 +1983,13 @@ def breadcrumb_prefix(facets: Sequence[Facet], assignment: Mapping[str, Sequence
 
 
 def bind_document(
-    document: CorpusDocument, facets: Sequence[Facet], assignment: Mapping[str, Sequence[str]]
+    document: CorpusDocument,
+    facets: Sequence[Facet],
+    assignment: Mapping[str, Sequence[str]],
+    role: DocumentRole,
 ) -> CompiledDocument:
-    """Bind one document: section and chunk IDs, and breadcrumbs from its facets."""
+    """Bind one document: section and chunk IDs, breadcrumbs from its facets, and its role:
+    the induced role of a citable document, or `curator_note_role` for a curator note."""
     reading, card = document.reading, document.reading.card
     prefix = breadcrumb_prefix(facets, assignment)
     sections: list[Section] = []
@@ -2041,7 +2036,6 @@ def bind_document(
             else (reading.date.iso if reading.date else None)
         ),
         date=reading.date,
-        deliverable_type=card.deliverable_type,
         summary=card.summary,
         facets={
             f.name: tuple(sorted(assignment[f.name])) for f in facets if assignment.get(f.name)
@@ -2050,6 +2044,19 @@ def bind_document(
         chunks=tuple(chunks),
         pages=reading.pages,
         is_curator_note=reading.is_curator_note,
+        role=role,
+    )
+
+
+def curator_note_role(document: CorpusDocument) -> DocumentRole:
+    """A curator note's role: its card's type, no feedback, and a version family of its own."""
+    return DocumentRole(
+        deliverable_type=document.reading.card.deliverable_type,
+        is_feedback=False,
+        feedback_for_types=(),
+        family_id=document.doc_id,
+        version_status="sole",
+        superseded_by=None,
     )
 
 
@@ -2126,7 +2133,13 @@ def compile_corpus(
     )
     knowledge = induce(documents, notes, gateway, topic=topic, max_concurrency=max_concurrency)
     compiled = tuple(
-        bind_document(d, knowledge.facets, knowledge.assignments[d.doc_id]) for d in documents
+        bind_document(
+            d,
+            knowledge.facets,
+            knowledge.assignments[d.doc_id],
+            knowledge.roles[d.doc_id] if d.is_citable else curator_note_role(d),
+        )
+        for d in documents
     )
     chunks = [chunk for doc in compiled for chunk in doc.chunks]
     embeddings = gateway.embed_texts([f"{c.breadcrumb}\n{c.content}" for c in chunks])
@@ -2149,7 +2162,9 @@ def compile_corpus(
         guide_markdown=knowledge.guide_markdown,
         facets=knowledge.facets,
         glossary=knowledge.glossary,
-        blueprints=knowledge.blueprints,
+        deliverable_types=knowledge.deliverable_types,
+        feedback_lessons=knowledge.feedback_lessons,
+        unit_clusters=knowledge.unit_clusters,
         build_settings=settings,
         build_report=knowledge.report,
         documents=compiled,

@@ -77,10 +77,10 @@
       "answer_groups": [["41,700"], ["doc_cc01ac49e1"]]
     },
     {
-      "scenario_id": "draft-from-blueprint",
-      "description": "Drafts a campaign brief from the full blueprint, which only get_blueprint returns, reproducing one of its standing passages and using only the project facts given.",
-      "prompt": "In the creator-campaigns topic, draft a short campaign brief for a new client, Pellow Bakery: spring 2027, budget GBP 9,000, channel email newsletter. Follow the topic's blueprint for campaign briefs, and use no project facts other than mine.",
-      "required_tools": ["get_blueprint"],
+      "scenario_id": "draft-from-packet",
+      "description": "Drafts a campaign brief from the drafting packet, which only prepare_draft returns, reproducing one of its recurring passages and using only the project facts given.",
+      "prompt": "In the creator-campaigns topic, draft a short campaign brief for a new client, Pellow Bakery: spring 2027, budget GBP 9,000, channel email newsletter. Follow how the topic's prior campaign briefs are written, and use no project facts other than mine.",
+      "required_tools": ["prepare_draft"],
       "topics_queried": ["creator-campaigns"],
       "answer_groups": [
         ["Pellow"],
@@ -90,7 +90,7 @@
         ["measure", "KPI"],
         ["mandator"]
       ],
-      "answer_reproduces_standing_passage_of": "creator-campaigns"
+      "answer_reproduces_recurring_passage_of": "creator-campaigns"
     },
     {
       "scenario_id": "cross-topic-question",
