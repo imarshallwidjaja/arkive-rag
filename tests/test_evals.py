@@ -2603,6 +2603,7 @@ def test_eval_runner_checks_the_credential_and_opens_the_cache_before_creating_o
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
     snapshot_path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
     out = tmp_path / "out"
     arguments = ["--pack", str(EXAMPLE_PACK_PATH), "--snapshot", str(snapshot_path)]

@@ -526,9 +526,10 @@ def test_catalog_rejects_two_snapshots_with_the_same_topic(
 
 
 def test_cli_inspect_and_grep_work_offline(
-    snapshots: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    snapshots: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
     runner = CliRunner()
 
     inspected = runner.invoke(app, ["inspect", str(snapshots[0])])
@@ -648,6 +649,7 @@ def test_cli_build_rejects_outputs_in_the_corpus_before_any_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
     corpus = tmp_path / "corpus"
     (corpus / "p1").mkdir(parents=True)
     (corpus / "p1" / "memo.md").write_text("# Memo\n\nText")
