@@ -115,12 +115,15 @@ uv run --locked python -m evals.run --pack path/to/bathymetry.eval.json \
 runs every holdout in the pack, or the one `--holdout ID` names, for
 `--drafts N` rounds (default 1), and writes each holdout's snapshot and each
 round's blind drafts to `<out>/holdouts/<holdout_id>/`; layer 3 refuses an
-`--out` that already holds a `holdouts` directory. Three drafting arms always
-run in every round (no tools, chunk search, the Arkive MCP tools), and a
-fourth, with the holdout's `exemplar_paths` documents in the prompt, runs
-when `exemplar_paths` is not empty. Each completed draft is measured with two
-lexical-overlap measures over its prose: house-text recall and copied-text
-contamination.
+`--out` that already holds a `holdouts` directory. Four drafting arms always
+run in every round (no tools, chunk search, raw-file tools over the included
+files, the Arkive MCP tools), and a fifth, with the holdout's `exemplar_paths`
+documents in the prompt, runs when `exemplar_paths` is not empty. With
+`exemplar_paths`, the report also says how many of those documents
+`prepare_draft` surfaces for the holdout's inputs. Each completed draft is
+measured with two lexical-overlap measures over its prose: house-text recall
+and copied-text contamination. Layer 1 compares BM25, dense and hybrid
+ranking with the search agents get.
 Layers 2 and 3 need `--corpus`, whose files must still match the snapshot's
 `corpus_fingerprint`; `--cache` reuses a build cache for the holdout snapshots
 and must not overlap `--out`.

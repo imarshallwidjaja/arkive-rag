@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import time
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
@@ -163,34 +163,91 @@ def _page_argument(args: dict[str, Any], name: str) -> int:
     return value
 
 
-@dataclass(frozen=True)
-class RawPage:
-    text: str
-    webp: bytes | None
+PageImage = Callable[[str, int], bytes | None]
 
 
 class RawCorpus:
-    """Native text and page images of every corpus file, extracted once before any timed query
-    so the baseline is not charged LibreOffice start-up on each question. The files are the ones
-    `discover_corpus` accepts, the same set a snapshot is compiled from."""
+    """The native text layer of every page of some corpus files, and their page images: what
+    the raw-file tools search and read. A Markdown file is one page of raw text without an
+    image. `page_image(rel_path, page_number)` returns one page's WebP, or None when the page
+    has none; `page_texts` and `page_image` must describe the same files and pages."""
 
-    def __init__(self, corpus_dir: Path) -> None:
-        started = time.monotonic()
-        self.files: dict[str, list[RawPage]] = {}
+    def __init__(self, page_texts: Mapping[str, Sequence[str]], page_image: PageImage) -> None:
+        self.files = dict(page_texts)
+        self._page_image = page_image
+
+    @classmethod
+    def extract(cls, corpus_dir: Path) -> RawCorpus:
+        """Render every file `discover_corpus` accepts, the set a snapshot is compiled from:
+        LibreOffice converts Word and PowerPoint files and pdfium renders each PDF page."""
+        texts: dict[str, list[str]] = {}
+        images: dict[tuple[str, int], bytes] = {}
         for source in discover_corpus(corpus_dir):
             data = read_source(source)
             if source.format == "md":
-                self.files[source.rel_path] = [RawPage(data.decode("utf-8"), None)]
+                texts[source.rel_path] = [data.decode("utf-8")]
                 continue
             pdf = (
                 data
                 if source.format == "pdf"
                 else convert_office_to_pdf(data, source.path.suffix.lower(), source.rel_path)
             )
-            self.files[source.rel_path] = [RawPage(text, webp) for text, webp in render_pdf(pdf)]
-        self.prep_seconds = time.monotonic() - started
+            pages = render_pdf(pdf)
+            texts[source.rel_path] = [text for text, _ in pages]
+            for number, (_, webp) in enumerate(pages, start=1):
+                images[source.rel_path, number] = webp
+        return cls(texts, lambda rel_path, number: images.get((rel_path, number)))
 
-    def _pages(self, rel_path: str) -> list[RawPage]:
+    @classmethod
+    def from_snapshot(
+        cls, files: Mapping[str, bytes], snapshot: TopicSnapshot, *, digests: Mapping[str, str]
+    ) -> RawCorpus:
+        """`files`, the corpus files `snapshot` was compiled from, read without rendering: a
+        Markdown file is its own bytes, and any other file is the native text and WebP of the
+        pages the build rendered and stored, the same pdfium output `extract` produces. Images
+        are read from `snapshot` when a tool asks for one, so `snapshot` must stay open while
+        the tools run. `digests` maps each file to the SHA-256 hex digest of its bytes, which
+        the caller computed once for its own checks, so no file is hashed twice.
+
+        The files are listed and searched in `snapshot.list_documents()` path order, whatever
+        the order of `files`. Refuses (ValueError) `digests` for other files than `files`, a
+        set of files other than the snapshot's documents, and a file the snapshot holds with
+        other bytes, since its stored pages would not be this file's."""
+        documents = snapshot.list_documents()
+        if digests.keys() != files.keys():
+            raise ValueError("digests must name exactly the files")
+        if files.keys() != {d.rel_path for d in documents}:
+            missing = sorted({d.rel_path for d in documents} - files.keys())
+            extra = sorted(files.keys() - {d.rel_path for d in documents})
+            raise ValueError(
+                f"{snapshot.path} was not compiled from exactly these files: documents without"
+                f" a file {missing}, files without a document {extra}"
+            )
+        texts: dict[str, list[str]] = {}
+        doc_ids: dict[str, str] = {}
+        for document in documents:
+            rel_path = document.rel_path
+            if document.sha256 != digests[rel_path]:
+                raise ValueError(
+                    f"{snapshot.path} holds no document with the bytes of {rel_path}, so its"
+                    " stored pages cannot stand for the file"
+                )
+            if document.format == "md":
+                texts[rel_path] = [files[rel_path].decode("utf-8")]
+                continue
+            doc_ids[rel_path] = document.doc_id
+            texts[rel_path] = [
+                snapshot.view_page(document.doc_id, number).native_text
+                for number in range(1, document.page_count + 1)
+            ]
+
+        def page_image(rel_path: str, number: int) -> bytes | None:
+            doc_id = doc_ids.get(rel_path)
+            return None if doc_id is None else snapshot.view_page(doc_id, number).webp_bytes
+
+        return cls(texts, page_image)
+
+    def _pages(self, rel_path: str) -> Sequence[str]:
         if rel_path not in self.files:
             raise KeyError(f"unknown file {rel_path!r}; call list_corpus_files")
         return self.files[rel_path]
@@ -203,8 +260,8 @@ class RawCorpus:
         matches = [
             {"rel_path": rel, "page": number, "line": line.strip()[:300]}
             for rel, pages in self.files.items()
-            for number, page in enumerate(pages, start=1)
-            for line in page.text.splitlines()
+            for number, text in enumerate(pages, start=1)
+            for line in text.splitlines()
             if needle and needle in line.casefold()
         ]
         return json.dumps(matches[:MAX_GREP_MATCHES], ensure_ascii=False)
@@ -213,12 +270,12 @@ class RawCorpus:
         pages = self._pages(str(args["rel_path"]))
         start = max(1, _page_argument(args, "start_page"))
         end = min(len(pages), _page_argument(args, "end_page"), start + MAX_RAW_PAGES_PER_READ - 1)
-        return "\n\n".join(f"--- page {n} ---\n{pages[n - 1].text}" for n in range(start, end + 1))
+        return "\n\n".join(f"--- page {n} ---\n{pages[n - 1]}" for n in range(start, end + 1))
 
     def view_raw_page_image(self, args: dict[str, Any]) -> ToolResult:
         rel, number = str(args["rel_path"]), _page_argument(args, "page_number")
         pages = self._pages(rel)
-        image = pages[number - 1].webp if 1 <= number <= len(pages) else None
+        image = self._page_image(rel, number) if 1 <= number <= len(pages) else None
         if image is None:
             return f"ERROR: {rel} has no rendered page {number}"
         return ToolReply(f"{rel} page {number}", (ToolImage(image, "image/webp"),))
@@ -478,7 +535,11 @@ async def run_layer2_qa(
     (invalid or refused output, output still truncated after the retry, a provider failure),
     which keeps the row's phrase coverage. The spend limit stops the evaluation.
     """
-    raw = RawCorpus(corpus_dir)
+    # Extracted once before any timed query, so the baseline is not charged LibreOffice
+    # start-up on each question.
+    started = time.monotonic()
+    raw = RawCorpus.extract(corpus_dir)
+    raw_prep_seconds = time.monotonic() - started
     rows: list[dict[str, object]] = []
     with TopicSnapshot.open(snapshot_path) as snapshot:
         evidence = {case.case_id: qa_evidence(snapshot, case) for case in cases}
@@ -531,4 +592,4 @@ async def run_layer2_qa(
                         "claim_counts": None if judge is None else judge.claim_counts(),
                     }
                 )
-    return {"raw_prep_seconds": raw.prep_seconds, "rows": rows}
+    return {"raw_prep_seconds": raw_prep_seconds, "rows": rows}

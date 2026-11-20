@@ -1,18 +1,20 @@
 """Layer 3: draft held-out deliverables, measure the drafts and judge them blind.
 
 For each holdout the harness builds a holdout snapshot without the held-out material, then runs
-draft rounds. Every round runs the holdout's arms from its run notes, scores each completed
-draft with the rubric and two lexical-overlap measures, and sends the round's completed drafts
-to one blind judge call. Agent runs go through `evals.agents.run_agent`; the judge goes through
-`OpenAIGateway.run`.
+draft rounds. Before the first round it records which documents `prepare_draft` selects for
+the holdout's inputs against the pack author's `exemplar_paths`. Every round runs the
+holdout's arms from its run notes, scores each completed draft with the rubric and two
+lexical-overlap measures, and sends the round's completed drafts to one blind judge call.
+Agent runs go through `evals.agents.run_agent`; the judge goes through `OpenAIGateway.run`.
 
 The two measures compare wording, not meaning. They share with induction's recurring units the
 unit, folding, shingle and containment functions of `arkive_rag.passages` (`standing_units`,
 `fold_unit`, word shingles, `containment`, `without_visual_transcripts`) and its thresholds
 (`STANDING_MIN_WORDS`, `STANDING_RECURRENCE_CONTAINMENT`). They differ from recurrence
-discovery (`recurring_units`) in one way: a unit is held when the union of every holdout
-section's shingles contains enough of its shingles, where discovery tests each section of
-another document on its own.
+discovery (`recurring_units`) in one way: a unit is held when one holdout document, all its
+sections together, contains enough of its shingles, where discovery tests each section of
+another document on its own. A paragraph that joins two sections of one document is held;
+common 4-grams scattered over several unrelated documents never add up to a held unit.
 """
 
 from __future__ import annotations
@@ -22,7 +24,8 @@ import json
 import os
 import random
 import tempfile
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -33,12 +36,13 @@ from pydantic import BaseModel
 from arkive_rag import passages as _passages
 from arkive_rag.compiler import RenderCache, compile_corpus, discover_corpus, read_source
 from arkive_rag.llm import BudgetExceededError, Effort, LanguageGateway, OpenAIGateway, Tool
-from arkive_rag.models import DocumentInfo, ProviderError, fold_for_quote
+from arkive_rag.models import DocumentInfo, ProviderError, fold_facet_label, fold_for_quote
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
 from evals.agents import (
     EVAL_EFFORT,
     AgentRun,
     CountingEmbedder,
+    RawCorpus,
     Score10,
     arkive_mcp_tools,
     object_schema,
@@ -50,7 +54,7 @@ from evals.schema import Holdout, RubricCheck, held_out_markers_in, satisfies_gr
 DRAFT_MAX_TURNS = 16
 BLIND_SEED = 42
 
-DraftArm = Literal["zero_shot", "chunk_search", "arkive_mcp", "exemplars_in_context"]
+DraftArm = Literal["zero_shot", "chunk_search", "raw_files", "arkive_mcp", "exemplars_in_context"]
 
 
 # Holdout guards and the holdout snapshot.
@@ -121,13 +125,15 @@ def select_holdout_sources(
 
 
 def assert_holdout_clean(
-    holdout: Holdout, reference: DocumentInfo, documents: Sequence[DocumentInfo]
+    holdout: Holdout, reference: DocumentInfo, files: Iterable[tuple[str, str]]
 ) -> None:
-    """Fail before any drafting arm runs if held-out material reached the holdout snapshot."""
+    """Fail before any drafting arm runs if held-out material reached what an arm can read:
+    `files` are `(rel_path, sha256)` pairs, the holdout snapshot's documents or the raw files
+    the raw-file arm exposes."""
     leaked = {
-        d.rel_path: reasons
-        for d in documents
-        if (reasons := _leak_reasons(holdout, reference, d.rel_path, d.sha256))
+        rel_path: reasons
+        for rel_path, sha256 in files
+        if (reasons := _leak_reasons(holdout, reference, rel_path, sha256))
     }
     if leaked:
         raise ValueError(f"holdout snapshot leaks held-out material: {leaked}")
@@ -140,8 +146,9 @@ def compile_holdout_snapshot(
     holdout: Holdout,
     reference: DocumentInfo,
     render_cache: RenderCache | None = None,
-) -> None:
-    """Build the holdout snapshot and publish it at `output_path` only after its guard passes.
+) -> dict[str, bytes]:
+    """Build the holdout snapshot and publish it at `output_path` only after its guard passes;
+    return the included files it was built from (`select_holdout_sources`).
 
     `render_cache`, normally the build cache `gateway` uses, lets a holdout skip rendering
     files an earlier build rendered."""
@@ -162,11 +169,26 @@ def compile_holdout_snapshot(
         try:
             write_snapshot(corpus, unverified)
             with TopicSnapshot.open(unverified) as built:
-                assert_holdout_clean(holdout, reference, built.list_documents())
+                assert_holdout_clean(
+                    holdout, reference, ((d.rel_path, d.sha256) for d in built.list_documents())
+                )
             os.replace(unverified, output_path)
         except BaseException:
             unverified.unlink(missing_ok=True)
             raise
+    return sources
+
+
+def holdout_raw_corpus(
+    holdout: Holdout, reference: DocumentInfo, files: Mapping[str, bytes], built: TopicSnapshot
+) -> RawCorpus:
+    """The raw-file arm's corpus: the included `files` the holdout snapshot `built` was
+    compiled from, read from its stored pages (`RawCorpus.from_snapshot`), so no file is
+    rendered again. Refuses held-out material among `files` before reading anything; each
+    file is hashed once, for both that guard and the snapshot match."""
+    digests = {rel_path: hashlib.sha256(data).hexdigest() for rel_path, data in files.items()}
+    assert_holdout_clean(holdout, reference, digests.items())
+    return RawCorpus.from_snapshot(files, built, digests=digests)
 
 
 def section_markdowns(snapshot: TopicSnapshot, doc_id: str) -> list[str]:
@@ -219,8 +241,31 @@ def _text_shingles(text: str) -> Shingles:
     return whole.union(*(u.grams for u in _prose_units(text)))
 
 
-def _held(grams: Shingles, holdout: Shingles) -> bool:
-    return _passages.containment(grams, holdout) >= _passages.STANDING_RECURRENCE_CONTAINMENT
+@dataclass(frozen=True)
+class _HoldoutText:
+    """The holdout text as the documents that hold each shingle, so testing a unit reads only
+    its own shingles, however many documents the holdout has."""
+
+    # Each shingle's documents, in index order, each once (a document's text is a set).
+    holders: dict[tuple[str, ...], list[int]]
+
+    @classmethod
+    def of(cls, documents: Sequence[Shingles]) -> _HoldoutText:
+        """`documents` are the holdout documents' texts, one shingle set each."""
+        holders: dict[tuple[str, ...], list[int]] = {}
+        for index, grams in enumerate(documents):
+            for gram in grams:
+                holders.setdefault(gram, []).append(index)
+        return cls(holders)
+
+    def held_part(self, grams: Shingles) -> Shingles:
+        """The shingles of a unit's `grams` that its holders hold, the documents that each
+        hold at least `STANDING_RECURRENCE_CONTAINMENT` of `grams`; empty exactly when no
+        document holds the unit."""
+        counts = Counter(i for gram in grams for i in self.holders.get(gram, ()))
+        need = _passages.STANDING_RECURRENCE_CONTAINMENT * len(grams)
+        unit_holders = {i for i, n in counts.items() if n >= need}
+        return frozenset(g for g in grams if not unit_holders.isdisjoint(self.holders.get(g, ())))
 
 
 @dataclass(frozen=True)
@@ -235,8 +280,8 @@ class HouseUnitRecall:
 @dataclass(frozen=True)
 class CopiedUnit:
     """One copied unit of a draft, by its first `UNIT_HEAD_CHARS` characters, and how many of
-    its shingles are stray: in the holdout text, and in neither the reference nor the
-    authorised input."""
+    its shingles are stray: in the holdout documents that hold the unit, and in neither the
+    reference nor the authorised input."""
 
     text_head: str
     stray_shingles: int
@@ -267,15 +312,16 @@ class OverlapSources:
     shingles* are the union of its prose units' shingles. The *text shingles* of the reference,
     of authorised input (the run notes and instructions) and of each holdout section are
     `_text_shingles`: a superset of both the whole-text and the per-unit forms, so a sentence
-    present on both sides always matches on this side. The *holdout text* is the union of the
-    holdout sections' text shingles. A prose unit is *held* when the holdout text contains at
-    least `STANDING_RECURRENCE_CONTAINMENT` of its shingles. A *house unit* is a held prose unit
-    of the reference of at least `STANDING_MIN_WORDS` words; the *house shingles* are the union
-    of the house units' shingles minus authorised input. A draft's *copied unit* is a held prose
-    unit of at least `STANDING_MIN_WORDS` words.
+    present on both sides always matches on this side. A *holdout document's text* is the union
+    of its sections' text shingles. A prose unit is *held* when at least one holdout document's
+    text contains at least `STANDING_RECURRENCE_CONTAINMENT` of its shingles; its *holders* are
+    the documents that do. A *house unit* is a held prose unit of the reference of at least
+    `STANDING_MIN_WORDS` words; the *house shingles* are the union of the house units' shingles
+    minus authorised input. A draft's *copied unit* is a held prose unit of at least
+    `STANDING_MIN_WORDS` words.
     """
 
-    holdout: Shingles
+    holdout: _HoldoutText
     reference: Shingles
     authorised: Shingles
     house_units: tuple[_ProseUnit, ...]
@@ -286,19 +332,21 @@ class OverlapSources:
         cls,
         *,
         reference_sections: Sequence[str],
-        holdout_sections: Sequence[str],
+        holdout_documents: Sequence[Sequence[str]],
         run_notes: str,
         instructions: str,
     ) -> OverlapSources:
-        """`holdout_sections` are the section texts of the holdout's delivered documents;
-        curator notes are not holdout text, so the caller leaves them out."""
-        holdout: Shingles = frozenset().union(*map(_text_shingles, holdout_sections))
+        """`holdout_documents` hold each delivered document of the holdout as its section
+        texts; curator notes are not holdout text, so the caller leaves them out."""
+        holdout = _HoldoutText.of(
+            [frozenset().union(*map(_text_shingles, sections)) for sections in holdout_documents]
+        )
         authorised = _text_shingles(run_notes) | _text_shingles(instructions)
         house = tuple(
             unit
             for section in reference_sections
             for unit in _prose_units(section)
-            if unit.long and _held(unit.grams, holdout)
+            if unit.long and holdout.held_part(unit.grams)
         )
         return cls(
             holdout=holdout,
@@ -310,11 +358,12 @@ class OverlapSources:
 
     def measure(self, draft: str) -> LexicalOverlap:
         """*House-text recall*: the share of the house shingles among the draft's prose
-        shingles. *Copied-text contamination*: the *stray shingles*, the union of the copied
-        units' shingles that occur in the holdout text and in neither the reference's nor
-        authorised input's text shingles, as a share of the draft's prose shingles. Both stray
-        shingles and house shingles are subsets of what they are divided by, so both measures
-        lie in 0..1."""
+        shingles. *Copied-text contamination*: the *stray shingles*, the union over the copied
+        units of each unit's shingles that its holders' text holds and neither the reference's
+        nor authorised input's text shingles hold, as a share of the draft's prose shingles.
+        Words a drafter added to a copied passage are stray only if the document it was copied
+        from holds them. Both stray shingles and house shingles are subsets of what they are
+        divided by, so both measures lie in 0..1."""
         units = _prose_units(draft)
         draft_grams: Shingles = frozenset().union(*(u.grams for u in units))
         recall = (
@@ -322,9 +371,15 @@ class OverlapSources:
             if self.house_shingles
             else None
         )
-        copied = [u for u in units if u.long and _held(u.grams, self.holdout)]
-        strays = [(u.grams & self.holdout) - self.reference - self.authorised for u in copied]
-        stray: Shingles = frozenset().union(*strays)
+        known = self.reference | self.authorised
+        copied: list[CopiedUnit] = []
+        stray: set[tuple[str, ...]] = set()
+        for unit in units:
+            part = self.holdout.held_part(unit.grams) if unit.long else frozenset()
+            if part:
+                unit_stray = part - known
+                stray |= unit_stray
+                copied.append(CopiedUnit(unit.text[:UNIT_HEAD_CHARS], len(unit_stray)))
         contamination = len(stray) / len(draft_grams) if draft_grams else None
         return LexicalOverlap(
             house_text_recall=recall,
@@ -337,10 +392,7 @@ class OverlapSources:
                 )
                 for u in self.house_units
             ),
-            copied_units=tuple(
-                CopiedUnit(u.text[:UNIT_HEAD_CHARS], len(s))
-                for u, s in zip(copied, strays, strict=True)
-            ),
+            copied_units=tuple(copied),
         )
 
 
@@ -399,12 +451,14 @@ def rubric_diagnostics(
 
 # Exemplars in context.
 
-# The drafting obligations the MCP server gives (`arkive_rag.server.INSTRUCTIONS` and the
-# drafting packet's `arkive_rag.snapshot.DRAFTING_GUIDANCE`), reworded for documents in the
-# prompt instead of tools. A test pins word for word the drafting part of those instructions,
-# the packet guidance, the `prepare_draft` and `read_section` tool descriptions as the server
-# publishes them, and this text, beside a map of the obligations they share, so an edit to any
-# of them fails until the pins are updated together.
+# The rules of the exemplars-in-context arm: the control that drafts from the documents the pack
+# author chose, whole and in the prompt. It measures what full context of human-selected
+# exemplars achieves, so it is the fixed baseline the arkive_mcp arm is compared against across
+# changes to the server. This text is therefore frozen on its own: it does not follow
+# `arkive_rag.server.INSTRUCTIONS` or `arkive_rag.snapshot.DRAFTING_GUIDANCE`, and a test pins it
+# word for word apart from the server's drafting surface. Moving it with the server would change
+# the control together with the treatment and confound every before/after comparison. Change it
+# only as a deliberate change of baseline, and rerun the baseline when you do.
 EXEMPLAR_DRAFTING_RULES = """\
 The prompt holds prior deliverables of the same collection, each labelled with its file path,
 followed by the run notes of the new project.
@@ -436,6 +490,104 @@ def exemplars_prompt(documents: Sequence[tuple[str, str]], run_notes: str) -> st
         for path, markdown in documents
     ]
     return "\n\n".join([*blocks, f"RUN NOTES:\n{run_notes}"])
+
+
+# Raw files.
+
+# Added to the holdout's instructions for the raw_files arm, which otherwise has only the
+# tools' own descriptions to tell it what the files are for. Its authorised inputs are the
+# ones the blind judge accepts (`DRAFT_JUDGE_INSTRUCTIONS`): the task instructions and the run
+# notes, so a role or company the instructions give is a project fact, not an invention.
+RAW_FILES_DRAFTING_HINT = """\
+Use the file tools to find relevant prior deliverables and reviewer feedback in the
+collection. Take every fact about the new project only from these instructions and the run
+notes, and write a standalone deliverable without file paths."""
+
+
+# Exemplar selection.
+
+
+@dataclass(frozen=True)
+class ExemplarSelection:
+    """How `prepare_draft`, given the holdout's instructions and run notes and the reference's
+    deliverable type, surfaces the documents the pack author named in `exemplar_paths`.
+
+    `oracle_exemplar_paths` are the named deliverables and `oracle_feedback_paths` the named
+    feedback documents. When the reference is a feedback document, or every named document is
+    one, the holdout drafts a review, so every named document is a deliverable to surface and
+    none is a feedback document. `requested_type` is the deliverable type passed to
+    `prepare_draft`: the reference's, when the holdout snapshot has that type, else None.
+
+    Every share counts version families once, so naming two versions of one deliverable
+    counts as one, and a superseded document counts through the member that replaced it.
+    `oracle_exemplar_families` and `oracle_feedback_families` count the named families. A named
+    deliverable family is surfaced when one of its documents is among the packet's exemplars
+    (`exemplar_recall_at_packet`) or among its exemplars and other candidates
+    (`exemplar_recall_at_candidates`); each recall is None without a named deliverable.
+    `feedback_attached` is the share of named feedback families that a packet lesson comes
+    from, None without one. `query_embeddings` counts the query embeddings the call made."""
+
+    oracle_exemplar_paths: tuple[str, ...]
+    oracle_feedback_paths: tuple[str, ...]
+    oracle_exemplar_families: int
+    oracle_feedback_families: int
+    requested_type: str | None
+    packet_exemplar_paths: tuple[str, ...]
+    packet_candidate_paths: tuple[str, ...]
+    exemplar_recall_at_packet: float | None
+    exemplar_recall_at_candidates: float | None
+    feedback_attached: float | None
+    query_embeddings: int
+
+
+def exemplar_selection(
+    built: TopicSnapshot, holdout: Holdout, reference: DocumentInfo, embedder: CountingEmbedder
+) -> ExemplarSelection:
+    """One deterministic `prepare_draft` call on the holdout snapshot `built`, compared with
+    `holdout.exemplar_paths`; no model writes anything. `reference` is the held-out
+    deliverable in the full snapshot: its type is requested the way an agent drafting that
+    deliverable would request it, so an exemplar of another type cannot set the lessons'
+    type."""
+    by_path = {d.rel_path: d for d in built.list_documents()}
+    named = [by_path[p] for p in holdout.exemplar_paths]
+    types = {
+        fold_facet_label(t.deliverable_type): t.deliverable_type for t in built.type_summaries()
+    }
+    requested = types.get(fold_facet_label(reference.deliverable_type))
+    with embedder.recording_run() as embeddings:
+        packet = built.prepare_draft(
+            f"{holdout.instructions}\n\n{holdout.run_notes}",
+            embedder,
+            deliverable_type=requested,
+        )
+    drafts_review = reference.is_feedback or all(d.is_feedback for d in named)
+    oracle = named if drafts_review else [d for d in named if not d.is_feedback]
+    feedback = [] if drafts_review else [d for d in named if d.is_feedback]
+    oracle_families = {d.family_id for d in oracle}
+    feedback_families = {d.family_id for d in feedback}
+    candidates = [built.document(c.doc_id) for c in packet.other_candidates]
+    exemplar_families = {built.document(e.doc_id).family_id for e in packet.exemplars}
+    candidate_families = exemplar_families | {c.family_id for c in candidates}
+    lesson_families = {built.document(lesson.source_doc_id).family_id for lesson in packet.lessons}
+
+    def share(surfaced: set[str], named_families: set[str]) -> float | None:
+        if not named_families:
+            return None
+        return len(named_families & surfaced) / len(named_families)
+
+    return ExemplarSelection(
+        oracle_exemplar_paths=tuple(d.rel_path for d in oracle),
+        oracle_feedback_paths=tuple(d.rel_path for d in feedback),
+        oracle_exemplar_families=len(oracle_families),
+        oracle_feedback_families=len(feedback_families),
+        requested_type=requested,
+        packet_exemplar_paths=tuple(e.rel_path for e in packet.exemplars),
+        packet_candidate_paths=tuple(c.rel_path for c in candidates),
+        exemplar_recall_at_packet=share(exemplar_families, oracle_families),
+        exemplar_recall_at_candidates=share(candidate_families, oracle_families),
+        feedback_attached=share(lesson_families, feedback_families),
+        query_embeddings=embeddings.calls,
+    )
 
 
 # Blind judge.
@@ -481,26 +633,30 @@ class DraftBlindComparison(BaseModel):
 
 
 DRAFT_JUDGE_INSTRUCTIONS = """\
-You review anonymous drafts of one deliverable, written from the same run notes, against the
-reference deliverable the project team actually delivered. The reference is given as text with
-its figures removed; figures, charts and maps are out of scope. Score each candidate from 1 to
-10 on structure_and_house_style, technical_rigor, limitations_and_review_readiness,
-factual_discipline_no_contamination (penalise any value that contradicts the run notes or
-belongs to another project) and editing_effort_saved (how much of the reference a reviewer
-would not need to rewrite). Give concrete strengths and defects, then rank the candidates
-best first by their labels."""
+You review anonymous drafts of one deliverable, written from the same task instructions and
+run notes, against the reference deliverable the project team actually delivered. The task
+instructions and the run notes are the authorised inputs: a fact, person, role or organisation
+that either of them gives, such as the author's name, role or company, is not invented and
+not contamination. The reference is given as text with its figures removed; figures, charts
+and maps are out of scope. Score each candidate from 1 to 10 on structure_and_house_style,
+technical_rigor, limitations_and_review_readiness, factual_discipline_no_contamination
+(penalise any value that contradicts the authorised inputs or belongs to another project) and
+editing_effort_saved (how much of the reference a reviewer would not need to rewrite). Give
+concrete strengths and defects, then rank the candidates best first by their labels."""
 
 
 @dataclass(frozen=True)
 class DraftComparison:
     """Blind side-by-side review of one round's completed drafts against the reference
-    deliverable, whose visual transcripts the caller has removed."""
+    deliverable, whose visual transcripts the caller has removed. `task_instructions` are the
+    holdout's instructions, which every arm drafted under."""
 
     operation: ClassVar[str] = "judge_drafts"
     output: ClassVar[type[DraftBlindComparison]] = DraftBlindComparison
     effort: ClassVar[Effort] = EVAL_EFFORT
     instructions: ClassVar[str] = DRAFT_JUDGE_INSTRUCTIONS
     image_webp: ClassVar[None] = None
+    task_instructions: str
     run_notes: str
     reference_markdown: str
     drafts: tuple[tuple[str, str], ...]
@@ -508,8 +664,8 @@ class DraftComparison:
     def text(self) -> str:
         candidates = "\n\n".join(f"===== {label} =====\n{text}" for label, text in self.drafts)
         return (
-            f"RUN NOTES:\n{self.run_notes}\n\nREFERENCE DELIVERABLE:\n{self.reference_markdown}"
-            f"\n\nCANDIDATES:\n{candidates}"
+            f"TASK INSTRUCTIONS:\n{self.task_instructions}\n\nRUN NOTES:\n{self.run_notes}"
+            f"\n\nREFERENCE DELIVERABLE:\n{self.reference_markdown}\n\nCANDIDATES:\n{candidates}"
         )
 
 
@@ -534,10 +690,13 @@ async def run_layer3_holdout(
     `holdout_gateway` compiles it, with `render_cache` when one is given; it must embed in the
     full snapshot's embedding space, because `embedder` serves both. The reference and the
     included files are checked before any file is copied or any model is called. Every round
-    runs `zero_shot`, `chunk_search` and
-    `arkive_mcp`, and `exemplars_in_context` unless the holdout lists no `exemplar_paths` (it is
-    then reported in `skipped_arms`), and makes one blind judge call when any draft completed.
-    Each round's `blind_drafts` maps Candidate labels to draft text; the caller writes them out.
+    runs `zero_shot`, `chunk_search`, `raw_files` and `arkive_mcp`, and `exemplars_in_context`
+    unless the holdout lists no `exemplar_paths` (it is then reported in `skipped_arms`), and
+    makes one blind judge call when any draft completed. `raw_files` reads the included files
+    through the raw-file tools of layer 2, served from the pages the holdout build stored
+    (`holdout_raw_corpus`). With `exemplar_paths`, `selection` is the `exemplar_selection` made
+    before the first round; without, it is None. Each round's `blind_drafts` maps Candidate
+    labels to draft text; the caller writes them out.
     """
     if drafts < 1:
         raise ValueError(f"drafts must be at least 1, got {drafts}")
@@ -551,7 +710,7 @@ async def run_layer3_holdout(
     holdout_path = output_dir / "holdout.arkive.db"
     # A worker thread: compiling may start its own event loop for agent runs, and this
     # coroutine's loop is already running.
-    await anyio.to_thread.run_sync(
+    included = await anyio.to_thread.run_sync(
         compile_holdout_snapshot,
         corpus_dir,
         holdout_path,
@@ -563,6 +722,9 @@ async def run_layer3_holdout(
 
     with TopicSnapshot.open(holdout_path) as built:
         documents = built.list_documents()
+        raw = holdout_raw_corpus(holdout, reference, included, built)
+        # Release the included files' bytes before drafting; `raw` keeps Markdown text only.
+        del included
         # Each document's sections, read once. A document without sections, such as an empty
         # curator note, contributes none.
         sections = {d.rel_path: section_markdowns(built, d.doc_id) for d in documents}
@@ -571,11 +733,10 @@ async def run_layer3_holdout(
             if not sections[path]:
                 raise ValueError(f"exemplar document {path} has no sections")
             exemplars.append((path, "\n\n".join(sections[path])))
+        selection = exemplar_selection(built, holdout, reference, embedder) if exemplars else None
         sources = OverlapSources.from_texts(
             reference_sections=reference_sections,
-            holdout_sections=[
-                m for d in documents if not d.is_curator_note for m in sections[d.rel_path]
-            ],
+            holdout_documents=[sections[d.rel_path] for d in documents if not d.is_curator_note],
             run_notes=holdout.run_notes,
             instructions=holdout.instructions,
         )
@@ -608,6 +769,11 @@ async def run_layer3_holdout(
             arms: dict[DraftArm, tuple[Sequence[Tool], str, str]] = {
                 "zero_shot": ((), holdout.instructions, notes_prompt),
                 "chunk_search": ((chunk_search,), holdout.instructions, notes_prompt),
+                "raw_files": (
+                    raw.tools,
+                    f"{holdout.instructions}\n\n{RAW_FILES_DRAFTING_HINT}",
+                    notes_prompt,
+                ),
                 "arkive_mcp": (
                     mcp_tools,
                     with_server_instructions(holdout.instructions, mcp_notes),
@@ -644,6 +810,7 @@ async def run_layer3_holdout(
         "holdout_snapshot": str(holdout_path),
         "holdout_documents": [d.rel_path for d in documents],
         "exemplar_paths": list(holdout.exemplar_paths),
+        "selection": selection,
         "skipped_arms": skipped,
         "house_units": len(sources.house_units),
         "house_shingles": len(sources.house_shingles),
@@ -677,7 +844,12 @@ async def _finish_round(
         try:
             judged = await anyio.to_thread.run_sync(
                 gateway.run,
-                DraftComparison(holdout.run_notes, reference_markdown, tuple(blind_drafts.items())),
+                DraftComparison(
+                    holdout.instructions,
+                    holdout.run_notes,
+                    reference_markdown,
+                    tuple(blind_drafts.items()),
+                ),
             )
         except BudgetExceededError:
             raise

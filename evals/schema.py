@@ -3,16 +3,21 @@
 Packs hold corpus-specific facts, so private packs live outside this repository next to their
 corpus (see docs/architecture.md). A *group* is a list of alternative substrings; text satisfies
 a group when it contains any alternative, and satisfies a list of groups when it satisfies every
-group. Matching is NFKC, case-, dash-, whitespace- and thousands-separator-insensitive, and
-folds an x or multiplication sign (U+00D7) between digits to " x ", so "59,494 km²" matches
-"59494 km2" and "1800 x 1800" matches "1800x1800".
+group. Matching is NFKC, case-, dash-, whitespace- and thousands-separator-insensitive, ignores
+Markdown emphasis, and folds an x or multiplication sign (U+00D7) between digits to " x ", so
+"59,494 km²" matches "59494 km2", "does **not** hold" matches "does not hold" and "1800 x 1800"
+matches "1800x1800". Emphasis is backticks, `*` runs that touch a non-space character (a spaced
+`2 * 3` keeps its sign) and `_` runs with a letter or digit on one side only, so `_italic_` and
+`__bold__` lose their underscores while `harbour_dry` and `survey__v2.tif` keep every one.
+Table pipes stay, so a group can test a table row. Every phrase must keep some text once
+normalized: a markup-only phrase such as "**" would otherwise match every text.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Self
 
@@ -30,10 +35,14 @@ _DASHES = re.compile(r"[\u2010-\u2015\u2212]")
 _THOUSANDS = re.compile(r"(?<=\d),(?=\d{3})")
 _SPACES = re.compile(r"\s+")
 _DIMENSION_SIGN = re.compile(r"(?<=\d)\s*[x\u00d7]\s*(?=\d)")
+# `[^\W_]` is a letter or digit. An `_` run is matched whole: its outer lookaround refuses a
+# word character, `_` included, so backtracking cannot strip part of the run in `survey__v2`.
+_MATCH_EMPHASIS = re.compile(r"`|\*+(?=\S)|(?<=\S)\*+|(?<!\w)_+(?=[^\W_])|(?<=[^\W_])_+(?!\w)")
 
 
 def normalize_for_match(text: str) -> str:
-    folded = _DASHES.sub("-", unicodedata.normalize("NFKC", text)).casefold()
+    plain = _MATCH_EMPHASIS.sub("", unicodedata.normalize("NFKC", text))
+    folded = _DASHES.sub("-", plain).casefold()
     folded = _DIMENSION_SIGN.sub(" x ", folded)
     return _SPACES.sub(" ", _THOUSANDS.sub("", folded)).strip()
 
@@ -41,6 +50,18 @@ def normalize_for_match(text: str) -> str:
 NonBlank = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
 Group = Annotated[tuple[NonBlank, ...], Field(min_length=1)]
 Groups = tuple[Group, ...]
+
+
+def _require_matchable(owner: str, phrases: Iterable[str]) -> None:
+    """Refuse a phrase that normalizes to nothing: `"" in text` holds for every text, so it
+    would make a required group always pass and a forbidden phrase always fail."""
+    for phrase in phrases:
+        if not normalize_for_match(phrase):
+            raise ValueError(f"{owner} phrase {phrase!r} is empty once markup is ignored")
+
+
+def _flat(groups: Groups) -> list[str]:
+    return [alt for group in groups for alt in group]
 
 
 def satisfies_groups(text: str, groups: Groups) -> bool:
@@ -70,6 +91,11 @@ class RetrievalCase(_PackModel):
     # Facet name to one value or alias, as `TopicSnapshot.resolve_filters` takes them. The
     # snapshot's facets are induced from its corpus: `arkive-rag inspect` lists them.
     filters: dict[NonBlank, NonBlank] = {}
+
+    @model_validator(mode="after")
+    def _phrases_matchable(self) -> Self:
+        _require_matchable(f"retrieval case {self.case_id!r}", _flat(self.required_groups))
+        return self
 
 
 QAKind = Literal["lookup", "multi_document", "aggregation", "abstention", "conflict", "vocabulary"]
@@ -113,6 +139,7 @@ class QACase(_PackModel):
             raise ValueError(
                 f"qa case {self.case_id!r} of kind {self.kind!r} has no source_anchors"
             )
+        _require_matchable(f"qa case {self.case_id!r}", _flat(self.required_groups))
         return self
 
 
@@ -135,6 +162,9 @@ class RubricCheck(_PackModel):
     def _tests_something(self) -> Self:
         if not self.require_groups and not self.forbid_any:
             raise ValueError(f"rubric check {self.check_id!r} has no require_groups or forbid_any")
+        _require_matchable(
+            f"rubric check {self.check_id!r}", [*_flat(self.require_groups), *self.forbid_any]
+        )
         return self
 
     def passes(self, draft: str) -> bool:

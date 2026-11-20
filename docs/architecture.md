@@ -1033,7 +1033,8 @@ request takes the estimate past the limit, the evaluation finishes normally.
 An eval pack is a JSON file validated by `EvalPack` in `evals/schema.py`
 (`format` `arkive-eval-pack/3`). It holds `retrieval_cases`, `qa_cases` and a
 list of `holdouts`. A retrieval case may set `filters`, a mapping
-from facet name to value or alias that layer 1 passes to `rank_channels`;
+from facet name to value or alias that layer 1 passes to `rank_channels` and
+`search`;
 facets are induced per snapshot, so `arkive-rag inspect` lists the names and
 values a pack can use. A Q&A case has a `kind`, one of `lookup`,
 `multi_document`, `aggregation`, `abstention`, `conflict` and `vocabulary`,
@@ -1057,7 +1058,15 @@ list means the exemplars-in-context arm does not run for that holdout. The
 rubric may be empty, because the lexical-overlap measures below need none.
 Expected facts are
 *groups* of alternative substrings, matched NFKC-, case-, dash-, whitespace-
-and thousands-separator-insensitively. A `RubricCheck` passes when the draft
+and thousands-separator-insensitively and with Markdown emphasis ignored, so
+`does **not** hold` matches `does not hold`. Emphasis is backticks, `*` runs
+that touch a non-space character (a spaced `2 * 3` keeps its sign) and `_`
+runs with a letter or digit on one side only: `_italic_` and `__bold__` lose
+their underscores, while `harbour_dry` and `survey__v2.tif` keep every one.
+Table pipes stay, so a group such as `| values` can test a table row. Pack
+validation refuses a phrase in `required_groups`, `require_groups` or
+`forbid_any` that is empty once normalized, such as ```` ``` ```` or `**`,
+because an empty phrase would match every text. A `RubricCheck` passes when the draft
 satisfies every `require_groups` group and contains no `forbid_any` phrase.
 An anti-contamination check requires the held-out project's own values and
 forbids only claims that a faithful draft cannot make, so a draft that
@@ -1069,9 +1078,9 @@ of that collection (see Example corpora). Real packs stay in the private store.
 
 | Layer | Module | Measures |
 | --- | --- | --- |
-| 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of BM25-only, dense-only and hybrid RRF ranking over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks all three arms from one query embedding per case. |
+| 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of four rankings over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks three arms over raw chunk channels: `bm25_only`, `dense_only` and `hybrid_rrf`. The fourth, `served_search`, is `TopicSnapshot.search` with the same top-k, the ranking agents get: it leaves out a superseded document whose replacement passes the case's filters and takes at most `SEARCH_FAMILY_CAP` (3) chunks of one version family before held-back chunks fill the list; it shows whether that collapse and cap keep or improve completion. All four use one query embedding per case, made only after the first ranking has validated the query, filters and top-k, so an invalid case fails with no embedding call. |
 | 2 | `agents.py` | An agent conversation answers each QA case once with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and once with the ten Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score with evidence, below. Raw-file extraction runs once before timing. The report groups results by `kind`. |
-| 3 | `drafting.py` | For each holdout, or the one `--holdout` names, builds a holdout snapshot and runs `--drafts` rounds of three draft arms, and a fourth when the holdout's `exemplar_paths` is not empty, measured against a reference deliverable; the procedure, guards and measures are below. |
+| 3 | `drafting.py` | For each holdout, or the one `--holdout` names, builds a holdout snapshot, records which documents `prepare_draft` selects, and runs `--drafts` rounds of four draft arms, and a fifth when the holdout's `exemplar_paths` is not empty, measured against a reference deliverable; the procedure, guards and measures are below. |
 
 The Q&A judge sees the question, the reference facts, the anchors and their
 evidence: the snapshot's Markdown of every section that overlaps an anchor's
@@ -1102,23 +1111,71 @@ For layer 3:
 1. Select a delivered reference document, not a curator note, with a `held_out_markers` entry in its path. Select files through `included_paths`; pack validation requires plain paths and `discover_corpus` refuses symlinks. Every `exemplar_paths` entry must be one of the selected files and not a curator note.
 2. Before copying files or calling a model, the guards reject a selected file that is held-out material: its path contains a marker, or its bytes match the reference. Markers match case- and dash-insensitively. The guards infer nothing from folders, so a holdout works the same in a folder per project, nested folders or a flat folder: the pack author chooses markers that cover the held-out work's files (a marker may be a folder name) and lists `included_paths` explicitly. The guards do not scan content: the pack author must leave out changed copies, curator notes, summaries and other documents that restate held-out facts.
 3. Compile the selected bytes alone into a holdout snapshot, using the full snapshot's embedding model and dimensions and optionally `--cache`. Check the snapshot again before publishing it as `<out>/holdouts/<holdout_id>/holdout.arkive.db`. Cache reuse follows the request-input rules above.
-4. Run `--drafts` rounds. Three arms always run in every round from `run_notes` and `instructions`: `zero_shot` (no tools), `chunk_search` (a five-chunk search tool) and `arkive_mcp` (the MCP tools and the server instructions). The fourth, `exemplars_in_context`, runs when `exemplar_paths` is not empty; otherwise the report says it was not run. Every completed draft gets the rubric checks and the two lexical-overlap measures below, and the round's completed drafts get one blinded side-by-side judgment against the reference. A document of the holdout snapshot without sections, such as an empty curator note, contributes no sections; a reference or exemplar document without sections stops the holdout.
+4. When `exemplar_paths` is not empty, record the exemplar selection (below): one `prepare_draft` call on the holdout snapshot before the first round.
+5. Run `--drafts` rounds. Four arms always run in every round from `run_notes` and `instructions`: `zero_shot` (no tools), `chunk_search` (a five-chunk search tool), `raw_files` (the four raw-file tools of layer 2 over the included files) and `arkive_mcp` (the MCP tools and the server instructions). The fifth, `exemplars_in_context`, runs when `exemplar_paths` is not empty; otherwise the report says it was not run. Every arm has the same 16-turn limit. Every completed draft gets the rubric checks and the two lexical-overlap measures below, and the round's completed drafts get one blinded side-by-side judgment against the reference. A document of the holdout snapshot without sections, such as an empty curator note, contributes no sections; a reference or exemplar document without sections stops the holdout.
+
+The `raw_files` arm measures what an agent with file tools alone drafts
+from the collection: `list_corpus_files`, `grep_raw_text`, `read_raw_pages`
+and `view_raw_page_image`, as in layer 2. Its instructions are the holdout's
+`instructions` followed by `RAW_FILES_DRAFTING_HINT` in `evals/drafting.py`,
+which tells it to look for prior deliverables and reviewer feedback with the
+tools, take every new-project fact from the instructions and the run notes
+(the authorised inputs the blind judge accepts) and write a standalone
+deliverable without file paths. Its files are exactly the included files the
+holdout snapshot was compiled from, listed and searched in the snapshot's path
+order whatever the order of `included_paths`. Before any round, the guard of
+step 2 runs again over their paths and SHA-256 hashes, and each file must match
+a holdout snapshot document byte for byte. Nothing is rendered again: a
+Markdown file is read as its raw text, and any other file is the native text
+layer and WebP of the pages the holdout build stored, the same pdfium output
+layer 2 renders. Page images are read from the holdout snapshot when the
+agent asks for one, so the arm starts no LibreOffice process.
 
 The `exemplars_in_context` arm has no tools. Its prompt holds the section
 Markdown of each `exemplar_paths` document of the holdout snapshot, labelled
 with its path and without visual transcripts, then the run notes. Its
 instructions are the holdout's `instructions` followed by
-`EXEMPLAR_DRAFTING_RULES` in `evals/drafting.py`: the drafting obligations of
-the MCP server, reworded for documents in the prompt.
-`tests/test_evals.py` pins, word for word, every drafting surface: the
-drafting part of `arkive_rag.server.INSTRUCTIONS` (item 3), the packet's
-`DRAFTING_GUIDANCE`, the `prepare_draft` and `read_section` tool descriptions
-as the server publishes them, and `EXEMPLAR_DRAFTING_RULES`, beside a map from
-each obligation they share to its phrase in the server's text and in
-`EXEMPLAR_DRAFTING_RULES`. An edit to any of them
-fails the test until the pins are updated together. The test does not judge
-whether the texts mean the same thing. The report gives each arm's input tokens, so the cost of
-carrying the exemplars is visible beside the other arms.
+`EXEMPLAR_DRAFTING_RULES` in `evals/drafting.py`. The arm is the control: it
+shows what full context of the documents a person chose achieves, and the
+`arkive_mcp` arm is compared against it across server changes. For that
+reason `EXEMPLAR_DRAFTING_RULES` is frozen on its own. It does not follow
+`arkive_rag.server.INSTRUCTIONS` or the packet's `DRAFTING_GUIDANCE`: a
+control that changed with the server would move with the treatment and
+confound every before/after comparison. `tests/test_evals.py` pins
+`EXEMPLAR_DRAFTING_RULES` word for word in one test, and pins the server's
+drafting surface that the `arkive_mcp` arm measures in another: the whole of
+`INSTRUCTIONS`, `DRAFTING_GUIDANCE`, the names of the server's tools (which
+`ARKIVE_TOOLS` of the OpenCode check must equal) and the `prepare_draft` and
+`read_section` descriptions as the server publishes them. A server change
+fails only the second test. Change `EXEMPLAR_DRAFTING_RULES` only as a
+deliberate change of baseline, and rerun the baseline when you do. The report
+gives each arm's input tokens, so the cost of carrying the exemplars is
+visible beside the other arms.
+
+The exemplar selection measures, with no model call besides one query
+embedding, whether `prepare_draft` surfaces the documents the pack author
+named. It calls `prepare_draft` on the holdout snapshot with the holdout's
+`instructions` and `run_notes` as project inputs and, as `deliverable_type`,
+the reference's type when the holdout snapshot has that type (`requested_type`;
+null for a type whose only document is the reference). An agent drafting that
+deliverable through the MCP tool would request the same type, so an exemplar
+of another type cannot decide which type's lessons the packet carries.
+`results.json` (`selection`) records the named deliverables
+(`oracle_exemplar_paths`), the named feedback documents
+(`oracle_feedback_paths`), the packet's exemplars and other candidates by
+path, and three shares. When the reference is a feedback document, or every
+named document is one, the holdout drafts a review: every named document is
+then a deliverable to surface, and none counts as feedback. Every share counts
+version families once (`oracle_exemplar_families`,
+`oracle_feedback_families`), so naming two versions of one deliverable counts
+as one, and a superseded document counts through the member that replaced it.
+A named deliverable family is surfaced when one of its documents is among the
+packet's exemplars (`exemplar_recall_at_packet`) or among its exemplars and
+other candidates (`exemplar_recall_at_candidates`). `feedback_attached` is the
+share of named feedback families that some packet lesson comes from, so a
+superseded review counts when its replacement supplied the lessons. A share is
+null when the holdout names no document of its kind. `report.md` gives the
+selection in one line per holdout.
 
 The two measures compare wording, not meaning. They reuse the build's text
 functions from `arkive_rag.passages`: `standing_units`, word 4-gram
@@ -1146,11 +1203,15 @@ sections of curator notes in the holdout snapshot are not holdout text.
   union means a sentence present on both sides always matches on this side,
   and a shingle the reference carries anywhere, even in a table, is never
   stray.
-- The *holdout text* is the union of the text shingles of every holdout
-  section: one set, not one per section.
-- A prose unit is *held* when the holdout text contains at least
-  `STANDING_RECURRENCE_CONTAINMENT` of its shingles. A paragraph that joins
-  sentences from two holdout sections can therefore be held.
+- A *holdout document's text* is the union of the text shingles of its
+  sections: one set per delivered document of the holdout snapshot.
+- A prose unit is *held* when at least one holdout document's text contains
+  at least `STANDING_RECURRENCE_CONTAINMENT` of its shingles; its *holders*
+  are the documents that do. A paragraph that joins sentences from two
+  sections of one document can therefore be held. Common 4-grams spread over
+  several unrelated documents cannot add up to a held unit, however many
+  documents the holdout has: with hundreds of documents, an ordinary sentence
+  would otherwise find most of its 4-grams somewhere in the collection.
 - A *house unit* is a prose unit of the reference, in the full snapshot, of at
   least `STANDING_MIN_WORDS` words that is held. The *house shingles* are the
   union of the house units' shingles minus authorised input's text shingles.
@@ -1158,13 +1219,14 @@ sections of curator notes in the holdout snapshot are not holdout text.
   draft's prose shingles. It is null when the holdout has no house shingles;
   the report gives the number of house units and house shingles.
 - A *copied unit* is a prose unit of the draft, of at least
-  `STANDING_MIN_WORDS` words, that is held. The *stray shingles* are the union
-  of the copied units' shingles that are in the holdout text and in neither
-  the reference's nor authorised input's text shingles.
+  `STANDING_MIN_WORDS` words, that is held. The *stray shingles* are the union,
+  over the copied units, of each unit's shingles that its holders' text holds
+  and neither the reference's nor authorised input's text shingles hold.
 - *Copied-text contamination* is the number of stray shingles divided by the
   number of the draft's prose shingles. Words a drafter adds to a copied
-  passage, such as the new project's client name, are not in the holdout text
-  and do not count. It is 0 for a draft without a copied unit and null only
+  passage, such as the new project's client name, are not in the document it
+  was copied from and do not count, even when another holdout document
+  happens to hold them. It is 0 for a draft without a copied unit and null only
   for a draft without prose shingles. Both measures lie between 0 and 1.
 
 `results.json` lists, per draft, each house unit with the share of it the draft
@@ -1180,8 +1242,9 @@ unseen. The shared fold joins a hyphen at a line end with the next word. A
 house paragraph that the reference's authors reworded counts partly as
 contamination. A draft paragraph stitched together from several short copied
 sentences, with words of the drafter's own between them, can hold under
-`STANDING_RECURRENCE_CONTAINMENT` of its shingles in the holdout text and then
-counts as no copied unit. The holdout text includes each section's whole-text
+`STANDING_RECURRENCE_CONTAINMENT` of its shingles in any one document and then
+counts as no copied unit; so does a paragraph that joins sentences copied from
+two different documents. A document's text includes each section's whole-text
 shingles, which join the end of one list item to the start of the next, so a
 draft sentence that happens to span two adjacent holdout list items can count
 as copied. The zero-shot arm never sees the collection, so its contamination
@@ -1195,9 +1258,13 @@ group labelled `none` as "required phrase found in no supplied input". The
 label tells the pack author where a phrase can come from; it is not a verdict
 on whether a draft can derive it.
 
-The blind judge receives the run notes, the reference without its visual
-transcripts and the round's completed drafts under `Candidate_<n>` labels, and
-is told that figures are out of scope. Its output counts only when its
+The blind judge receives the holdout's `instructions` as task instructions,
+the run notes, the reference without its visual transcripts and the round's
+completed drafts under `Candidate_<n>` labels, and is told that figures are out
+of scope. It is told that both the task instructions and the run notes are
+authorised inputs, so a draft that names the author, role or company the
+instructions give is not penalised for inventing them. The judge gets the
+whole reference, however long; it is never cut. Its output counts only when its
 assessments and its ranking each name exactly the labels sent, once each.
 Otherwise, or when the judge call fails with a `ProviderError` other than the
 spend limit (output that fails schema validation, a refusal, output still
@@ -1224,11 +1291,13 @@ The evaluation harness compiles the holdout snapshot through `compile_corpus`
 itself, the one real OpenAI build outside `arkive-rag build`. Each round's
 blinded drafts and `blind_key.json` are written to
 `<out>/holdouts/<holdout_id>/blind-drafts/round-<n>/`. `results.json` keys
-layer 3 results by `holdout_id`; each holdout lists its `rounds`, each with the
-arms' runs, rubric results and measures. `tests/test_evals.py` covers pack
-validation, scoring, the rubric, the lexical-overlap measures, the rubric
-diagnostics, the exemplars-in-context prompt and rules, the holdout guards, the
-run-status contract, per-run embedding records, the judge's evidence and claim
+layer 3 results by `holdout_id`; each holdout gives its `selection` and lists
+its `rounds`, each with the arms' runs, rubric results and measures.
+`tests/test_evals.py` covers pack validation, scoring, the rubric, the
+lexical-overlap measures, the rubric diagnostics, the exemplars-in-context
+prompt and its frozen rules, the server drafting surface pins, the holdout
+guards, the raw-file arm's files, the exemplar selection, the run-status
+contract, per-run embedding records, the judge's evidence and claim
 counts, the layer 3 rounds, the runner's input checks, a run of every layer of
 the example pack and the tool adapters offline, using the example pack and a
 scripted OpenAI HTTP transport; `tests/test_llm.py` covers the tool-call record.

@@ -12,6 +12,7 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import ANY
 
 import anyio
 import httpx2
@@ -26,6 +27,7 @@ from arkive_rag import compiler
 from arkive_rag.llm import BudgetExceededError, Tool, ToolReply, ToolResult, UsageMeter
 from arkive_rag.models import (
     DocumentInfo,
+    InvalidFilterError,
     ProviderError,
     UnsafePathError,
     corpus_fingerprint,
@@ -38,7 +40,7 @@ from arkive_rag.snapshot import DRAFTING_GUIDANCE, TopicSnapshot
 from evals import agents as eval_agents
 from evals import drafting
 from evals import run as eval_run
-from evals.ablation import first_satisfying_rank, run_layer1, summarize_ranks
+from evals.ablation import ARMS, TOP_K, first_satisfying_rank, run_layer1, summarize_ranks
 from evals.agents import (
     QA_INSTRUCTIONS,
     AgentRun,
@@ -54,15 +56,19 @@ from evals.agents import (
 )
 from evals.drafting import (
     EXEMPLAR_DRAFTING_RULES,
+    RAW_FILES_DRAFTING_HINT,
     CandidateAssessment,
     DraftBlindComparison,
+    ExemplarSelection,
     LexicalOverlap,
     OverlapSources,
     assert_holdout_clean,
     blind_assignment,
     check_reference_held_out,
     compile_holdout_snapshot,
+    exemplar_selection,
     exemplars_prompt,
+    holdout_raw_corpus,
     rubric_diagnostics,
     run_layer3_holdout,
     score_rubric,
@@ -83,6 +89,7 @@ from evals.schema import (
 from tests.support import (
     BATHYMETRY_CORPUS,
     HARBOUR_MEMO,
+    MARKETING_CORPUS,
     REEF_NOTE,
     FakeGateway,
     ScriptedOpenAI,
@@ -208,6 +215,11 @@ def pack_with(**overrides: Any) -> dict[str, Any]:
         ({"holdouts__0__included_paths": ["p101//memo.md"]}, "plain corpus-relative"),
         ({"holdouts__0__included_paths": ["."]}, "plain corpus-relative"),
         ({"holdouts__0__rubric__0__require_groups": []}, "no require_groups or forbid_any"),
+        # A phrase that is markup only would match every text.
+        ({"holdouts__0__rubric__0__forbid_any": ["```"]}, r"phrase '```' is empty once markup"),
+        ({"holdouts__0__rubric__0__require_groups": [["**"]]}, r"phrase '\*\*' is empty"),
+        ({"qa_cases__0__required_groups": [["`", "**"]]}, r"qa case .* phrase '`' is empty"),
+        ({"retrieval_cases__0__required_groups": [["`` ``"]]}, "retrieval case .* is empty"),
         ({"holdouts__0__rubric__1__check_id": "scope_and_budget"}, "duplicate rubric check_id"),
         ({"qa_cases__0__kind": "trivia"}, "'lookup', 'multi_document', 'aggregation'"),
         ({"qa_cases__0__source_anchors": []}, "of kind 'lookup' has no source_anchors"),
@@ -259,6 +271,20 @@ def test_group_matching_folds_case_dashes_whitespace_and_thousands_separators() 
     assert satisfies_groups("Area 59494 KM\u00b2  and post-process  =  False", (("59,494 km2",),))
     assert satisfies_groups("Sentinel\u20112 cloud", (("sentinel-2",), ("rain", "cloud")))
     assert not satisfies_groups("Sentinel-2 only", (("sentinel-2",), ("rain", "cloud")))
+
+
+def test_group_matching_ignores_markdown_emphasis_but_keeps_pipes_and_inner_underscores() -> None:
+    assert satisfies_groups("The corpus does **not** contain a rainfall series.", (("does not",),))
+    assert satisfies_groups("It does *not* say, and `harbour` _never_ does.", (("not say",),))
+    assert normalize_for_match("**harbour_dry_2026.tif**") == "harbour_dry_2026.tif"
+    # A run of underscores inside a word is kept whole; emphasis runs at a word edge go.
+    assert normalize_for_match("`survey__v2.tif`") == "survey__v2.tif"
+    assert not satisfies_groups("survey__v2.tif", (("surveyv2.tif",),))
+    assert normalize_for_match("_italic_ and __bold__") == "italic and bold"
+    assert normalize_for_match("2 * 3 = 6") == "2 * 3 = 6"
+    row = "| Metric | **Values** |"
+    assert normalize_for_match(row) == "| metric | values |"
+    assert satisfies_groups(row, (("| values",), ("values |",)))
 
 
 @pytest.mark.parametrize(
@@ -313,12 +339,27 @@ def test_layer1_runs_the_example_pack_with_one_embedding_per_case(
     cases = example_pack.retrieval_cases
     embed = RecordingEmbedder()
     result = run_layer1(snapshot_path, embed, cases)
+    # Four arms, the served search among them, from one query embedding per case.
     assert embed.calls == [case.query for case in cases]
     rows = cast(list[Any], result["cases"])
-    assert all(r.ranks["bm25_only"] is not None for r in rows), [r.ranks for r in rows]
-    assert all(r.ranks["hybrid_rrf"] is not None for r in rows), [r.ranks for r in rows]
+    assert all(list(r.ranks) == list(ARMS) for r in rows)
+    assert ARMS[-1] == "served_search"
+    for arm in ("bm25_only", "hybrid_rrf", "served_search"):
+        assert all(r.ranks[arm] is not None for r in rows), [r.ranks for r in rows]
+    with TopicSnapshot.open(snapshot_path) as snapshot:
+        served = [
+            [h.doc_id for h in snapshot.search(c.query, embed, filters=c.filters, top_k=TOP_K)]
+            for c in cases
+        ]
+    assert [r.top_docs["served_search"] for r in rows] == served
     by_category = cast(dict[str, Any], result["by_category"])
     assert set(by_category) == {c.category for c in cases}
+    # A case the snapshot refuses fails before its query is embedded.
+    unfiltered = embed.calls[:]
+    bad = cases[0].model_copy(update={"filters": {"no-such-facet": "x"}})
+    with pytest.raises(InvalidFilterError):
+        run_layer1(snapshot_path, embed, [bad])
+    assert embed.calls == unfiltered
 
 
 FAITHFUL_DRAFT = """\
@@ -382,9 +423,9 @@ def overlap_sources() -> OverlapSources:
             f"# Estuary proposal\n\n{HOUSE}\n\n{SHORT}\n\n{AUTHORISED}",
             f"## Figures\n\n{CHART}\n\n{visual('Map', MAP)}\n\n{REFERENCE_ONLY}",
         ],
-        holdout_sections=[
-            f"# About us\n\n{HOUSE}\n\n{SHORT}\n\n{AUTHORISED}",
-            f"{visual('Chart', CHART)}\n\n{MAP}\n\n{HOLDOUT_ONLY}\n\n{HOLDOUT_TABLE}",
+        holdout_documents=[
+            [f"# About us\n\n{HOUSE}\n\n{SHORT}\n\n{AUTHORISED}"],
+            [f"{visual('Chart', CHART)}\n\n{MAP}\n\n{HOLDOUT_ONLY}\n\n{HOLDOUT_TABLE}"],
         ],
         run_notes=f"Client: Contoso Ports. Area: 812 km2.\n{AUTHORISED}",
         instructions="Write the estuary proposal in Markdown.",
@@ -427,7 +468,7 @@ def test_house_text_recall_grades_how_much_of_the_house_shingles_a_draft_holds()
     assert in_table.house_text_recall == pytest.approx(7 / 12)
     without_house = OverlapSources.from_texts(
         reference_sections=[REFERENCE_ONLY],
-        holdout_sections=[HOUSE],
+        holdout_documents=[[HOUSE]],
         run_notes="notes",
         instructions="Write it.",
     )
@@ -474,7 +515,7 @@ def test_a_draft_without_holdout_access_that_restates_the_run_notes_is_not_conta
 def test_copied_text_contamination_never_exceeds_one() -> None:
     sources = OverlapSources.from_texts(
         reference_sections=["Rainfall totals were checked against the regional gauge network."],
-        holdout_sections=["1. a1 a1 a1 a1 a1 a1 a1 a-"],
+        holdout_documents=[["1. a1 a1 a1 a1 a1 a1 a1 a-"]],
         run_notes="notes",
         instructions="Write it.",
     )
@@ -493,7 +534,7 @@ def test_identical_notes_reference_and_draft_across_a_dash_before_a_numbered_ite
     )
     sources = OverlapSources.from_texts(
         reference_sections=[notes_and_reference],
-        holdout_sections=[notes_and_reference.replace("\u2014", ":")],
+        holdout_documents=[[notes_and_reference.replace("\u2014", ":")]],
         run_notes=notes_and_reference,
         instructions="Write it.",
     )
@@ -507,7 +548,7 @@ def test_a_numbered_and_a_dashed_list_item_measure_the_same() -> None:
     item = "Northwind Marine reduces every sounding to datum."
     sources = OverlapSources.from_texts(
         reference_sections=[f"{REFERENCE_ONLY}\n\n- {item}"],
-        holdout_sections=[f"- {item}", HOLDOUT_ONLY],
+        holdout_documents=[[f"- {item}"], [HOLDOUT_ONLY]],
         run_notes="notes",
         instructions="Write it.",
     )
@@ -521,32 +562,72 @@ def test_a_marker_alone_on_its_line_is_a_word_of_the_paragraph_it_opens() -> Non
     # and has the eight words of a house unit.
     text = "1.\nEach measurement report records current site baseline"
     sources = OverlapSources.from_texts(
-        reference_sections=[text], holdout_sections=[text], run_notes="notes", instructions="Go."
+        reference_sections=[text], holdout_documents=[[text]], run_notes="notes", instructions="Go."
     )
     assert len(sources.house_units) == 1
     assert measure(sources, text).house_text_recall == 1.0
 
 
-def test_a_paragraph_joining_sentences_of_two_holdout_sections_is_a_copied_unit() -> None:
+def test_a_paragraph_joining_two_sections_of_one_holdout_document_is_a_copied_unit() -> None:
     harbour = "Harbour lidar soundings required coastline land masking before final export."
     reef = "Reef sonar mosaics exhibited acoustic shadowing behind coral pinnacles."
-    sources = OverlapSources.from_texts(
-        reference_sections=[REFERENCE_ONLY],
-        holdout_sections=[harbour, reef],
-        run_notes="notes",
-        instructions="Write it.",
-    )
-    measured = measure(sources, f"{harbour} {reef}")
-    # Neither section holds 80% of the joined paragraph's shingles; the holdout text does.
-    assert [u.stray_shingles for u in measured.copied_units] == [len(grams(harbour) | grams(reef))]
-    assert measured.copied_text_contamination == pytest.approx(13 / 16)
+
+    def joined(holdout_documents: list[list[str]]) -> LexicalOverlap:
+        sources = OverlapSources.from_texts(
+            reference_sections=[REFERENCE_ONLY],
+            holdout_documents=holdout_documents,
+            run_notes="notes",
+            instructions="Write it.",
+        )
+        return measure(sources, f"{harbour} {reef}")
+
+    # Neither section holds 80% of the joined paragraph's shingles; their document does.
+    one_document = joined([[harbour, reef]])
+    assert [u.stray_shingles for u in one_document.copied_units] == [
+        len(grams(harbour) | grams(reef))
+    ]
+    assert one_document.copied_text_contamination == pytest.approx(13 / 16)
+    # The same sentences in two separate documents: neither holds the paragraph.
+    two_documents = joined([[harbour], [reef]])
+    assert two_documents.copied_units == () and two_documents.copied_text_contamination == 0.0
+
+
+def test_common_word_runs_scattered_over_several_holdout_documents_never_make_a_held_unit() -> None:
+    # Eight words, five 4-grams; each document holds one 4-gram of the sentence in its own
+    # context, so the documents together hold four of the five (80%).
+    sentence = "Survey crews calibrate every multibeam transducer before launch."
+    fragments = [
+        "Field survey crews calibrate every instrument on arrival.",
+        "The crews calibrate every multibeam unit twice.",
+        "We calibrate every multibeam transducer annually.",
+        "Check every multibeam transducer before storage.",
+    ]
+    assert len(grams(sentence)) == 5
+    assert len(grams(sentence) & frozenset().union(*map(grams, fragments))) == 4
+
+    def sources(holdout_documents: list[list[str]]) -> OverlapSources:
+        return OverlapSources.from_texts(
+            reference_sections=[f"{sentence}\n\n{REFERENCE_ONLY}"],
+            holdout_documents=holdout_documents,
+            run_notes="notes",
+            instructions="Write it.",
+        )
+
+    scattered = sources([[f] for f in fragments])
+    assert scattered.house_units == ()
+    zero_shot = measure(scattered, sentence)
+    assert zero_shot.copied_units == () and zero_shot.copied_text_contamination == 0.0
+    # The same four fragments as sections of one document do hold the sentence.
+    together = sources([fragments])
+    assert [u.text for u in together.house_units] == [sentence]
+    assert [u.text_head for u in measure(together, sentence).copied_units] == [sentence]
 
 
 def test_a_fenced_block_is_kept_as_written_and_never_starts_a_visual_transcript() -> None:
     fenced = f"```\n{visual('Chart', HOLDOUT_ONLY)}\n```"
     sources = OverlapSources.from_texts(
         reference_sections=[f"# Estuary\n\n{fenced}"],
-        holdout_sections=[HOLDOUT_ONLY],
+        holdout_documents=[[HOLDOUT_ONLY]],
         run_notes="notes",
         instructions="Write it.",
     )
@@ -618,7 +699,7 @@ def test_lexical_overlap_of_drafts_from_the_example_collections_is_pinned() -> N
     for name, documents, reference, sibling, run_notes in overlap_pin_cases():
         sources = OverlapSources.from_texts(
             reference_sections=documents[reference],
-            holdout_sections=[s for f, ss in documents.items() if f != reference for s in ss],
+            holdout_documents=[ss for f, ss in documents.items() if f != reference],
             run_notes=run_notes,
             instructions="Write the deliverable in Markdown.",
         )
@@ -759,39 +840,39 @@ def test_exemplars_prompt_labels_documents_by_path_without_visuals_and_ends_with
     assert prompt.endswith("RUN NOTES:\n- area: 812 km2")
 
 
-# Each drafting obligation the MCP server and the exemplars-in-context rules share: the phrase
-# that carries it in the server's drafting text (its instructions and the drafting packet's
-# guidance) and in the exemplars-in-context rules.
-DRAFTING_OBLIGATIONS = {
-    "follow_shared_structure": (
-        "Match the closest applicable exemplar's structure, heading hierarchy",
-        "Follow the structure and conventions the documents share",
-    ),
-    "apply_reviewer_feedback": (
-        "Apply the lessons",
-        "avoid what any reviewer feedback among them criticises",
-    ),
-    "project_facts_from_inputs_only": (
-        "for the new work only from the user's inputs",
-        "comes only from the run notes",
-    ),
-    "reuse_house_method_text": (
-        "Reuse and adapt the exemplars' domain methodology explanations",
-        "Reproduce it where it applies",
-    ),
-    "enumerations_in_full": ("Enumerate listed items in full", "list every item in full"),
-    "standalone": ("Write a clean standalone deliverable", "Write a standalone deliverable"),
-}
-
-
-# The server's drafting instructions as `EXEMPLAR_DRAFTING_RULES` was last reconciled with them.
-SERVER_DRAFTING_RULES = """\
+# The server's drafting surface, as the arkive_mcp arm last measured it: its initialize
+# instructions, the drafting packet's guidance, its tool names and the drafting tools'
+# descriptions. A change to any of them changes the arm under test, so it fails here and is
+# made, with these pins, as a deliberate before/after change.
+PINNED_SERVER_INSTRUCTIONS = """\
+Arkive serves curated reference collections ("topics").
+1. Call list_topics when the topic slug or its facets are unknown. Facets filter a topic
+   (client, project, author and the like): list_documents, search, grep and prepare_draft
+   accept `filters`, a mapping from facet name to one value or alias; facets combine with AND.
+2. Answering questions: use search for meaning and grep for exact strings, numbers or file
+   names, read_section for context, get_topic_guide for scope and curator notes,
+   lookup_glossary for unclear terms, and view_page when a chart, map or layout matters.
+   Cite doc_id, section_id and pages. When search and grep find no evidence for a requested
+   fact or mechanism, say that the corpus does not establish it and stop searching rather
+   than inferring an answer from adjacent workflows.
 3. Drafting a deliverable: call prepare_draft with the user's full project_inputs, never
    summarised, and follow the drafting_guidance, exemplars, lessons and curator_notes it
    returns. Use read_section for an outline entry it did not include.
 """
 
-# The drafting packet's guidance, as pinned with the rules.
+PINNED_SERVER_TOOLS = (
+    "get_document_outline",
+    "get_topic_guide",
+    "grep",
+    "list_documents",
+    "list_topics",
+    "lookup_glossary",
+    "prepare_draft",
+    "read_section",
+    "search",
+    "view_page",
+)
+
 PINNED_DRAFTING_GUIDANCE = """\
 - Take every fact, measurement, date, quantity, parameter, personnel list and deliverable
   file name for the new work only from the user's inputs. Enumerate listed items in full and
@@ -831,7 +912,28 @@ SERVER_DRAFTING_TOOL_DESCRIPTIONS = {
     ),
 }
 
-# `EXEMPLAR_DRAFTING_RULES` as last reconciled with the server's drafting surfaces above.
+
+def test_the_server_drafting_surface_the_arkive_mcp_arm_measures_is_pinned() -> None:
+    async def published_tools() -> dict[str, str]:
+        with TopicCatalog([]) as catalog:
+            async with Client(create_mcp_server(catalog)) as session:
+                listed = await session.list_tools()
+        return {t.name: t.description or "" for t in listed.tools}
+
+    tools = anyio.run(published_tools)
+    assert INSTRUCTIONS == PINNED_SERVER_INSTRUCTIONS
+    assert DRAFTING_GUIDANCE == PINNED_DRAFTING_GUIDANCE
+    assert tuple(sorted(tools)) == PINNED_SERVER_TOOLS
+    # The OpenCode check keeps its own closed list of Arkive tools; it must name exactly the
+    # tools the server registers, or the check rejects a valid call as a non-Arkive tool.
+    assert frozenset(PINNED_SERVER_TOOLS) == ARKIVE_TOOLS
+    for name, pinned in SERVER_DRAFTING_TOOL_DESCRIPTIONS.items():
+        assert tools[name] == pinned, name
+
+
+# The exemplars-in-context arm's rules: the frozen full-context control. It is pinned apart
+# from the server's drafting surface on purpose and must not follow it, so that a server change
+# moves only the arkive_mcp arm and a before/after comparison keeps the same control.
 PINNED_EXEMPLAR_DRAFTING_RULES = """\
 The prompt holds prior deliverables of the same collection, each labelled with its file path,
 followed by the run notes of the new project.
@@ -855,26 +957,18 @@ followed by the run notes of the new project.
   documents in the prompt."""
 
 
-def test_exemplars_in_context_rules_carry_the_pinned_drafting_rules_of_the_server() -> None:
-    async def published_descriptions() -> dict[str, str]:
-        with TopicCatalog([]) as catalog:
-            async with Client(create_mcp_server(catalog)) as session:
-                listed = await session.list_tools()
-        return {t.name: t.description or "" for t in listed.tools}
-
-    descriptions = anyio.run(published_descriptions)
-    # Every drafting surface is pinned word for word: an edit to any of them fails here until
-    # the pins, the obligation map and, where an obligation changed, the rules move together.
-    assert INSTRUCTIONS[INSTRUCTIONS.index("3. Drafting") :] == SERVER_DRAFTING_RULES
-    assert DRAFTING_GUIDANCE == PINNED_DRAFTING_GUIDANCE
-    for name, pinned in SERVER_DRAFTING_TOOL_DESCRIPTIONS.items():
-        assert descriptions[name] == pinned, name
+def test_the_exemplars_in_context_rules_are_the_frozen_control_baseline() -> None:
     assert EXEMPLAR_DRAFTING_RULES == PINNED_EXEMPLAR_DRAFTING_RULES
-    server_text = " ".join(f"{SERVER_DRAFTING_RULES} {DRAFTING_GUIDANCE}".split())
-    rules_text = " ".join(EXEMPLAR_DRAFTING_RULES.split())
-    for name, (server, rules) in DRAFTING_OBLIGATIONS.items():
-        assert server in server_text, name
-        assert rules in rules_text, name
+
+
+def test_the_raw_files_hint_authorises_the_inputs_the_blind_judge_accepts() -> None:
+    # The judge treats a fact from the task instructions, such as the author's role or
+    # company, as authorised; a hint limited to the run notes would forbid it.
+    hint = " ".join(RAW_FILES_DRAFTING_HINT.split())
+    assert "only from these instructions and the run notes" in hint
+    assert "task instructions and the run notes are the authorised inputs" in " ".join(
+        drafting.DRAFT_JUDGE_INSTRUCTIONS.split()
+    )
 
 
 def write_corpus(root: Path, files: dict[str, str | bytes]) -> Path:
@@ -1000,11 +1094,11 @@ def test_holdout_selection_keeps_included_files_and_refuses_held_out_material(
         select_holdout_sources(missing, task, reference)
 
     with pytest.raises(ValueError, match="held-out marker 'p102'"):
-        assert_holdout_clean(task, reference, [reference_doc(rel_path="moved/P102.md", sha256="0")])
+        assert_holdout_clean(task, reference, [("moved/P102.md", "0")])
     with pytest.raises(ValueError, match="same bytes"):
-        assert_holdout_clean(task, reference, [reference_doc(rel_path="p101/x.md")])
+        assert_holdout_clean(task, reference, [("p101/x.md", reference.sha256)])
     # A file beside the reference without a marker in its own path is not held-out material.
-    assert_holdout_clean(task, reference, [reference_doc(rel_path="final/other.md", sha256="0")])
+    assert_holdout_clean(task, reference, [("final/other.md", "0")])
 
 
 def test_holdout_snapshot_is_published_only_after_its_guard_passes(
@@ -1014,12 +1108,16 @@ def test_holdout_snapshot_is_published_only_after_its_guard_passes(
     corpus = write_corpus(tmp_path / "corpus", HOLDOUT_FILES)
     output = tmp_path / "out" / "holdout.arkive.db"
     output.parent.mkdir()
-    compile_holdout_snapshot(corpus, output, FakeGateway(), task, reference_doc())
+    included = compile_holdout_snapshot(corpus, output, FakeGateway(), task, reference_doc())
     with TopicSnapshot.open(output) as holdout:
-        assert [d.rel_path for d in holdout.list_documents()] == [
-            "p101-harbour-lidar/harbour-memo.md",
-            "p103-reef-sonar/memo.md",
-        ]
+        assert (
+            [d.rel_path for d in holdout.list_documents()]
+            == list(included)
+            == [
+                "p101-harbour-lidar/harbour-memo.md",
+                "p103-reef-sonar/memo.md",
+            ]
+        )
         # Facets are induced from the included files only.
         assert [v.value for v in holdout.facets[0].values] == [
             "p101-harbour-lidar",
@@ -1203,10 +1301,10 @@ def test_eval_outputs_are_private_files(tmp_path: Path) -> None:
 
 
 def test_blind_assignment_is_a_seeded_permutation() -> None:
-    arms = ["zero_shot", "chunk_search", "arkive_mcp", "exemplars_in_context"]
+    arms = ["zero_shot", "chunk_search", "raw_files", "arkive_mcp", "exemplars_in_context"]
     key = blind_assignment(arms)
     assert key == blind_assignment(arms)
-    assert list(key) == ["Candidate_1", "Candidate_2", "Candidate_3", "Candidate_4"]
+    assert list(key) == [f"Candidate_{i}" for i in (1, 2, 3, 4, 5)]
     assert sorted(key.values()) == sorted(arms)
 
 
@@ -1250,7 +1348,7 @@ def test_raw_corpus_tools_read_text_layers_and_page_images(tmp_path: Path) -> No
     (tmp_path / "p1").mkdir()
     (tmp_path / "AGENTS.md").write_text("# Notes\nStill closing out.", encoding="utf-8")
     write_pdf(tmp_path / "p1" / "memo.pdf", [["Rainfall 330.9 mm"], ["Outputs depth_grid.tif"]])
-    tools = RawCorpus(tmp_path).tools
+    tools = RawCorpus.extract(tmp_path).tools
 
     assert json.loads(cast(str, invoke(tools, "list_corpus_files"))) == [
         {"rel_path": "AGENTS.md", "pages": 1},
@@ -1298,10 +1396,7 @@ def test_arkive_mcp_adapter_exposes_every_server_tool_and_forwards_images(tmp_pa
     names, grep, page, missing, server_instructions = anyio.run(run)
     assert server_instructions == INSTRUCTIONS
     assert with_server_instructions("Answer.", "  ") == "Answer."
-    # The OpenCode check keeps its own closed list of Arkive tools; it must name exactly the
-    # tools the server registers, or the check rejects a valid call as a non-Arkive tool.
-    assert names == sorted(ARKIVE_TOOLS)
-    assert len(names) == 10
+    assert names == list(PINNED_SERVER_TOOLS)
     assert isinstance(grep, str) and "330.9" in grep
     assert isinstance(page, ToolReply) and page.images[0].mime_type == "image/webp"
     assert isinstance(missing, str) and missing.startswith("ERROR:")
@@ -1859,18 +1954,20 @@ def test_layer3_runs_every_arm_in_every_round_and_judges_each_round_once(
             "/responses",
             response_body([message(zero_shot)]),
             response_body([message("# Chunk proposal for the estuary survey")]),
+            response_body([function_call("c1", "list_corpus_files", "{}")]),
+            response_body([message("# Raw-file proposal for the estuary survey")]),
             arkive,
             response_body([message("# Exemplar proposal for the estuary survey")]),
-            # Round 1 has three drafts, so this output names an unknown label there and its
+            # Round 1 has four drafts, so this output names an unknown label there and its
             # ranking leaves labels out: that round is not judged.
             structured_body(
                 DraftBlindComparison(
                     candidates=[
-                        candidate_scores(f"Candidate_{i}", 2 * number) for i in (1, 2, 3, 4)
+                        candidate_scores(f"Candidate_{i}", 2 * number) for i in (1, 2, 3, 4, 5)
                     ],
                     ranking=["Candidate_1"]
                     if number == 1
-                    else [f"Candidate_{i}" for i in (4, 3, 2, 1)],
+                    else [f"Candidate_{i}" for i in (5, 4, 3, 2, 1)],
                 )
             ),
         )
@@ -1892,34 +1989,72 @@ def test_layer3_runs_every_arm_in_every_round_and_judges_each_round_once(
     assert holdout_gateway.calls and (out / "holdout.arkive.db").is_file()
     assert not api.scripts["/responses"]
     rounds = cast(list[dict[str, Any]], result["rounds"])
-    arms = ["zero_shot", "chunk_search", "arkive_mcp", "exemplars_in_context"]
+    arms = ["zero_shot", "chunk_search", "raw_files", "arkive_mcp", "exemplars_in_context"]
     assert [list(r["arms"]) for r in rounds] == [arms] * 3
     assert result["skipped_arms"] == {}
     # The curator note's NOTE is not holdout text, so HOUSE is the only house unit.
     assert (result["house_units"], result["house_shingles"]) == (1, 12)
+    # The one prepare_draft call before the rounds surfaces the named exemplar.
+    memo = "p101-harbour-lidar/harbour-memo.md"
+    assert result["selection"] == ExemplarSelection(
+        oracle_exemplar_paths=(memo,),
+        oracle_feedback_paths=(),
+        oracle_exemplar_families=1,
+        oracle_feedback_families=0,
+        # The fake build types the proposal and the memo alike, so the type is requested.
+        requested_type="document",
+        packet_exemplar_paths=(memo,),
+        packet_candidate_paths=(),
+        exemplar_recall_at_packet=1.0,
+        exemplar_recall_at_candidates=1.0,
+        feedback_attached=None,
+        query_embeddings=1,
+    )
     first = rounds[0]["arms"]
     assert first["arkive_mcp"]["run"].status == "incomplete"
     assert first["arkive_mcp"]["rubric"] is None and first["arkive_mcp"]["overlap"] is None
     assert sorted(rounds[0]["blind_key"].values()) == sorted(
-        ["zero_shot", "chunk_search", "exemplars_in_context"]
+        ["zero_shot", "chunk_search", "raw_files", "exemplars_in_context"]
     )
     recall = [r["arms"]["zero_shot"]["overlap"].house_text_recall for r in rounds]
     assert recall == [1.0, pytest.approx(7 / 12), 0.0]
     assert all(r["arms"]["zero_shot"]["rubric"] is not None for r in rounds)
     # The unjudged round keeps its drafts and measures and says why it has no comparison.
-    assert rounds[0]["blind_comparison"] is None and len(rounds[0]["blind_drafts"]) == 3
+    assert rounds[0]["blind_comparison"] is None and len(rounds[0]["blind_drafts"]) == 4
     assert rounds[0]["blind_comparison_missing"] == (
-        "the judge output does not cover the round: candidates unknown ['Candidate_4'];"
-        " ranking missing ['Candidate_2', 'Candidate_3']"
+        "the judge output does not cover the round: candidates unknown ['Candidate_5'];"
+        " ranking missing ['Candidate_2', 'Candidate_3', 'Candidate_4']"
     )
     assert [r["blind_comparison_missing"] for r in rounds[1:]] == [None, None]
 
     requests = api.requests("/responses")
     judged = [r for r in requests if r.get("text", {}).get("format", {}).get("name")]
     assert len(judged) == 3
-    assert "figures, charts and maps are out of scope" in judged[0]["instructions"]
+    judge_instructions = " ".join(judged[0]["instructions"].split())
+    assert "figures, charts and maps are out of scope" in judge_instructions
+    assert "the author's name, role or company, is not invented" in judge_instructions
     reference_text = prompt_text(judged[0])
+    # The judge sees the task instructions every arm drafted under, then the run notes.
+    assert reference_text.startswith(
+        f"TASK INSTRUCTIONS:\n{task.instructions}\n\nRUN NOTES:\n{task.run_notes}\n\n"
+    )
     assert "## Reporting" in reference_text and "Survey boundary" not in reference_text
+    raw_requests = [r for r in requests if RAW_FILES_DRAFTING_HINT in r["instructions"]]
+    # Two turns a round: a tool call, then the draft.
+    assert len(raw_requests) == 6
+    assert raw_requests[0]["instructions"] == f"{task.instructions}\n\n{RAW_FILES_DRAFTING_HINT}"
+    assert sorted(t["name"] for t in raw_requests[0]["tools"]) == [
+        "grep_raw_text",
+        "list_corpus_files",
+        "read_raw_pages",
+        "view_raw_page_image",
+    ]
+    # The raw-file tools expose the included files only, never the held-out reference.
+    (listing,) = first["raw_files"]["run"].tool_calls
+    assert json.loads(listing.result_head) == [
+        {"rel_path": "p101-harbour-lidar/harbour-memo.md", "pages": 1},
+        {"rel_path": "p103-reef-sonar/AGENTS.md", "pages": 1},
+    ]
     exemplar_requests = [r for r in requests if EXEMPLAR_DRAFTING_RULES in r["instructions"]]
     assert len(exemplar_requests) == 3
     exemplar_prompt = prompt_text(exemplar_requests[0])
@@ -1937,7 +2072,13 @@ def test_layer3_runs_every_arm_in_every_round_and_judges_each_round_once(
     assert "| arkive_mcp | 2/3 | 5.0 [4.0, 6.0] (n=2) |" in report
     assert "- round 1: not judged: the judge output does not cover the round" in report
     assert "their tokens and tool calls are counted" in report
-    assert "| scope_and_budget | 0/3 | 0/3 | 0/2 | 0/3 |" in report
+    assert "| scope_and_budget | 0/3 | 0/3 | 0/3 | 0/2 | 0/3 |" in report
+    assert (
+        "Exemplar selection (prepare_draft on the instructions and run notes, deliverable type"
+        " 'document', version families counted once): named exemplars among the packet's"
+        " exemplars 1/1, among its exemplars"
+        " and other candidates 1/1; named feedback documents with a packet lesson n/a." in report
+    )
     assert "- round 1 / arkive_mcp: incomplete" in report
     assert (
         "- `no_borrowed_masking_claim`: required phrase found in no supplied input:"
@@ -1956,7 +2097,7 @@ def test_layer3_skips_the_exemplars_arm_and_says_so_when_the_holdout_lists_no_ex
     api = ScriptedOpenAI()
     api.script(
         "/responses",
-        *[response_body([message(f"# Draft {i} of the estuary proposal")]) for i in range(3)],
+        *[response_body([message(f"# Draft {i} of the estuary proposal")]) for i in range(4)],
         structured_body(DraftBlindComparison(candidates=[], ranking=[])),
     )
 
@@ -1975,11 +2116,166 @@ def test_layer3_skips_the_exemplars_arm_and_says_so_when_the_holdout_lists_no_ex
 
     assert not api.scripts["/responses"]
     (only_round,) = cast(list[dict[str, Any]], result["rounds"])
-    assert list(only_round["arms"]) == ["zero_shot", "chunk_search", "arkive_mcp"]
+    assert list(only_round["arms"]) == ["zero_shot", "chunk_search", "raw_files", "arkive_mcp"]
     assert result["skipped_arms"] == {"exemplars_in_context": "the holdout lists no exemplar_paths"}
+    assert result["selection"] is None
     report = "\n".join(_layer3_report(result))
     assert "exemplars_in_context was not run: the holdout lists no exemplar_paths." in report
+    assert "Exemplar selection" not in report
     assert "The holdout has no rubric checks." in report
+
+
+def test_the_raw_files_arm_reads_included_files_from_stored_pages_and_refuses_held_out_ones(
+    tmp_path: Path, example_pack: EvalPack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rainfall = "p101-harbour-lidar/rainfall.pdf"
+    full = compile_snapshot(
+        tmp_path,
+        DRAFTING_FILES,
+        pdfs={rainfall: [["Rainfall 330.9 mm"], ["Outputs depth_grid.tif"]]},
+    )
+    with TopicSnapshot.open(full) as snapshot:
+        reference = next(d for d in snapshot.list_documents() if d.rel_path.startswith("p102"))
+    task = holdout_task(example_pack).model_copy(update={"reference_doc_id": reference.doc_id})
+    output = tmp_path / "holdout.arkive.db"
+    included = compile_holdout_snapshot(
+        tmp_path / "bathymetry-corpus", output, FakeGateway(), task, reference
+    )
+
+    def never(*args: object) -> None:
+        raise AssertionError("the raw-file arm rendered a file again")
+
+    monkeypatch.setattr(eval_agents, "convert_office_to_pdf", never)
+    monkeypatch.setattr(eval_agents, "render_pdf", never)
+    with TopicSnapshot.open(output) as built:
+        tools = holdout_raw_corpus(task, reference, included, built).tools
+        assert json.loads(cast(str, invoke(tools, "list_corpus_files"))) == [
+            {"rel_path": "p101-harbour-lidar/harbour-memo.md", "pages": 1},
+            {"rel_path": rainfall, "pages": 2},
+            {"rel_path": "p103-reef-sonar/AGENTS.md", "pages": 1},
+        ]
+        assert json.loads(cast(str, invoke(tools, "grep_raw_text", pattern="330.9"))) == [
+            {"rel_path": "p101-harbour-lidar/harbour-memo.md", "page": 1, "line": ANY},
+            {"rel_path": rainfall, "page": 1, "line": "Rainfall 330.9 mm"},
+        ]
+        pages = invoke(tools, "read_raw_pages", rel_path=rainfall, start_page=1, end_page=2)
+        assert "--- page 2 ---\nOutputs depth_grid.tif" in cast(str, pages)
+        image = invoke(tools, "view_raw_page_image", rel_path=rainfall, page_number=2)
+        assert isinstance(image, ToolReply) and image.images[0].data[8:12] == b"WEBP"
+        no_image = invoke(
+            tools, "view_raw_page_image", rel_path="p103-reef-sonar/AGENTS.md", page_number=1
+        )
+        assert cast(str, no_image).startswith("ERROR")
+        # Files are listed and searched in the snapshot's path order, whatever their order.
+        reordered = holdout_raw_corpus(task, reference, dict(reversed(included.items())), built)
+        for name, args in (("list_corpus_files", {}), ("grep_raw_text", {"pattern": "330.9"})):
+            assert invoke(reordered.tools, name, **args) == invoke(tools, name, **args)
+        # Every document of the snapshot needs its file.
+        partial = {rel: data for rel, data in included.items() if rel != rainfall}
+        with pytest.raises(ValueError, match=rf"documents without a file \['{rainfall}'\]"):
+            holdout_raw_corpus(task, reference, partial, built)
+
+        # Held-out material among the files is refused before any page is read.
+        reference_bytes = (tmp_path / "bathymetry-corpus" / reference.rel_path).read_bytes()
+        for leaked, reason in (
+            ({"p101-harbour-lidar/old.md": reference_bytes}, "same bytes"),
+            ({"p102-estuary-multibeam/notes.md": b"x"}, "held-out marker"),
+        ):
+            with pytest.raises(ValueError, match=reason):
+                holdout_raw_corpus(task, reference, included | leaked, built)
+        # A file whose bytes the snapshot's pages do not stand for is refused too.
+        edited = included | {rainfall: b"%PDF-1.4 other bytes"}
+        with pytest.raises(ValueError, match=f"holds no document with the bytes of {rainfall}"):
+            holdout_raw_corpus(task, reference, edited, built)
+
+
+def test_exemplar_selection_counts_version_families_once_and_requests_the_reference_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def versioned(rel_path: str, title: str) -> dict[str, str]:
+        text = MARKETING_CORPUS[rel_path]
+        stem = rel_path.removesuffix(".md")
+        return {
+            rel_path: text.replace(f"# {title}", f"# {title} v1"),
+            f"{stem}-v2.md": text.replace(f"# {title}", f"# {title} v2"),
+        }
+
+    files = (
+        MARKETING_CORPUS
+        | versioned("loyalty-relaunch/brief.md", "Loyalty Relaunch Brief")
+        | versioned("spring-launch/review.md", "Spring Brief Review")
+    )
+    path = compile_snapshot(tmp_path, files, topic="campaigns")
+    task = Holdout.model_validate(
+        {
+            "holdout_id": "summer-brief",
+            "included_paths": ["AGENTS.md", "loyalty-relaunch", "spring-launch"],
+            "held_out_markers": ["summer-launch"],
+            "reference_doc_id": "doc_0000000000",
+            "instructions": "Write the campaign brief.",
+            "run_notes": "Summer loyalty relaunch for lapsed members over email.",
+            # Two versions of one deliverable, another deliverable, and the superseded review.
+            "exemplar_paths": [
+                "loyalty-relaunch/brief.md",
+                "loyalty-relaunch/brief-v2.md",
+                "spring-launch/brief.md",
+                "spring-launch/review.md",
+            ],
+        }
+    )
+    requested: list[str | None] = []
+    prepare_draft = TopicSnapshot.prepare_draft
+
+    def recording(self: TopicSnapshot, *args: Any, **kwargs: Any) -> Any:
+        requested.append(kwargs.get("deliverable_type"))
+        return prepare_draft(self, *args, **kwargs)
+
+    monkeypatch.setattr(TopicSnapshot, "prepare_draft", recording)
+    embedder = CountingEmbedder(FakeGateway().embed_query)
+    with TopicSnapshot.open(path) as built:
+        documents = {d.rel_path: d for d in built.list_documents()}
+        brief = documents["spring-launch/brief.md"]
+        # The reference type matches the snapshot's type ignoring case.
+        reference = brief.model_copy(update={"deliverable_type": "Campaign Brief"})
+        selection = exemplar_selection(built, task, reference, embedder)
+        review = brief.model_copy(update={"deliverable_type": "review notes", "is_feedback": True})
+        review_task = task.model_copy(update={"exemplar_paths": ("spring-launch/review.md",)})
+        review_selection = exemplar_selection(built, review_task, review, embedder)
+        absent = brief.model_copy(update={"deliverable_type": "press release"})
+        absent_selection = exemplar_selection(built, task, absent, embedder)
+    review_v1 = documents["spring-launch/review.md"]
+    review_v2 = documents["spring-launch/review-v2.md"]
+    assert review_v1.version_status == "superseded" and review_v1.family_id == review_v2.family_id
+    assert requested == ["campaign brief", "review notes", None]
+    assert selection.requested_type == "campaign brief"
+    assert selection.oracle_exemplar_paths == (
+        "loyalty-relaunch/brief.md",
+        "loyalty-relaunch/brief-v2.md",
+        "spring-launch/brief.md",
+    )
+    assert selection.oracle_feedback_paths == ("spring-launch/review.md",)
+    # Three named deliverables in two version families.
+    assert (selection.oracle_exemplar_families, selection.oracle_feedback_families) == (2, 1)
+    # The superseded v1 is never an exemplar; its family's v2 stands for it.
+    assert "loyalty-relaunch/brief.md" not in selection.packet_exemplar_paths
+    assert "loyalty-relaunch/brief-v2.md" in selection.packet_exemplar_paths
+    assert selection.exemplar_recall_at_packet == 1.0
+    assert selection.exemplar_recall_at_candidates == 1.0
+    # The superseded review gives no lessons; its v2 does, and stands for it.
+    assert selection.feedback_attached == 1.0
+    assert selection.query_embeddings == 1
+    line = eval_run._selection_line(selection)
+    assert "deliverable type 'campaign brief'" in line
+    assert "packet's exemplars 2/2" in line and "lesson 1/1" in line
+    # A review holdout: the named review is a deliverable to surface, of the review type.
+    assert review_selection.requested_type == "review notes"
+    assert review_selection.oracle_exemplar_paths == ("spring-launch/review.md",)
+    assert review_selection.oracle_feedback_paths == ()
+    assert "spring-launch/review-v2.md" in review_selection.packet_exemplar_paths
+    assert review_selection.exemplar_recall_at_packet == 1.0
+    assert review_selection.feedback_attached is None
+    # A reference type the holdout snapshot lacks requests no type.
+    assert absent_selection.requested_type is None
 
 
 def test_layer3_reads_an_empty_curator_note_among_the_included_files_as_no_sections(
@@ -2009,7 +2305,7 @@ def test_layer3_reads_an_empty_curator_note_among_the_included_files_as_no_secti
     api = ScriptedOpenAI()
     api.script(
         "/responses",
-        *[response_body([message(f"# Draft {i}\n\n{HOUSE}")]) for i in range(4)],
+        *[response_body([message(f"# Draft {i}\n\n{HOUSE}")]) for i in range(5)],
         structured_body(DraftBlindComparison(candidates=[], ranking=[])),
     )
     out = tmp_path / "out"
@@ -2050,11 +2346,11 @@ def test_a_failed_blind_judge_call_is_recorded_on_its_round_and_the_spend_limit_
 ) -> None:
     task = holdout_task(example_pack).model_copy(update={"exemplar_paths": (), "rubric": ()})
     corpus, full, task = drafting_holdout(tmp_path, task)
-    labels = [f"Candidate_{i}" for i in (1, 2, 3)]
+    labels = [f"Candidate_{i}" for i in (1, 2, 3, 4)]
     comparison = DraftBlindComparison(
         candidates=[candidate_scores(label, 5) for label in labels], ranking=labels
     )
-    drafts = [response_body([message(f"# Draft {i}\n\n{HOUSE}")]) for i in range(3)]
+    drafts = [response_body([message(f"# Draft {i}\n\n{HOUSE}")]) for i in range(4)]
     api = ScriptedOpenAI()
     api.script(
         "/responses", *drafts, invalid_judge_body(comparison, candidates__0__editing_effort_saved=0)
@@ -2085,7 +2381,7 @@ def test_a_failed_blind_judge_call_is_recorded_on_its_round_and_the_spend_limit_
     assert missing[0].startswith("the judge call failed: judge_drafts on gpt-6.1-sol returned")
     assert "invalid output" in missing[0] and "no parsed output" in missing[1]
     for draft_round in rounds:
-        assert draft_round["blind_comparison"] is None and len(draft_round["blind_drafts"]) == 3
+        assert draft_round["blind_comparison"] is None and len(draft_round["blind_drafts"]) == 4
         assert draft_round["arms"]["zero_shot"]["overlap"].house_text_recall == 1.0
     report = "\n".join(_layer3_report(result))
     assert "| zero_shot | 0/2 | n/a | n/a | n/a | n/a | n/a |" in report
@@ -2130,13 +2426,14 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
             structured_body(verdict),
         )
     copied = "The chart shows the Nine Year Median = 330.9 mm reference line for 2016"
-    labels = [f"Candidate_{i}" for i in (1, 2, 3, 4)]
+    labels = [f"Candidate_{i}" for i in (1, 2, 3, 4, 5)]
     for _ in range(2):
         api.script(
             "/responses",
             response_body([message("# Zero-shot proposal for the estuary survey")]),
             response_body([function_call("c1", "search_chunks", '{"query": "scope"}')]),
             response_body([message("# Chunk proposal for the estuary survey")]),
+            response_body([message("# Raw-file proposal for the estuary survey")]),
             response_body([message("# Arkive proposal for the estuary survey")]),
             response_body([message(f"# Exemplar proposal\n\n{copied}.")]),
             structured_body(
@@ -2187,8 +2484,9 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
     assert holdout["holdout_snapshot"] == str(holdout_dir / "holdout.arkive.db")
     assert (holdout_dir / "holdout.arkive.db").is_file()
     assert holdout["exemplar_paths"] == ["p101-harbour-lidar/harbour-memo.md"]
+    assert holdout["selection"]["exemplar_recall_at_packet"] == 1.0
     rounds = holdout["rounds"]
-    arms = ["zero_shot", "chunk_search", "arkive_mcp", "exemplars_in_context"]
+    arms = ["zero_shot", "chunk_search", "raw_files", "arkive_mcp", "exemplars_in_context"]
     assert [list(r["arms"]) for r in rounds] == [arms] * 2
     assert [c["name"] for c in rounds[0]["arms"]["chunk_search"]["run"]["tool_calls"]] == [
         "search_chunks"
@@ -2217,6 +2515,7 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
         "Candidate_2.md",
         "Candidate_3.md",
         "Candidate_4.md",
+        "Candidate_5.md",
         "blind_key.json",
     ]
     report = (out / "report.md").read_text()
@@ -2229,11 +2528,11 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
 
 
 def drafting_round_script(api: ScriptedOpenAI) -> None:
-    """One layer 3 round of the example pack: four drafts and a judge output covering them."""
-    labels = [f"Candidate_{i}" for i in (1, 2, 3, 4)]
+    """One layer 3 round of the example pack: five drafts and a judge output covering them."""
+    labels = [f"Candidate_{i}" for i in (1, 2, 3, 4, 5)]
     api.script(
         "/responses",
-        *[response_body([message(f"# Draft {i} of the estuary proposal")]) for i in range(4)],
+        *[response_body([message(f"# Draft {i} of the estuary proposal")]) for i in range(5)],
         structured_body(
             DraftBlindComparison(
                 candidates=[candidate_scores(label, 5) for label in labels], ranking=labels

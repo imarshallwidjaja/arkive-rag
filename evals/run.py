@@ -48,10 +48,12 @@ from arkive_rag.llm import (
     load_dotenv_if_present,
 )
 from arkive_rag.models import ArkiveError, corpus_fingerprint
-from arkive_rag.snapshot import TopicSnapshot
+from arkive_rag.passages import STANDING_RECURRENCE_CONTAINMENT
+from arkive_rag.snapshot import SEARCH_FAMILY_CAP, TopicSnapshot
 from evals.ablation import ARMS, RankSummary, run_layer1
 from evals.agents import AgentRun, CountingEmbedder, qa_evidence, run_layer2_qa
 from evals.drafting import (
+    ExemplarSelection,
     check_reference_held_out,
     run_layer3_holdout,
     select_holdout_sources,
@@ -151,7 +153,12 @@ def _layer1_report(result: dict[str, Any]) -> list[str]:
         "## Layer 1: retrieval ablation",
         "",
         f"Top-k {result['top_k']}. Completion@k: the top-k prefix covers every required fact"
-        " group and expected document of the case.",
+        " group and expected document of the case. bm25_only, dense_only and hybrid_rrf rank"
+        " raw chunk channels; served_search is the search agents get (`snapshot.search` with"
+        f" top_k={result['top_k']}), which leaves out a superseded document whose replacement"
+        f" passes the case's filters and takes at most {SEARCH_FAMILY_CAP} chunks of one version"
+        " family before filling the list with held-back chunks. Every arm uses the case's one"
+        " query embedding.",
         "",
     ]
     header = "| Scope | Arm | Completion@1 | Completion@3 | Completion@5 | CompletionMRR@5 |"
@@ -273,6 +280,26 @@ def _median_range(values: list[float], digits: int) -> str:
     )
 
 
+def _selection_line(selection: ExemplarSelection) -> str:
+    """The exemplar selection of one holdout in one line."""
+
+    def share(value: float | None, total: int) -> str:
+        return "n/a" if value is None else f"{round(value * total)}/{total}"
+
+    exemplars = selection.oracle_exemplar_families
+    feedback = selection.oracle_feedback_families
+    requested = selection.requested_type
+    return (
+        "Exemplar selection (prepare_draft on the instructions and run notes, deliverable type"
+        f" {'none' if requested is None else repr(requested)}, version families counted once):"
+        " named exemplars among the packet's exemplars"
+        f" {share(selection.exemplar_recall_at_packet, exemplars)}, among its exemplars and"
+        f" other candidates {share(selection.exemplar_recall_at_candidates, exemplars)};"
+        f" named feedback documents with a packet lesson"
+        f" {share(selection.feedback_attached, feedback)}."
+    )
+
+
 JUDGE_SCORES = (
     ("Structure", "structure_and_house_style"),
     ("Rigor", "technical_rigor"),
@@ -296,6 +323,9 @@ def _layer3_report(result: dict[str, Any]) -> list[str]:
     )
     for arm, reason in result["skipped_arms"].items():
         lines.append(f"{arm} was not run: {reason}.")
+    selection = result["selection"]
+    if selection is not None:
+        lines += ["", _selection_line(selection)]
     lines += [
         "",
         "Drafts that did not complete are left out of the recall, contamination, rubric and"
@@ -306,8 +336,10 @@ def _layer3_report(result: dict[str, Any]) -> list[str]:
         "Lexical-overlap measures (wording, not meaning), over each draft's prose shingles"
         " (headings, tables and fenced blocks do not count): house-text recall is the share of"
         " the house shingles a draft holds; copied-text contamination is the share of a draft's"
-        " prose shingles that come from its copied units, occur in the holdout text and occur"
-        " neither in the reference nor in the run notes and instructions. The holdout has"
+        " prose shingles that come from its copied units, occur in a holdout document that holds"
+        " the unit and occur neither in the reference nor in the run notes and instructions."
+        " A unit is held when one holdout document holds at least"
+        f" {_pct(STANDING_RECURRENCE_CONTAINMENT)} of its shingles. The holdout has"
         f" {result['house_units']} house units and {result['house_shingles']} house shingles"
         + ("; recall is n/a without house shingles." if not result["house_shingles"] else "."),
         "",
