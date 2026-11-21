@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1280 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="build-pipeline-title build-pipeline-desc" id="build-pipeline-root">
+        <title id="build-pipeline-title">Arkive Build and Parsing Pipeline</title>
+        <desc id="build-pipeline-desc">Three-pass build architecture covering per-document reading and render caching, bounded corpus induction under a 90,000-character prompt ceiling, and breadcrumb embedding into an atomic schema 6.0 SQLite snapshot.</desc>
+        <defs>
+      <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
+      #build-pipeline-root { --color-paper:       #F4F1EA;
+      --color-paper-2:     #E9E4D8;
+      --color-ink:         #1D232A;
+      --color-muted:       #47525E;
+      --color-soft:        #4F5B66;
+      --color-accent:      #B03F1B;
+      --color-accent-tint: rgba(176, 63, 27, 0.08);
+      --color-link:        #1B5E63;
+      --font-sans:         'Geist', system-ui, sans-serif;
+      --font-serif:        'Instrument Serif', Georgia, serif;
+      --font-mono:         'Geist Mono', ui-monospace, monospace; }
+      #build-pipeline-root { font-family: var(--font-sans); color: var(--color-ink); }
+      #build-pipeline-root .diagram-container { width: 100%; overflow-x: auto; }
+      #build-pipeline-root .diagram-container { overflow-x: visible; }</style>
+          <marker id="build-pipeline-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#47525E"/>
+          </marker>
+          <marker id="build-pipeline-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#B03F1B"/>
+          </marker>
+          <marker id="build-pipeline-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#1B5E63"/>
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#F4F1EA"/>
+
+        <!-- THREE PASS ZONES -->
+        <rect x="24" y="24" width="388" height="396" rx="8" fill="#1d232a" fill-opacity="0.025" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <rect x="36" y="28" width="168" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="120" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">PASS 1 · READING (PER FILE)</text>
+
+        <rect x="444" y="24" width="424" height="396" rx="8" fill="#1d232a" fill-opacity="0.025" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <rect x="456" y="28" width="212" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="562" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">PASS 2 · INDUCTION (≤90K CHARS)</text>
+
+        <rect x="900" y="24" width="356" height="396" rx="8" fill="#1d232a" fill-opacity="0.025" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <rect x="912" y="28" width="168" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="996" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">PASS 3 · BIND &amp; STORE</text>
+
+        <!-- CONNECTORS (drawn before nodes) -->
+        <!-- Discover -> Transcribe -->
+        <line x1="208" y1="108" x2="232" y2="108" stroke="#47525E" stroke-width="1.2" marker-end="url(#build-pipeline-arrow)"/>
+
+        <!-- Transcribe -> Observe -->
+        <line x1="312" y1="148" x2="312" y2="200" stroke="#47525E" stroke-width="1.2" marker-end="url(#build-pipeline-arrow)"/>
+        <rect x="322" y="166" width="60" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="352" y="176" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">SECTIONS</text>
+
+        <!-- Discover -> Cache (dashed) -->
+        <line x1="124" y1="148" x2="124" y2="332" stroke="#47525E" stroke-width="1.1" stroke-dasharray="5,4" marker-end="url(#build-pipeline-arrow)"/>
+        <rect x="52" y="232" width="64" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="84" y="242" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">WEBP PAGES</text>
+
+        <!-- Observe -> Cache (dashed) -->
+        <line x1="312" y1="280" x2="312" y2="332" stroke="#47525E" stroke-width="1.1" stroke-dasharray="5,4" marker-end="url(#build-pipeline-arrow)"/>
+        <rect x="322" y="298" width="68" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="356" y="308" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">LLM CACHE</text>
+
+        <!-- Observe -> Organise (elbow via x=428) -->
+        <path d="M 396,240 H 420 Q 428,240 428,232 V 116 Q 428,108 436,108 H 464" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#build-pipeline-arrow)"/>
+
+        <!-- Organise -> Versions -->
+        <line x1="644" y1="108" x2="672" y2="108" stroke="#47525E" stroke-width="1.2" marker-end="url(#build-pipeline-arrow)"/>
+
+        <!-- Versions -> Recurrence -->
+        <line x1="760" y1="148" x2="760" y2="200" stroke="#1B5E63" stroke-width="1.2" marker-end="url(#build-pipeline-arrow-link)"/>
+        <rect x="770" y="166" width="76" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="808" y="176" fill="#1B5E63" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">LUNA VERIFY</text>
+
+        <!-- Recurrence -> Breadcrumbs (elbow via x=884) -->
+        <path d="M 852,240 H 876 Q 884,240 884,232 V 116 Q 884,108 892,108 H 920" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#build-pipeline-arrow)"/>
+
+        <!-- Breadcrumbs -> Snapshot (focal accent vertical) -->
+        <line x1="1076" y1="152" x2="1076" y2="208" stroke="#B03F1B" stroke-width="1.6" marker-end="url(#build-pipeline-arrow-accent)"/>
+        <rect x="1086" y="172" width="96" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="1134" y="182" fill="#B03F1B" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">ATOMIC RENAME</text>
+
+        <!-- NODES -->
+        <!-- 1. Discover & Convert -->
+        <rect x="44" y="68" width="164" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="44" y="68" width="164" height="80" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="52" y="76" width="38" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="71" y="85" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">LOCAL</text>
+        <text x="126" y="108" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Discover &amp; Render</text>
+        <text x="126" y="124" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">soffice · pypdfium2 2x</text>
+        <text x="126" y="138" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">doc_&lt;10hex&gt; · dates</text>
+
+        <!-- 2. Transcribe & Stitch -->
+        <rect x="232" y="68" width="164" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="232" y="68" width="164" height="80" rx="6" fill="#1b5e63" fill-opacity="0.06" stroke="#1B5E63" stroke-width="1"/>
+        <rect x="240" y="76" width="42" height="12" rx="2" fill="none" stroke="#1b5e63" stroke-opacity="0.45" stroke-width="0.8"/>
+        <text x="261" y="85" fill="#1B5E63" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">VISION</text>
+        <text x="314" y="108" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Transcribe &amp; Stitch</text>
+        <text x="314" y="124" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">gpt-6.1-sol · fidelity</text>
+        <text x="314" y="138" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">cross-page tables &amp; charts</text>
+
+        <!-- 3. Observe & Split -->
+        <rect x="232" y="200" width="164" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="232" y="200" width="164" height="80" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="240" y="208" width="34" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="257" y="217" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">CARD</text>
+        <text x="314" y="240" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Observe &amp; Chunk</text>
+        <text x="314" y="256" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">≤32k sections · ≤6k chunks</text>
+        <text x="314" y="270" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">located quotes · attributes</text>
+
+        <!-- 4. Render & LLM Cache -->
+        <rect x="44" y="332" width="352" height="68" rx="6" fill="#F4F1EA"/>
+        <rect x="44" y="332" width="352" height="68" rx="6" fill="#E9E4D8" stroke="#47525E" stroke-width="1" stroke-dasharray="4,3"/>
+        <rect x="52" y="340" width="38" height="12" rx="2" fill="none" stroke="#47525e" stroke-opacity="0.40" stroke-width="0.8"/>
+        <text x="71" y="349" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">CACHE</text>
+        <text x="220" y="368" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">BuildCache (Content-Addressed SQLite)</text>
+        <text x="220" y="384" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">unchanged rebuild = 0 provider calls · 0 page renders</text>
+
+        <!-- 5. Organise & Canonical Types -->
+        <rect x="464" y="68" width="180" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="464" y="68" width="180" height="80" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="472" y="76" width="38" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="491" y="85" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">BATCH</text>
+        <text x="554" y="108" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Facets &amp; Types</text>
+        <text x="554" y="124" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">0–6 facets · uncapped types</text>
+        <text x="554" y="138" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">44k-char digest batches</text>
+
+        <!-- 6. Versions & Lessons -->
+        <rect x="672" y="68" width="180" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="672" y="68" width="180" height="80" rx="6" fill="#1b5e63" fill-opacity="0.06" stroke="#1B5E63" stroke-width="1"/>
+        <rect x="680" y="76" width="42" height="12" rx="2" fill="none" stroke="#1b5e63" stroke-opacity="0.45" stroke-width="0.8"/>
+        <text x="701" y="85" fill="#1B5E63" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">JUDGE</text>
+        <text x="762" y="108" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Versions &amp; Lessons</text>
+        <text x="762" y="124" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">gpt-6-luna Decisions API</text>
+        <text x="762" y="138" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">latest/superseded · quotes</text>
+
+        <!-- 7. Recurrence, Glossary & Guide -->
+        <rect x="464" y="200" width="388" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="464" y="200" width="388" height="80" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="472" y="208" width="42" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="493" y="217" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">INDEX</text>
+        <text x="658" y="240" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Recurring Units, Cited Glossary &amp; Topic Guide</text>
+        <text x="658" y="256" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">4-gram clusters + holder samples · verified citations · ≤16k guide</text>
+        <text x="658" y="270" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">every citation verified against citable doc_id:section_id</text>
+
+        <!-- 8. Breadcrumbs & Embeddings -->
+        <rect x="920" y="68" width="316" height="84" rx="6" fill="#F4F1EA"/>
+        <rect x="920" y="68" width="316" height="84" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="928" y="76" width="44" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="950" y="85" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">VECTOR</text>
+        <text x="1078" y="108" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Bind Breadcrumbs &amp; Embed Chunks</text>
+        <text x="1078" y="126" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">text-embedding-3-large · 1536-d L2 + FTS5</text>
+        <text x="1078" y="140" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">path-ordinal sorting · facets in every breadcrumb</text>
+
+        <!-- 9. Read-Only SQLite Snapshot (FOCAL ACCENT) -->
+        <rect x="920" y="208" width="316" height="104" rx="6" fill="#F4F1EA"/>
+        <rect x="920" y="208" width="316" height="104" rx="6" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.5"/>
+        <rect x="928" y="216" width="60" height="12" rx="2" fill="none" stroke="#b03f1b" stroke-opacity="0.45" stroke-width="0.8"/>
+        <text x="958" y="225" fill="#B03F1B" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">SCHEMA 6.0</text>
+        <text x="1078" y="256" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Portable Read-Only Snapshot</text>
+        <text x="1078" y="274" fill="#B03F1B" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">*.arkive.db (mode 0600 · integrity checked)</text>
+        <text x="1078" y="292" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">documents · sections · pages · chunks · clusters · lessons</text>
+
+        <!-- LEGEND STRIP -->
+        <line x1="24" y1="452" x2="1256" y2="452" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <text x="24" y="472" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">LEGEND</text>
+
+        <rect x="116" y="462" width="14" height="12" rx="3" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.2"/>
+        <text x="138" y="472" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Published snapshot artifact</text>
+
+        <rect x="336" y="462" width="14" height="12" rx="3" fill="#1b5e63" fill-opacity="0.06" stroke="#1B5E63" stroke-width="1"/>
+        <text x="358" y="472" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Model-assisted extraction or judgement</text>
+
+        <line x1="620" y1="468" x2="648" y2="468" stroke="#47525E" stroke-width="1.2" stroke-dasharray="5,4"/>
+        <text x="656" y="472" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Content-addressed cache read/write</text>
+
+        <rect x="900" y="462" width="14" height="12" rx="3" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <text x="922" y="472" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Deterministic local Python/SQLite pass</text>
+      </svg>

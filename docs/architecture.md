@@ -1,5 +1,11 @@
 # Architecture
 
+> Authoritative engineering reference. For guided reads, start at the [Documentation index](README.md), [System walkthrough](walkthrough.md), [Parsing and build](parsing-and-build.md), [MCP serving and `prepare_draft`](mcp-serving.md), or [Evaluation and benchmarks](evaluation-and-benchmarks.md).
+
+![Arkive RAG system overview](assets/system-overview.svg)
+
+[Open interactive HTML diagram](assets/system-overview.html)
+
 Arkive RAG turns a folder of reference documents into one SQLite file, the
 *snapshot*, and serves one or more snapshots to AI agents over MCP. Building a
 snapshot calls OpenAI models. Reading one needs no network, except that the

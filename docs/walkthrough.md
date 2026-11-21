@@ -1,6 +1,12 @@
 # Product goal and system walkthrough
 
-Arkive RAG turns a human-curated folder of reference documents into a single SQLite file (`*.arkive.db`) that an MCP-capable agent can query and read.
+> Part of the [Arkive documentation suite](README.md). For deeper detail, see [Parsing and build](parsing-and-build.md), [MCP serving and `prepare_draft`](mcp-serving.md), [Evaluation and benchmarks](evaluation-and-benchmarks.md), and the [Architecture reference](architecture.md).
+
+Arkive RAG turns a human-curated folder of reference documents into a single SQLite file (`*.arkive.db`, schema `6.0`) that an MCP-capable agent can query and read.
+
+![Arkive RAG system overview](assets/system-overview.svg)
+
+[Open interactive HTML diagram](assets/system-overview.html)
 
 ## Curating a topic without data-preparation overhead
 
@@ -61,7 +67,7 @@ With `--cache`, provider responses are stored under a hash of their inputs. Rebu
 
 ### 2. Snapshot contents and model calls
 
-`write_snapshot` in `src/arkive_rag/snapshot.py` writes a temporary sibling SQLite file (mode `0600`) in a single transaction, checks foreign keys and database integrity, and atomically renames it into place (retaining the existing file mode when replacing a previous snapshot). The schema version is `5.0`; older snapshots are rebuilt from their corpus.
+`write_snapshot` in `src/arkive_rag/snapshot.py` writes a temporary sibling SQLite file (mode `0600`) in a single transaction, checks foreign keys and database integrity, and atomically renames it into place (retaining the existing file mode when replacing a previous snapshot). The schema version is `6.0`; older snapshots are rebuilt from their corpus.
 
 | Table | Contents |
 | --- | --- |

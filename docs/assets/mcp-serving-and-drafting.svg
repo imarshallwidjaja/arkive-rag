@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1280 548" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="mcp-serving-and-drafting-title mcp-serving-and-drafting-desc" id="mcp-serving-and-drafting-root">
+        <title id="mcp-serving-and-drafting-title">Arkive MCP Serving and Drafting Packet</title>
+        <desc id="mcp-serving-and-drafting-desc">Runtime serving diagram showing how an AI agent routes through either the pinpoint Q&amp;A tools or the prepare_draft 45,000-byte drafting packet builder with outline caps, inline prose reserves, and recurrence provenance.</desc>
+        <defs>
+      <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
+      #mcp-serving-and-drafting-root { --color-paper:       #F4F1EA;
+      --color-paper-2:     #E9E4D8;
+      --color-ink:         #1D232A;
+      --color-muted:       #47525E;
+      --color-soft:        #4F5B66;
+      --color-accent:      #B03F1B;
+      --color-accent-tint: rgba(176, 63, 27, 0.08);
+      --color-link:        #1B5E63;
+      --font-sans:         'Geist', system-ui, sans-serif;
+      --font-serif:        'Instrument Serif', Georgia, serif;
+      --font-mono:         'Geist Mono', ui-monospace, monospace; }
+      #mcp-serving-and-drafting-root { font-family: var(--font-sans); color: var(--color-ink); }
+      #mcp-serving-and-drafting-root .diagram-container { width: 100%; overflow-x: auto; }
+      #mcp-serving-and-drafting-root .diagram-container { overflow-x: visible; }</style>
+          <marker id="mcp-serving-and-drafting-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#47525E"/>
+          </marker>
+          <marker id="mcp-serving-and-drafting-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#B03F1B"/>
+          </marker>
+          <marker id="mcp-serving-and-drafting-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#1B5E63"/>
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#F4F1EA"/>
+
+        <!-- ZONES -->
+        <rect x="236" y="24" width="724" height="184" rx="8" fill="#1d232a" fill-opacity="0.025" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <rect x="248" y="28" width="160" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="328" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">PINPOINT Q&amp;A TOOLS</text>
+
+        <rect x="236" y="236" width="724" height="224" rx="8" fill="#1d232a" fill-opacity="0.025" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <rect x="248" y="240" width="224" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="360" y="250" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">GROUNDED DRAFTING · PREPARE_DRAFT</text>
+
+        <!-- CONNECTORS (drawn before nodes) -->
+        <!-- Agent -> Q&A (up elbow via x=212) -->
+        <path d="M 192,224 H 204 Q 212,224 212,216 V 132 Q 212,124 220,124 H 256" fill="none" stroke="#1B5E63" stroke-width="1.3" marker-end="url(#mcp-serving-and-drafting-arrow-link)"/>
+
+        <!-- Agent -> prepare_draft (down elbow via x=212, accent) -->
+        <path d="M 192,260 H 204 Q 212,260 212,268 V 340 Q 212,348 220,348 H 256" fill="none" stroke="#B03F1B" stroke-width="1.5" marker-end="url(#mcp-serving-and-drafting-arrow-accent)"/>
+
+        <!-- Hybrid Search -> Read Section -->
+        <line x1="464" y1="124" x2="504" y2="124" stroke="#47525E" stroke-width="1.2" marker-end="url(#mcp-serving-and-drafting-arrow)"/>
+
+        <!-- Read Section -> View Page (dashed optional) -->
+        <line x1="712" y1="124" x2="752" y2="124" stroke="#47525E" stroke-width="1.1" stroke-dasharray="5,4" marker-end="url(#mcp-serving-and-drafting-arrow)"/>
+        <rect x="716" y="100" width="32" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="732" y="110" fill="#4F5B66" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">IMG</text>
+
+        <!-- View Page -> Compact JSON (down elbow via x=988) -->
+        <path d="M 940,124 H 980 Q 988,124 988,132 V 216 Q 988,224 996,224 H 1020" fill="none" stroke="#1B5E63" stroke-width="1.3" marker-end="url(#mcp-serving-and-drafting-arrow-link)"/>
+
+        <!-- prepare_draft -> Bounded Outlines (straight horizontal at y=316) -->
+        <line x1="464" y1="316" x2="504" y2="316" stroke="#B03F1B" stroke-width="1.4" marker-end="url(#mcp-serving-and-drafting-arrow-accent)"/>
+
+        <!-- prepare_draft -> Provenance & Lessons (down elbow via x=484) -->
+        <path d="M 464,376 H 476 Q 484,376 484,384 V 400 Q 484,408 492,408 H 504" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#mcp-serving-and-drafting-arrow)"/>
+
+        <!-- Bounded Outlines -> Packet Guard (down elbow via x=732) -->
+        <path d="M 712,316 H 724 Q 732,316 732,324 V 332 Q 732,340 740,340 H 752" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#mcp-serving-and-drafting-arrow)"/>
+
+        <!-- Provenance -> Packet Guard (up elbow via x=732) -->
+        <path d="M 712,408 H 724 Q 732,408 732,400 V 376 Q 732,368 740,368 H 752" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#mcp-serving-and-drafting-arrow)"/>
+
+        <!-- Packet Guard -> Compact JSON (up elbow via x=988, accent) -->
+        <path d="M 940,352 H 980 Q 988,352 988,344 V 268 Q 988,260 996,260 H 1020" fill="none" stroke="#B03F1B" stroke-width="1.5" marker-end="url(#mcp-serving-and-drafting-arrow-accent)"/>
+
+        <!-- NODES -->
+        <!-- 1. Agent Request -->
+        <rect x="28" y="200" width="164" height="84" rx="6" fill="#F4F1EA"/>
+        <rect x="28" y="200" width="164" height="84" rx="6" fill="#E9E4D8" stroke="#1D232A" stroke-width="1.2"/>
+        <rect x="36" y="208" width="42" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="57" y="217" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">CLIENT</text>
+        <text x="110" y="244" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Agent Call</text>
+        <text x="110" y="262" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">query or project_inputs</text>
+
+        <!-- 2. Hybrid Search & Grep -->
+        <rect x="256" y="80" width="208" height="88" rx="6" fill="#F4F1EA"/>
+        <rect x="256" y="80" width="208" height="88" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="264" y="88" width="38" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="283" y="97" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">RANK</text>
+        <text x="360" y="120" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">search &amp; grep</text>
+        <text x="360" y="138" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">FTS5 + cosine RRF (top_k=5)</text>
+        <text x="360" y="152" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">hides superseded · cap 3/family</text>
+
+        <!-- 3. Read Section & Glossary -->
+        <rect x="504" y="80" width="208" height="88" rx="6" fill="#F4F1EA"/>
+        <rect x="504" y="80" width="208" height="88" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="512" y="88" width="38" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="531" y="97" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">READ</text>
+        <text x="608" y="120" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">read_section &amp; glossary</text>
+        <text x="608" y="138" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">paginated Markdown · prev/next</text>
+        <text x="608" y="152" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">list_documents · outline · guide</text>
+
+        <!-- 4. View Page Visuals -->
+        <rect x="752" y="80" width="188" height="88" rx="6" fill="#F4F1EA"/>
+        <rect x="752" y="80" width="188" height="88" rx="6" fill="#1b5e63" fill-opacity="0.06" stroke="#1B5E63" stroke-width="1"/>
+        <rect x="760" y="88" width="38" height="12" rx="2" fill="none" stroke="#1b5e63" stroke-opacity="0.45" stroke-width="0.8"/>
+        <text x="779" y="97" fill="#1B5E63" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">WEBP</text>
+        <text x="846" y="120" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">view_page</text>
+        <text x="846" y="138" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">image/webp + visual summary</text>
+        <text x="846" y="152" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">inspect charts &amp; tables directly</text>
+
+        <!-- 5. prepare_draft (FOCAL ACCENT) -->
+        <rect x="256" y="296" width="208" height="104" rx="6" fill="#F4F1EA"/>
+        <rect x="256" y="296" width="208" height="104" rx="6" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.5"/>
+        <rect x="264" y="304" width="48" height="12" rx="2" fill="none" stroke="#b03f1b" stroke-opacity="0.45" stroke-width="0.8"/>
+        <text x="288" y="313" fill="#B03F1B" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">PACKET</text>
+        <text x="360" y="344" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">prepare_draft</text>
+        <text x="360" y="362" fill="#B03F1B" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">ranks by best-3 chunks (≤3 ex.)</text>
+        <text x="360" y="380" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">related-type backfill · 0 gen LLM</text>
+
+        <!-- 6. Bounded Outlines & Prose -->
+        <rect x="504" y="280" width="208" height="72" rx="6" fill="#F4F1EA"/>
+        <rect x="504" y="280" width="208" height="72" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="512" y="288" width="46" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="535" y="297" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">BUDGET</text>
+        <text x="608" y="320" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Outlines &amp; Inline Prose</text>
+        <text x="608" y="336" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">8 KB outline cap · 16 KB reserve</text>
+
+        <!-- 7. Provenance & Lessons -->
+        <rect x="504" y="372" width="208" height="72" rx="6" fill="#F4F1EA"/>
+        <rect x="504" y="372" width="208" height="72" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="512" y="380" width="56" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="540" y="389" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">EVIDENCE</text>
+        <text x="608" y="412" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Provenance &amp; Lessons</text>
+        <text x="608" y="428" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">family counts · dates · AGENTS.md</text>
+
+        <!-- 8. Packet Assembly -->
+        <rect x="752" y="312" width="188" height="84" rx="6" fill="#F4F1EA"/>
+        <rect x="752" y="312" width="188" height="84" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="760" y="320" width="44" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="782" y="329" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">PACKER</text>
+        <text x="846" y="352" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Priority Packing</text>
+        <text x="846" y="370" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">matched · recurring · rare terms</text>
+        <text x="846" y="384" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">omitted counts always explicit</text>
+
+        <!-- 9. Compact JSON Output -->
+        <rect x="1020" y="200" width="232" height="84" rx="6" fill="#F4F1EA"/>
+        <rect x="1020" y="200" width="232" height="84" rx="6" fill="#E9E4D8" stroke="#1D232A" stroke-width="1.2"/>
+        <rect x="1028" y="208" width="46" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="1051" y="217" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">RESULT</text>
+        <text x="1136" y="242" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Bounded Compact JSON</text>
+        <text x="1136" y="260" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">≤45,000 bytes · ≤1,600 lines</text>
+        <text x="1136" y="274" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">zero client truncation</text>
+
+        <!-- LEGEND STRIP -->
+        <line x1="24" y1="488" x2="1256" y2="488" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <text x="24" y="508" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">LEGEND</text>
+
+        <rect x="116" y="498" width="14" height="12" rx="3" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.2"/>
+        <text x="138" y="508" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Drafting packet focal entrypoint</text>
+
+        <line x1="364" y1="504" x2="392" y2="504" stroke="#1B5E63" stroke-width="1.3"/>
+        <text x="400" y="508" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Pinpoint Q&amp;A / multimodal inspection</text>
+
+        <line x1="652" y1="504" x2="680" y2="504" stroke="#47525E" stroke-width="1.2" stroke-dasharray="5,4"/>
+        <text x="688" y="508" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Optional visual page fetch</text>
+
+        <rect x="884" y="498" width="14" height="12" rx="3" fill="#E9E4D8" stroke="#1D232A" stroke-width="1"/>
+        <text x="906" y="508" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">MCP client boundary</text>
+      </svg>

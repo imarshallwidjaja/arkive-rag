@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 536" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="evaluation-harness-title evaluation-harness-desc" id="evaluation-harness-root">
+        <title id="evaluation-harness-title">Arkive Evaluation Harness</title>
+        <desc id="evaluation-harness-desc">Evaluation architecture showing how an eval pack, snapshot, and raw corpus pass through preflight validation into retrieval ablation, grounded Q&amp;A, five-arm holdout drafting, and containerized OpenCode acceptance checks before writing atomic private reports.</desc>
+        <defs>
+      <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
+      #evaluation-harness-root { --color-paper:       #F4F1EA;
+      --color-paper-2:     #E9E4D8;
+      --color-ink:         #1D232A;
+      --color-muted:       #47525E;
+      --color-soft:        #4F5B66;
+      --color-accent:      #B03F1B;
+      --color-accent-tint: rgba(176, 63, 27, 0.08);
+      --color-link:        #1B5E63;
+      --font-sans:         'Geist', system-ui, sans-serif;
+      --font-serif:        'Instrument Serif', Georgia, serif;
+      --font-mono:         'Geist Mono', ui-monospace, monospace; }
+      #evaluation-harness-root { font-family: var(--font-sans); color: var(--color-ink); }
+      #evaluation-harness-root .diagram-container { width: 100%; overflow-x: auto; }
+      #evaluation-harness-root .diagram-container { overflow-x: visible; }</style>
+          <marker id="evaluation-harness-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#47525E"/>
+          </marker>
+          <marker id="evaluation-harness-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#B03F1B"/>
+          </marker>
+          <marker id="evaluation-harness-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#1B5E63"/>
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#F4F1EA"/>
+
+        <!-- ZONES -->
+        <rect x="24" y="24" width="208" height="412" rx="8" fill="#1d232a" fill-opacity="0.025" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <rect x="36" y="28" width="144" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="108" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">INPUTS &amp; PREFLIGHT</text>
+
+        <rect x="276" y="24" width="408" height="412" rx="8" fill="#1d232a" fill-opacity="0.025" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <rect x="288" y="28" width="164" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="370" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">EVALUATION LAYERS</text>
+
+        <!-- CONNECTORS (drawn before nodes) -->
+        <!-- Eval Pack -> Preflight -->
+        <line x1="128" y1="148" x2="128" y2="196" stroke="#47525E" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow)"/>
+        <!-- Raw Corpus -> Preflight -->
+        <line x1="128" y1="328" x2="128" y2="280" stroke="#47525E" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow)"/>
+
+        <!-- Preflight right edge (x=212, y=196..280) fanned at y=208, 224, 248, 268 -->
+        <!-- -> Layer 1 (y=96 via x=240) -->
+        <path d="M 212,208 H 232 Q 240,208 240,200 V 104 Q 240,96 248,96 H 296" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow)"/>
+        <!-- -> Layer 2 (y=184 via x=256) -->
+        <path d="M 212,224 H 248 Q 256,224 256,216 V 192 Q 256,184 264,184 H 296" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow)"/>
+        <!-- -> Layer 3 (y=280 via x=256, accent) -->
+        <path d="M 212,248 H 248 Q 256,248 256,256 V 272 Q 256,280 264,280 H 296" fill="none" stroke="#B03F1B" stroke-width="1.5" marker-end="url(#evaluation-harness-arrow-accent)"/>
+        <!-- -> OpenCode Check (y=380 via x=240) -->
+        <path d="M 212,268 H 232 Q 240,268 240,276 V 372 Q 240,380 248,380 H 296" fill="none" stroke="#1B5E63" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow-link)"/>
+
+        <!-- Layers right edge (x=664) -> Reports left edge (x=736, y=188..284) fanned at y=204, 224, 248, 268 -->
+        <!-- Layer 1 -> Reports (via x=712) -->
+        <path d="M 664,96 H 704 Q 712,96 712,104 V 196 Q 712,204 720,204 H 736" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow)"/>
+        <!-- Layer 2 -> Reports (via x=696) -->
+        <path d="M 664,184 H 688 Q 696,184 696,192 V 216 Q 696,224 704,224 H 736" fill="none" stroke="#47525E" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow)"/>
+        <!-- Layer 3 -> Reports (via x=696, accent) -->
+        <path d="M 664,280 H 688 Q 696,280 696,272 V 256 Q 696,248 704,248 H 736" fill="none" stroke="#B03F1B" stroke-width="1.5" marker-end="url(#evaluation-harness-arrow-accent)"/>
+        <!-- OpenCode -> Reports (via x=712) -->
+        <path d="M 664,380 H 704 Q 712,380 712,372 V 276 Q 712,268 720,268 H 736" fill="none" stroke="#1B5E63" stroke-width="1.2" marker-end="url(#evaluation-harness-arrow-link)"/>
+
+        <!-- NODES -->
+        <!-- 1. Eval Pack + Snapshot -->
+        <rect x="44" y="68" width="168" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="44" y="68" width="168" height="80" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="52" y="76" width="48" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="76" y="85" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">PACK V3</text>
+        <text x="128" y="108" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Eval Pack &amp; DB</text>
+        <text x="128" y="124" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">arkive-eval-pack/3</text>
+        <text x="128" y="138" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">fingerprint · rubrics</text>
+
+        <!-- 2. Preflight Gate -->
+        <rect x="44" y="196" width="168" height="84" rx="6" fill="#F4F1EA"/>
+        <rect x="44" y="196" width="168" height="84" rx="6" fill="#E9E4D8" stroke="#1D232A" stroke-width="1.2"/>
+        <rect x="52" y="204" width="38" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="71" y="213" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">GATE</text>
+        <text x="128" y="236" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Preflight Checks</text>
+        <text x="128" y="252" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">before any spend</text>
+        <text x="128" y="266" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">anchors · leaks · paths</text>
+
+        <!-- 3. Raw Corpus -->
+        <rect x="44" y="328" width="168" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="44" y="328" width="168" height="80" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="52" y="336" width="44" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="74" y="345" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">SOURCE</text>
+        <text x="128" y="368" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Corpus Folder</text>
+        <text x="128" y="384" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">raw files baseline</text>
+        <text x="128" y="398" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">4 public collections</text>
+
+        <!-- 4. Layer 1 -->
+        <rect x="296" y="64" width="368" height="64" rx="6" fill="#F4F1EA"/>
+        <rect x="296" y="64" width="368" height="64" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="304" y="72" width="24" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="316" y="81" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">L1</text>
+        <text x="480" y="96" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 1 · Retrieval Ablation</text>
+        <text x="480" y="114" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">bm25 · dense · hybrid_rrf · served_search · Completion@k</text>
+
+        <!-- 5. Layer 2 -->
+        <rect x="296" y="152" width="368" height="64" rx="6" fill="#F4F1EA"/>
+        <rect x="296" y="152" width="368" height="64" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="304" y="160" width="24" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="316" y="169" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">L2</text>
+        <text x="480" y="184" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 2 · Grounded Q&amp;A</text>
+        <text x="480" y="202" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">raw_files vs arkive_mcp · anchored claim-level judge</text>
+
+        <!-- 6. Layer 3 (FOCAL ACCENT) -->
+        <rect x="296" y="240" width="368" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="296" y="240" width="368" height="80" rx="6" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.5"/>
+        <rect x="304" y="248" width="24" height="12" rx="2" fill="none" stroke="#b03f1b" stroke-opacity="0.45" stroke-width="0.8"/>
+        <text x="316" y="257" fill="#B03F1B" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">L3</text>
+        <text x="480" y="276" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 3 · 5-Arm Holdout Drafting</text>
+        <text x="480" y="294" fill="#B03F1B" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">zero · chunk · raw · mcp · oracle (5 rounds each)</text>
+        <text x="480" y="308" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">house recall · contamination · rubric · blind judge</text>
+
+        <!-- 7. OpenCode Container Check -->
+        <rect x="296" y="344" width="368" height="68" rx="6" fill="#F4F1EA"/>
+        <rect x="296" y="344" width="368" height="68" rx="6" fill="#1b5e63" fill-opacity="0.06" stroke="#1B5E63" stroke-width="1"/>
+        <rect x="304" y="352" width="46" height="12" rx="2" fill="none" stroke="#1b5e63" stroke-opacity="0.45" stroke-width="0.8"/>
+        <text x="327" y="361" fill="#1B5E63" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">DOCKER</text>
+        <text x="480" y="378" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">OpenCode Live Acceptance Check</text>
+        <text x="480" y="396" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">OpenCode 2.3.0 · 10 scenarios · zero truncation gate</text>
+
+        <!-- 8. Atomic Reports -->
+        <rect x="736" y="188" width="200" height="96" rx="6" fill="#F4F1EA"/>
+        <rect x="736" y="188" width="200" height="96" rx="6" fill="#E9E4D8" stroke="#1D232A" stroke-width="1.2"/>
+        <rect x="744" y="196" width="46" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="767" y="205" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">REPORT</text>
+        <text x="836" y="232" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Atomic Private Output</text>
+        <text x="836" y="250" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">results.json · report.md</text>
+        <text x="836" y="266" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">mode 0600 · blind drafts</text>
+
+        <!-- LEGEND STRIP -->
+        <line x1="24" y1="472" x2="936" y2="472" stroke="#1d232a" stroke-opacity="0.14" stroke-width="0.8"/>
+        <text x="24" y="492" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">LEGEND</text>
+
+        <rect x="108" y="482" width="14" height="12" rx="3" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.2"/>
+        <text x="130" y="492" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Focal drafting benchmark</text>
+
+        <rect x="316" y="482" width="14" height="12" rx="3" fill="#1b5e63" fill-opacity="0.06" stroke="#1B5E63" stroke-width="1"/>
+        <text x="338" y="492" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Containerised client check</text>
+
+        <rect x="540" y="482" width="14" height="12" rx="3" fill="#E9E4D8" stroke="#1D232A" stroke-width="1"/>
+        <text x="562" y="492" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Preflight gate &amp; atomic output</text>
+      </svg>
