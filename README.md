@@ -1,51 +1,67 @@
 # Arkive RAG
 
-![Raw documents compiled into a portable SQLite snapshot serving AI agents](docs/assets/arkive-concept-hero.png)
+![A folder of team documents compiled into one portable knowledge file that AI assistants query](docs/assets/arkive-concept-hero.png)
 
-Arkive RAG compiles a curated folder of `.pdf`, `.docx`, `.pptx`, and `.md` reference documents into a single read-only SQLite snapshot (`*.arkive.db`, schema `6.0`), and serves one or more snapshots to AI agents over MCP.
+Arkive RAG turns a curated folder of team reference documents (`.pdf`, `.docx`, `.pptx`, `.md`) into one portable, read-only knowledge file (`*.arkive.db`). AI assistants query that file to answer questions with citations and to draft new deliverables that follow the team's past work.
 
-Domain leads, engineers, and project teams place strong reference reports, proposals, slide decks, reviewer feedback, and optional `AGENTS.md` curator notes into any folder layout. `arkive-rag build` parses text, tables, and visual charts, induces corpus-specific facets, deliverable types, version families, verified reviewer lessons, recurring passages, and a cited glossary, and writes one portable database file. `arkive-rag serve` then gives any MCP-capable agent ten bounded tools for pinpoint Q&A and grounded deliverable drafting.
+A team uses one snapshot for two jobs:
+
+- **Grounded Q&A with citations.** The assistant finds exact numbers, filenames, table rows, and chart values, and cites the document, section, and page they came from.
+- **Grounded drafting from past work.** The assistant receives the closest past examples of the same kind of deliverable, the reviewer lessons that apply to it, and a marker on each passage showing whether it is standard company wording or a clause from one project.
+
+## At a glance
+
+- **No data preparation.** Put the documents in any folder layout. Tagging, renaming, and reformatting are not needed. Optional plain-English `AGENTS.md` notes tell Arkive how the collection fits together.
+- **Local, read-only serving.** The server reads the knowledge file on your machine and makes no generative AI calls. Nine of its ten tools work fully offline, and only `search` needs an OpenAI key, to embed the query. `prepare_draft` ranks past work by keywords when no key is set. When a key is set, it also sends the project inputs to OpenAI for embedding.
+- **Capped build spend.** `--max-cost` stops new paid model calls once the estimated spend reaches your limit.
+- **Private data stays out of Git.** Keep client documents and `*.arkive.db` files in a private store. The repository's `.gitignore` excludes snapshots and private evaluation packs.
 
 ## Quickstart
 
-Building a snapshot requires Python `3.14`, [uv](https://docs.astral.sh/uv/), LibreOffice (`soffice`, for `.docx` and `.pptx`), and an `OPENAI_API_KEY` (loaded automatically from `.env` in the working directory when unset).
+You need Python `3.14`, [uv](https://docs.astral.sh/uv/), LibreOffice (`soffice`, to read `.docx` and `.pptx` files), and an `OPENAI_API_KEY`. Arkive loads the key from `.env` in the working directory when it is not set.
+
+The commands below build the tracked fictional collection `evals/example_corpora/coastal-survey-projects` (nine files from three survey projects). Keep build outputs outside the corpus folder.
 
 ```sh
 uv sync --locked
 
-# Compile a folder into a portable snapshot (keep outputs outside the corpus)
-uv run --locked arkive-rag build path/to/corpus \
-  -o /tmp/bathymetry.arkive.db \
-  --cache /tmp/bathymetry-cache.sqlite \
-  --max-cost 5
+# Compile the folder into one snapshot file (stops new paid calls at about USD 2)
+uv run --locked arkive-rag build evals/example_corpora/coastal-survey-projects \
+  -o /tmp/arkive-examples/coastal-survey-projects.arkive.db \
+  --cache /tmp/arkive-examples/coastal-survey-projects.cache.db \
+  --max-cost 2
 
-# Inspect facets, deliverable types, version families, lessons, and build report
-uv run --locked arkive-rag inspect /tmp/bathymetry.arkive.db
+# Show the filters, document types, version families, and reviewer lessons Arkive found
+uv run --locked arkive-rag inspect /tmp/arkive-examples/coastal-survey-projects.arkive.db
 
-# Run exact lookup or hybrid filtered search from the CLI
-uv run --locked arkive-rag grep /tmp/bathymetry.arkive.db "harbour_dry_depth_thresh.tif"
-uv run --locked arkive-rag search /tmp/bathymetry.arkive.db "median rainfall" \
-  --filter project=p101-harbour-lidar
+# Exact text lookup (offline)
+uv run --locked arkive-rag grep /tmp/arkive-examples/coastal-survey-projects.arkive.db \
+  "oskary_pit_volume_2026.csv"
 
-# Serve one or more snapshots to an MCP client (stdio default, or --transport streamable-http)
-uv run --locked arkive-rag serve /tmp/bathymetry.arkive.db
+# Meaning-based search (needs OPENAI_API_KEY)
+uv run --locked arkive-rag search /tmp/arkive-examples/coastal-survey-projects.arkive.db \
+  "minimum depth in the dredged channel"
+
+# Serve the snapshot to an MCP-capable AI assistant (stdio by default)
+uv run --locked arkive-rag serve /tmp/arkive-examples/coastal-survey-projects.arkive.db
 ```
 
-Key operational facts:
-
-- **Offline serving:** Without `OPENAI_API_KEY`, `serve` still starts and nine of the ten tools work (`prepare_draft` ranks with BM25 alone; only `search` needs query embeddings).
-- **Local-only HTTP by default:** `--transport streamable-http` binds to `127.0.0.1:8000` with no authentication; non-loopback hosts require `--allow-nonlocal`.
-- **Private corpora stay out of Git:** Store client documents, snapshots (`*.arkive.db`), and private eval packs (`*.eval.local.json`) in a private store outside this repository.
+`search` and `grep` also take `--filter FACET=VALUE`. Arkive infers the facet names from each collection, so read them from the `inspect` output first.
 
 ## Documentation
 
-Full guides, diagrams, worked examples from public fictional collections, and verified benchmark results live in [`docs/`](docs/README.md):
+**Guides** explain the product in plain language:
 
-- [Documentation index](docs/README.md) — Reading guide and visual diagram index.
-- [System walkthrough](docs/walkthrough.md) — Product goal and end-to-end trace from folder to MCP response.
-- [Parsing, induction, and build pipeline](docs/parsing-and-build.md) — Document conversion, visual transcription, caching, bounded induction, and worked public-corpus examples.
-- [MCP serving, `prepare_draft`, and cost scaling](docs/mcp-serving.md) — The ten MCP tools, 45 KB drafting packet anatomy, provenance rules, hosted models, and scaling costs.
-- [Evaluation harness and benchmark results](docs/evaluation-and-benchmarks.md) — Layer 1-3 harness, live OpenCode 2.3.0 container check, and verified results across four fictional corpora (up to 126 files).
-- [Architecture and verification reference](docs/architecture.md) — Full module, schema, and offline verification specification.
+- [What Arkive does and how a team uses it](docs/overview.md)
+- [How folders become searchable knowledge](docs/how-it-works.md)
+- [Data boundaries, security, and cost](docs/security-privacy-and-cost.md)
+- [Evidence, benchmarks, and known limits](docs/results-and-limits.md)
 
-Agent contributor instructions use progressive discovery starting at [`AGENTS.md`](AGENTS.md), refined by directory-level `AGENTS.md` files in `src/arkive_rag/`, `evals/`, `tests/`, and `docs/`.
+**Technical appendices and reference** hold the engineering detail:
+
+- [Appendix A: Parsing, induction, and build pipeline](docs/appendices/build-and-parsing.md)
+- [Appendix B: MCP tools, drafting packet, and cost scaling](docs/appendices/mcp-tools-and-drafting.md)
+- [Appendix C: Evaluation harness and full benchmark tables](docs/appendices/evaluation-benchmarks.md)
+- [Architecture and verification reference](docs/architecture.md)
+
+The [documentation hub](docs/README.md) lists every diagram. Contributor instructions for agents start at [`AGENTS.md`](AGENTS.md).

@@ -1,6 +1,6 @@
 # Architecture
 
-> Authoritative engineering reference. For guided reads, start at the [Documentation index](README.md), [System walkthrough](walkthrough.md), [Parsing and build](parsing-and-build.md), [MCP serving and `prepare_draft`](mcp-serving.md), or [Evaluation and benchmarks](evaluation-and-benchmarks.md).
+> Authoritative engineering reference. For plain-language guides, technical appendices, and diagrams, start at the [Documentation hub](README.md).
 
 ![Arkive RAG system overview](assets/system-overview.svg)
 
@@ -1317,9 +1317,9 @@ scripted OpenAI HTTP transport; `tests/test_llm.py` covers the tool-call record.
 
 ### Example corpora
 
-`evals/example_corpora/` holds three small fictional corpora, so anyone can
-build real snapshots without private documents. They are organised in
-different ways, and induction gives them different facet schemas:
+`evals/example_corpora/` holds four fictional corpora, three small and one
+large, so anyone can build real snapshots without private documents. They are
+organised in different ways, and induction gives them different facet schemas:
 
 - `coastal-survey-projects`: one folder per survey project, each holding a
   proposal, a technical memorandum and reviewer feedback, with a curator note
@@ -1337,6 +1337,13 @@ different ways, and induction gives them different facet schemas:
   a caveat that varies by one instrument name, and a section only the newest
   report holds. `corvane-depot-night-noise-report.pdf` has a chart whose
   values appear only in the image.
+- `structural-monitoring-consultancy`: 126 files of a strain-monitoring
+  consultancy's job archive (Markdown, Word and PDF), with `archive/`,
+  `active/` and `reference/` folders and two curator notes. It is the scale
+  test: a 52-page Word installation report, versioned drafts of one report, a
+  calibration sheet copied byte for byte into two job folders, unlabelled QA
+  disposition registers, and a PDF chart value that exists only as vector
+  graphics.
 
 The first two repeat deliverable types, reviewer feedback, defined and undefined
 acronyms, one acronym with two meanings, tool names, stated attributes,
@@ -1349,9 +1356,12 @@ packets report recurring units. They are built with the ordinary
 `evals/example_packs/<collection>.eval.json` is the eval pack of each
 collection, built for real paid evaluation runs against a snapshot of that
 collection; `evals/example_pack.eval.json` stays the offline test fixture.
-Each pack sets the collection's `corpus_fingerprint`, has no retrieval cases,
-and has four Q&A cases, one each of `lookup`, `multi_document`, `abstention`
-and `vocabulary`, whose anchors cover whole documents. The holdouts are:
+Each pack sets the collection's `corpus_fingerprint`. The packs of the three
+small collections have no retrieval cases and four Q&A cases, one each of
+`lookup`, `multi_document`, `abstention` and `vocabulary`, whose anchors cover
+whole documents. The `structural-monitoring-consultancy` pack has 10 retrieval
+cases and 8 Q&A cases: two `lookup`, one `multi_document`, one `aggregation`,
+two `conflict`, one `abstention` and one `vocabulary`. The holdouts are:
 
 - `coastal-survey-projects`: the proposal and the technical memorandum of the
   Fennick Canal project (`q103`), each built from the `q101` and `q102`
@@ -1362,6 +1372,12 @@ and `vocabulary`, whose anchors cover whole documents. The holdouts are:
 - `acoustic-consultancy-files`: two noise reports, the Pellow Mill facade
   report and the Corvane depot night noise report, each built from the files
   of the other three projects.
+- `structural-monitoring-consultancy`: two deliverables of the 126-file
+  archive, `tallow-cross-fbg-installation-report` (the fibre Bragg grating
+  installation and baseline report for the Tallow Cross substation, built from
+  123 of the files) and `brackenford-footbridge-proposal` (the monitoring
+  proposal for the Brackenford footbridge stay anchorages, built from 124 of
+  the files).
 
 `test_example_collection_packs_match_their_collections_and_hold_out_their_references`
 in `tests/test_evals.py` checks, without a snapshot or a model call, that every
