@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How a Team Works with Arkive RAG</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:       #F4F1EA;
+      --color-paper-2:     #E9E4D8;
+      --color-ink:         #1D232A;
+      --color-muted:       #47525E;
+      --color-soft:        #4F5B66;
+      --color-accent:      #B03F1B;
+      --color-accent-tint: rgba(176, 63, 27, 0.08);
+      --color-link:        #1B5E63;
+      --font-sans:         'Geist', system-ui, sans-serif;
+      --font-serif:        'Instrument Serif', Georgia, serif;
+      --font-mono:         'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1040px; width: 100%; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.6rem, 2.4vw + 0.75rem, 2.1rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 960px; display: block; }
+
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <h1>Curate once, build a snapshot, then work from it every day</h1>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 960 444" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="team-workflow-title team-workflow-desc">
+        <title id="team-workflow-title">How a Team Works with Arkive RAG</title>
+        <desc id="team-workflow-desc">A team keeps its existing reference folder, builds it once into a portable read-only snapshot, and then uses that snapshot every day for grounded answers with citations and for grounded drafting.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#47525E"/>
+          </marker>
+          <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#B03F1B"/>
+          </marker>
+          <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#1B5E63"/>
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#F4F1EA"/>
+
+        <!-- STAGE ZONES (painted first) -->
+        <rect x="24" y="24" width="200" height="356" rx="8" fill="rgba(29,35,42,0.025)" stroke="rgba(29,35,42,0.14)" stroke-width="0.8"/>
+        <rect x="36" y="28" width="76" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="74" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">1 · CURATE</text>
+
+        <rect x="248" y="24" width="424" height="356" rx="8" fill="rgba(29,35,42,0.025)" stroke="rgba(29,35,42,0.14)" stroke-width="0.8"/>
+        <rect x="260" y="28" width="68" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="294" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">2 · BUILD</text>
+
+        <rect x="696" y="24" width="240" height="356" rx="8" fill="rgba(29,35,42,0.025)" stroke="rgba(29,35,42,0.14)" stroke-width="0.8"/>
+        <rect x="708" y="28" width="100" height="14" rx="2" fill="#F4F1EA"/>
+        <text x="758" y="38" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">3 · DAILY WORK</text>
+
+        <!-- CONNECTORS (painted before nodes, orthogonal r=8 only) -->
+        <!-- Folder -> Snapshot Build (straight horizontal at y=208) -->
+        <line x1="212" y1="208" x2="264" y2="208" stroke="#47525E" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <!-- Snapshot Build -> Portable Snapshot (accent, straight horizontal at y=208) -->
+        <line x1="456" y1="208" x2="496" y2="208" stroke="#B03F1B" stroke-width="1.6" marker-end="url(#arrow-accent)"/>
+
+        <!-- Snapshot -> Grounded Q&A (right-up elbow, attach y=196) -->
+        <path d="M 656,196 H 672 Q 680,196 680,188 V 126 Q 680,118 688,118 H 708" fill="none" stroke="#1B5E63" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+
+        <!-- Snapshot -> Grounded Drafting (right-down elbow, attach y=220) -->
+        <path d="M 656,220 H 672 Q 680,220 680,228 V 294 Q 680,302 688,302 H 708" fill="none" stroke="#1B5E63" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+
+        <!-- NODES (painted after connectors) -->
+        <!-- 1. Team Reference Folder -->
+        <rect x="36" y="164" width="176" height="88" rx="6" fill="#F4F1EA"/>
+        <rect x="36" y="164" width="176" height="88" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <rect x="44" y="172" width="40" height="12" rx="2" fill="none" stroke="rgba(29,35,42,0.35)" stroke-width="0.8"/>
+        <text x="64" y="181" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">FOLDER</text>
+        <text x="124" y="206" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Team Reference Folder</text>
+        <text x="124" y="224" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Reports, decks, feedback, notes</text>
+        <text x="124" y="238" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Keep your existing layout</text>
+
+        <!-- 2. One-Time Snapshot Build -->
+        <rect x="264" y="152" width="192" height="112" rx="6" fill="#F4F1EA"/>
+        <rect x="264" y="152" width="192" height="112" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1.2"/>
+        <rect x="272" y="160" width="36" height="12" rx="2" fill="none" stroke="rgba(29,35,42,0.35)" stroke-width="0.8"/>
+        <text x="290" y="169" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">BUILD</text>
+        <text x="360" y="196" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">One-Time Snapshot Build</text>
+        <text x="360" y="214" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Reads charts &amp; tables</text>
+        <text x="360" y="228" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Spots drafts vs finals</text>
+        <text x="360" y="242" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Extracts lessons &amp; house wording</text>
+
+        <!-- 3. Portable Snapshot (FOCAL ACCENT) -->
+        <rect x="496" y="168" width="160" height="80" rx="6" fill="#F4F1EA"/>
+        <rect x="496" y="168" width="160" height="80" rx="6" fill="rgba(176,63,27,0.08)" stroke="#B03F1B" stroke-width="1.5"/>
+        <rect x="504" y="176" width="32" height="12" rx="2" fill="none" stroke="rgba(176,63,27,0.45)" stroke-width="0.8"/>
+        <text x="520" y="185" fill="#B03F1B" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">FILE</text>
+        <text x="576" y="212" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Portable Snapshot</text>
+        <text x="576" y="230" fill="#B03F1B" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">*.arkive.db · read-only file</text>
+
+        <!-- 4. Grounded Q&A -->
+        <rect x="708" y="72" width="216" height="92" rx="6" fill="#F4F1EA"/>
+        <rect x="708" y="72" width="216" height="92" rx="6" fill="#E9E4D8" stroke="#1D232A" stroke-width="1"/>
+        <rect x="716" y="80" width="40" height="12" rx="2" fill="none" stroke="rgba(29,35,42,0.35)" stroke-width="0.8"/>
+        <text x="736" y="89" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">ANSWER</text>
+        <text x="816" y="116" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Grounded Q&amp;A</text>
+        <text x="816" y="134" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Exact facts, charts &amp; page citations</text>
+        <text x="816" y="148" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Hides outdated drafts</text>
+
+        <!-- 5. Grounded Drafting -->
+        <rect x="708" y="252" width="216" height="100" rx="6" fill="#F4F1EA"/>
+        <rect x="708" y="252" width="216" height="100" rx="6" fill="#E9E4D8" stroke="#1D232A" stroke-width="1"/>
+        <rect x="716" y="260" width="36" height="12" rx="2" fill="none" stroke="rgba(29,35,42,0.35)" stroke-width="0.8"/>
+        <text x="734" y="269" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">DRAFT</text>
+        <text x="816" y="296" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Grounded Drafting</text>
+        <text x="816" y="314" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Closest examples + team lessons</text>
+        <text x="816" y="328" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Separates house wording</text>
+        <text x="816" y="342" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">from project facts</text>
+
+        <!-- LEGEND STRIP (bottom) -->
+        <line x1="24" y1="404" x2="936" y2="404" stroke="rgba(29,35,42,0.14)" stroke-width="0.8"/>
+        <text x="24" y="424" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">LEGEND</text>
+
+        <rect x="108" y="414" width="14" height="12" rx="3" fill="rgba(176,63,27,0.08)" stroke="#B03F1B" stroke-width="1.2"/>
+        <text x="130" y="424" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">The one file the team shares</text>
+
+        <rect x="320" y="414" width="14" height="12" rx="3" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
+        <text x="342" y="424" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Team step</text>
+
+        <rect x="448" y="414" width="14" height="12" rx="3" fill="#E9E4D8" stroke="#1D232A" stroke-width="1"/>
+        <text x="470" y="424" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Daily outcome</text>
+
+        <line x1="584" y1="420" x2="612" y2="420" stroke="#1B5E63" stroke-width="1.2"/>
+        <text x="620" y="424" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Read from the snapshot</text>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>
