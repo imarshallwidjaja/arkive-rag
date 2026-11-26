@@ -63,8 +63,8 @@ During the MCP initialisation handshake, `INSTRUCTIONS` tells the client to call
 
 | Model | Input / cached input / output | Used during `build` | Used during `serve` |
 | --- | --- | --- | --- |
-| `gpt-6.1-sol` | $2.00 / $0.10 / $10.00 | Page transcription (low effort, high on retry), observation cards, organisation, type canonicalisation, feedback lessons, glossary, topic guide | Never called by the server |
-| `gpt-6-luna` | $0.10 / $0.01 / $0.00 | Decisions API: content-bound facets, version-family confirmation and ordering, glossary and lesson support checks | Never called |
+| `gpt-6.1-sol` | $2.00 / $0.10 / $10.00 | Page transcription (low effort, high on retry), observation cards, organisation, facet and type canonicalisation, version partition, feedback lessons, glossary, topic guide | Never called by the server |
+| `gpt-6-luna` | $0.10 / $0.01 / $0.00 | Decisions API: content-bound facets, glossary and lesson support checks | Never called |
 | `text-embedding-3-large` | $0.13 input | Batched chunk embeddings (1,536 dimensions) | One query embedding per `search` or `prepare_draft` call |
 
 Measured on the public fictional corpora:

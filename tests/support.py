@@ -28,11 +28,12 @@ from arkive_rag.compiler import (
     parse_markdown_blocks,
 )
 from arkive_rag.induction import (
-    ORDER_OPERATION,
-    VERSION_OPERATION,
+    MAX_FACETS,
+    CanonicaliseFacets,
     CanonicaliseTypes,
     ExtractFeedbackLessons,
     OrganiseCorpus,
+    PartitionVersions,
     WriteGlossary,
     WriteGuide,
 )
@@ -40,6 +41,7 @@ from arkive_rag.llm import OpenAIGateway, StructuredRequest
 from arkive_rag.models import (
     CanonicalTypeDraft,
     DocumentRoleDraft,
+    FacetCanonicalisationDraft,
     FacetDraft,
     FacetValueDraft,
     FeedbackLessonDraft,
@@ -50,11 +52,14 @@ from arkive_rag.models import (
     ObservationDraft,
     OrganisationDraft,
     PageExtraction,
+    ProposedVersionFamily,
     SenseDraft,
     StatedAttribute,
     TermDraft,
     TypeCanonicalisationDraft,
+    VersionPartitionDraft,
     document_id,
+    fold_facet_label,
     fold_for_quote,
 )
 from arkive_rag.snapshot import write_snapshot
@@ -93,15 +98,7 @@ def hash_embedding(text: str, dimensions: int) -> NDArray[np.float32]:
 
 # A version token in a title, such as `v0.9` or `V2`.
 _VERSION_TOKEN = re.compile(r"\bv(\d+(?:\.\d+)*)\b", re.IGNORECASE)
-_PAIR = re.compile(r"Document (doc_[0-9a-f]{10}) .*Document (doc_[0-9a-f]{10})")
-_CARD_TITLE = re.compile(r"=== (doc_[0-9a-f]{10}) ===\n(?:.*\n)*?Title: (.*)")
-
-JudgeRule = Callable[[str, str], float | None]
-
-
-def card_titles(evidence: str) -> dict[str, str]:
-    """Each document ID of version evidence with the title its card shows."""
-    return {m[1]: m[2] for m in _CARD_TITLE.finditer(evidence)}
+_PRINTED_DATE = re.compile(r"(\d{4}-\d{2}(?:-\d{2})?) \(printed\)")
 
 
 def _version(title: str) -> tuple[int, ...] | None:
@@ -109,23 +106,66 @@ def _version(title: str) -> tuple[int, ...] | None:
     return tuple(int(p) for p in match[1].split(".")) if match else None
 
 
-def same_deliverable(evidence: str, predicate: str) -> float:
-    """Fake rule for version pairs: titles equal once a version token is removed."""
-    a, b = _PAIR.search(predicate).groups()  # type: ignore[union-attr]
-    titles = card_titles(evidence)
-
-    def stem(title: str) -> str:
-        return " ".join(_VERSION_TOKEN.sub("", title).casefold().split())
-
-    return 0.9 if stem(titles[a]) == stem(titles[b]) else 0.1
+def _strictly_greatest(keys: Mapping[str, Any]) -> str | None:
+    """The member whose key is strictly greatest, when every member has one."""
+    if None in keys.values():
+        return None
+    ranked = sorted(keys, key=keys.__getitem__, reverse=True)
+    return ranked[0] if keys[ranked[0]] != keys[ranked[1]] else None
 
 
-def later_version(evidence: str, predicate: str) -> float:
-    """Fake rule for ordering: the first document's title has the higher version token."""
-    a, b = _PAIR.search(predicate).groups()  # type: ignore[union-attr]
-    titles = card_titles(evidence)
-    va, vb = _version(titles[a]), _version(titles[b])
-    return 0.9 if va is not None and vb is not None and va > vb else 0.1
+def partition_versions(request: PartitionVersions) -> VersionPartitionDraft:
+    """Fake partition: documents are one family when their titles are equal once a version
+    token is removed. The latest member has the highest version token, else the latest
+    printed date; a family that neither orders has no latest member."""
+    families: dict[str, list[str]] = {}
+    for card in request.cards:
+        stem = " ".join(_VERSION_TOKEN.sub("", card.title).casefold().split())
+        families.setdefault(stem, []).append(card.doc_id)
+    versions = {c.doc_id: _version(c.title) for c in request.cards}
+    printed = {
+        c.doc_id: (m[1] if (m := _PRINTED_DATE.fullmatch(c.date)) else None) for c in request.cards
+    }
+    proposed = []
+    for members in families.values():
+        latest = None
+        if len(members) > 1:
+            latest = _strictly_greatest({m: versions[m] for m in members}) or _strictly_greatest(
+                {m: printed[m] for m in members}
+            )
+        proposed.append(ProposedVersionFamily(doc_ids=members, latest_doc_id=latest))
+    return VersionPartitionDraft(families=proposed)
+
+
+def canonicalise_facets(request: CanonicaliseFacets) -> FacetCanonicalisationDraft:
+    """Fake facet canonicalisation: facets merge by name, each keeping the binding of its first
+    proposal; values merge by folded label, uniting aliases and folders; the first
+    `MAX_FACETS` names are kept."""
+    merged: dict[str, FacetDraft] = {}
+    for proposal in request.proposals:
+        facet = proposal.facet
+        prior = merged.get(facet.name)
+        binding = (
+            facet.binding if prior is None else ("path" if prior.values[0].folders else "content")
+        )
+        if binding != facet.binding:
+            continue
+        values = {fold_facet_label(v.value): v for v in (prior.values if prior else [])}
+        for value in facet.values:
+            key = fold_facet_label(value.value)
+            old = values.get(key)
+            values[key] = FacetValueDraft(
+                value=old.value if old else value.value,
+                description=old.description if old else value.description,
+                aliases=sorted({*(old.aliases if old else []), *value.aliases}),
+                folders=sorted({*(old.folders if old else []), *value.folders}),
+            )
+        merged[facet.name] = FacetDraft(
+            name=facet.name,
+            description=prior.description if prior else facet.description,
+            values=list(values.values()),
+        )
+    return FacetCanonicalisationDraft(facets=list(merged.values())[:MAX_FACETS])
 
 
 class FakeGateway:
@@ -137,10 +177,10 @@ class FakeGateway:
     `Folders: <name>` line in a root curator note, else `project`), one content-bound facet per
     attribute with two or more values, gives each document its observed type, and makes a
     document whose type says "review" feedback for the batch's other types. Canonicalisation
-    keeps every label as its own type. Feedback lessons are the `Reviewer:` lines. `judge`
-    answers version questions by `same_deliverable` and `later_version`, and any other
-    question 0.9 when every double-quoted span of a predicate occurs in the evidence, else
-    0.1; `judge_rules` replaces the rule of an operation.
+    keeps every label as its own type. Facet canonicalisation is `canonicalise_facets` and
+    version partition `partition_versions`. Feedback lessons are the `Reviewer:` lines.
+    `judge` answers 0.9 when every double-quoted span of a predicate occurs in the evidence,
+    else 0.1.
 
     Each `*_script` queues responses consumed before the deterministic answer. Every request
     is kept in `requests`, its operation name in `calls`, and judge questions in `judged`.
@@ -156,23 +196,21 @@ class FakeGateway:
         observe_script: Sequence[ObservationDraft] = (),
         organise_script: Sequence[OrganisationDraft] = (),
         types_script: Sequence[TypeCanonicalisationDraft] = (),
+        facets_script: Sequence[FacetCanonicalisationDraft] = (),
+        versions_script: Sequence[VersionPartitionDraft] = (),
         lesson_script: Sequence[FeedbackLessonsDraft] = (),
         glossary_script: Sequence[GlossaryDraft] = (),
         guide_script: Sequence[str] = (),
-        judge_rules: Mapping[str, JudgeRule] | None = None,
     ) -> None:
         self.page_script = list(page_script)
         self.observe_script = list(observe_script)
         self.organise_script = list(organise_script)
         self.types_script = list(types_script)
+        self.facets_script = list(facets_script)
+        self.versions_script = list(versions_script)
         self.lesson_script = list(lesson_script)
         self.glossary_script = list(glossary_script)
         self.guide_script = list(guide_script)
-        self.judge_rules: dict[str, JudgeRule] = {
-            VERSION_OPERATION: same_deliverable,
-            ORDER_OPERATION: later_version,
-            **(judge_rules or {}),
-        }
         self.requests: list[object] = []
         self.calls: list[str] = []
         self.judged: list[tuple[str, str, list[str]]] = []
@@ -224,6 +262,10 @@ class FakeGateway:
                         for t in labels
                     ]
                 )
+            case CanonicaliseFacets():
+                return self._pop(self.facets_script) or canonicalise_facets(request)
+            case PartitionVersions():
+                return self._pop(self.versions_script) or partition_versions(request)
             case ExtractFeedbackLessons(sections=sections):
                 scripted_lessons = self._pop(self.lesson_script)
                 return scripted_lessons or FeedbackLessonsDraft(
@@ -351,9 +393,6 @@ class FakeGateway:
         with self._lock:
             self.calls.append(operation)
             self.judged.append((operation, evidence, list(predicates)))
-        rule = self.judge_rules.get(operation)
-        if rule is not None:
-            return [rule(evidence, predicate) for predicate in predicates]
         haystack = fold_for_quote(evidence)
         return [
             0.9

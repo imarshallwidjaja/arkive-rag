@@ -26,7 +26,7 @@ their text and the factual provenance of that text.
 | `models.py` | Domain types (readings, observation cards, facets, document roles, feedback lessons, recurring units, glossary entries, the build report, read results and the drafting packet), the provider output schemas, the shared text folding (`fold_text`, `fold_for_quote`, `heading_context`), and the `ArkiveError` hierarchy. |
 | `llm.py` | The `StructuredRequest` protocol, the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Decisions, embeddings, the evaluation harness's agent conversations, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
 | `compiler.py` | Reading (discovery, rendering, the transcription fidelity gate, section stitching, chunk pieces, observation cards with quote location) and binding (IDs, breadcrumbs, embeddings). `compile_corpus` composes reading, induction and binding into a `CompiledCorpus`. Its request types (`PageTranscription`, `ObserveSections`, `ConsolidateCard`) own their prompts, output schemas and reasoning efforts. |
-| `induction.py` | Induction: corpus organisation in bounded batches, type canonicalisation, facet binding, version families, feedback lessons, the glossary and the topic guide; the validate-and-retry helper `generate_checked`; support checks. Its request types (`OrganiseCorpus`, `CanonicaliseTypes`, `ExtractFeedbackLessons`, `WriteGlossary`, `WriteGuide`) own their prompts, schemas and efforts. |
+| `induction.py` | Induction: corpus organisation in bounded batches, type canonicalisation, facet binding, version families, feedback lessons, the glossary and the topic guide; the validate-and-retry helper `generate_checked`; support checks. Its request types (`OrganiseCorpus`, `CanonicaliseFacets`, `CanonicaliseTypes`, `PartitionVersions`, `ExtractFeedbackLessons`, `WriteGlossary`, `WriteGuide`) own their prompts, schemas and efforts. |
 | `native_formats.py` | What a file's own structure holds, read from its bytes: Excel workbooks (`xlsx_markdown`) and HTML pages (`html_markdown`) as Markdown through Docling's spreadsheet and HTML backends, the Office archive limits (`open_office_archive`), the accepted-revision copy of a Word file (`accepted_revision_copy`), Word comments and tracked changes (`docx_asides`), and PowerPoint speaker notes, comments and chart data (`pptx_supplements`). It is the only module that imports Docling or openpyxl; `compiler` imports it inside the functions that read those formats. |
 | `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what an aside (a visual transcript or an annotation) is and its removal (`without_asides`), the one GFM table parser and renderer (`split_table_cells`, `tables`, `render_table`, `abridge_tables`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a corpus recur (`recurring_units`, over plain `TextDocument` records). Induction, the drafting packet and the evaluation harness all measure text with it. |
 | `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup, document pages and the drafting packet). |
@@ -336,7 +336,7 @@ A document with no text raises `ConversionError`.
 runs its steps in order: organise, bind, then version families, feedback
 lessons and the glossary on one executor, then the guide. Recurring text units
 are computed in code. One executor with `--max-concurrency` workers runs the
-organisation batches, the binding questions, the version judgements, the
+organisation batches, the binding questions, the version partitions, the
 lesson extractions, the glossary batches and the definition checks; each task
 makes one provider call at a time, so the limit bounds them together. Results
 are gathered in submission order, and the first failure of any task cancels
@@ -360,8 +360,8 @@ does not fit is cut with a marker, and `truncated_curator_notes` in the build
 report counts the notes no prompt shows in full. The snapshot stores every
 note verbatim. No step caps how many deliverable types a corpus has.
 
-1. **Organise** (`organise_corpus`, medium effort, then `canonicalise_types`,
-   medium effort). Every citable document becomes a one-line digest:
+1. **Organise** (`organise_corpus`, medium effort, then `canonicalise_facets`
+   and `canonicalise_types`, medium effort). Every citable document becomes a one-line digest:
    `doc_id | path | format | date | observed type | title | summary |
    stated attributes`, each field cut (path 160, type 80, title 120, summary
    180 and attributes 120 characters). Digests are packed in path order into
@@ -387,16 +387,26 @@ note verbatim. No step caps how many deliverable types a corpus has.
    form. Validation (`check_facets`) rejects a facet that mixes the two
    bindings, an unknown folder, a duplicate facet name, a blank value, a value
    given twice, a folded form that names two values of one facet, and more
-   than six facets. `merge_facets` then joins the batches' facets by name in
-   code: a name proposed path-bound by some batches and content-bound by
-   others keeps the binding more batches proposed (path-bound on a tie) and
-   drops the other proposals; values merge by folded label, keeping the first
-   spelling and description and uniting folders and aliases, with one spelling
-   kept per folded alias (`NM` from one batch and `nm` from another are one
-   alias), and an alias that folds like another value of the facet is
-   dropped. When more than six names
-   remain, those proposed by the most batches are kept. With one batch the
-   result is that batch's facets. A path-bound value also answers to the
+   than six facets.
+
+   Code then collects every distinct facet the batches proposed, without
+   dropping any, each with its binding, values, aliases, folders and the
+   number of batches that proposed it. Whenever at least one facet was
+   proposed, one canonicalisation request (`canonicalise_facets`, a single
+   batch included, so that synonyms within one batch merge too) receives the
+   curator notes and every proposal, with value descriptions cut to 200, then
+   60, then 0 characters until the proposals fit 54,000 characters
+   (`MAX_FACET_PROPOSALS_CHARS`); proposals whose values, aliases and folders
+   alone do not fit are refused with `ArkiveError`. The request merges facets
+   that filter by one property under different names (such as
+   `sensing_technology` and `monitoring_technology`) and synonymous values
+   into one canonical value with the other spellings as aliases, keeps the
+   facets curator notes ask for, and returns at most six. Its output passes
+   the same `check_facets` validation, with only the folders some proposal
+   lists as the known folders, so the request cannot introduce a corpus
+   folder no batch proposed. Folder lists render as JSON arrays, so a folder
+   name holding a separator stays one folder. No facet proposed means no request and no facets. A
+   path-bound value also answers to the
    paths of its folders, unless a path already names a value of the facet or
    belongs to several values.
 
@@ -424,42 +434,60 @@ note verbatim. No step caps how many deliverable types a corpus has.
    several values of a facet or none. Values no document holds are then
    pruned, and so are facets with fewer than two populated values; the build
    report names both.
-3. **Version families** (`confirm_versions`, `order_versions`). A version
+3. **Version families** (`partition_versions`, medium effort). A version
    family groups drafts, revisions and format exports of one deliverable.
    Byte-identical citable documents (the same `sha256`) are one family
    without a question, however short they are; only the first of them in
-   path order takes part in the candidate search. Code proposes candidate
-   pairs of citable documents through two inverted
-   indexes: one of word 4-grams sampled by checksum (one in four), where a
-   pair qualifies when one document holds at least 0.35 of the other's
-   sampled 4-grams, and one of title and file-name words, where two documents
-   of the same canonical type qualify when they share at least 0.6 of those
-   words (two words or more each). A 4-gram or word held by more than 50
-   documents proposes nothing, and a feedback document is never paired with a
-   document that is not feedback: a review quoting what it reviews is another
-   artifact. Each document keeps its six best partners, so
-   pairs grow linearly with the corpus. The Decisions API then judges each
-   pair against compact cards of both documents (path, format, page count,
-   date, canonical type, title, summary and first twelve headings), many
-   pairs per request within one 48,000-character evidence window, with the
-   predicate that the two are "drafts, revisions, or format exports of the
-   exact same deliverable artifact for the exact same engagement and
-   reporting period, not a follow-on phase, a study with a different sensor or
-   method, a periodic installment for another period, or a summary deck
-   paired with a full report". Confirmed pairs (0.5 or more) join into
-   families; a family's ID is its first member in path order.
+   path order (the representative) takes part in the candidate search and
+   the partition request. Code proposes scored candidate pairs through two
+   inverted indexes: one of word 4-grams sampled by checksum (one in four),
+   and one of title and file-name words. A 4-gram or word held by more than
+   12 documents (`VERSION_COMMON_POSTING`) is boilerplate shared across
+   deliverables: it counts in neither the shared part nor the whole of a
+   score, while a family of up to twelve versions keeps every 4-gram its
+   members share. A pair qualifies when one document holds at least 0.35 of
+   the other's distinctive sampled 4-grams, each having at least eight
+   (`VERSION_MIN_GRAMS`; a document with fewer is paired by its words
+   alone), or when two documents of the same canonical type share at least
+   0.6 of their distinctive title and file-name words (two words or more
+   each). A feedback document is never paired with a document that is not
+   feedback: a review quoting what it reviews is another artifact. Each
+   document keeps its six best partners, so pairs grow linearly with the
+   corpus.
 
-   In a family of one the document is `sole`. In a larger family, among the
-   distinct members (the first of byte-identical copies in path order), dates
-   decide when every member has a date of the same precision and one is
-   strictly latest; otherwise the decision model is asked, for each ordered
-   pair, whether one is "a later, more final version superseding" the other,
-   and a member that supersedes every other (each forward answer at least 0.5,
-   each reverse answer below it) is `latest`. Every other member, copies
-   included, is `superseded` with `superseded_by` naming the latest member, in
-   one step. Without such a member, or with more than twelve distinct members,
-   every distinct member is `unordered` (the build does not guess an order),
-   and a later byte-identical copy is `superseded` by its first copy.
+   The pairs join representatives into connected components, strongest
+   pair first (ties in path order of the pair). A pair that would join two
+   components into one of more than 16 documents
+   (`MAX_VERSION_COMPONENT_DOCS`) is dropped and counted in the build
+   report's `dropped_version_edges`, so only the weakest links of a large
+   cluster are cut and every request stays well within the prompt bound. A
+   representative whose every pair was dropped joins no component and is
+   its own family (`sole`, or with its byte-identical copies) without a request.
+   Each component of two or more representatives is one structured request
+   whose text depends only on that component, so the build cache keys each
+   component on its own. It holds a compact card per document (path,
+   format, page count, the date with its basis: `printed`, `printed, not
+   parsed` or `file metadata`, the observed type, the quote-verified stated
+   attributes, title, summary and first twelve headings, each field cut) and
+   the component's candidate pairs with their scores. The instructions join
+   documents only when they are drafts, revisions or format exports of the
+   exact same deliverable for the exact same engagement and reporting
+   period, never distinct projects, phases, periodic installments, an
+   addendum and its base document, or a summary deck and its full report.
+   They name a latest member only when it clearly supersedes every other one
+   (a final over drafts, a higher revision, an unambiguously later printed
+   date), state that a file metadata date never proves supersession, and ask
+   for `null` when the order is ambiguous. Validation rejects a family with
+   no documents, an unknown document, a document placed twice or not at all,
+   and a latest member outside its family.
+
+   A family's ID is its first member in path order, copies included. In a
+   family of one the document is `sole`. When the request names a latest
+   member, or a family's only representative has byte-identical copies, that
+   member is `latest` and every other member, copies included, is
+   `superseded` with `superseded_by` naming it, in one step. Otherwise every
+   representative is `unordered` (the build does not guess an order), and a
+   byte-identical copy is `superseded` by its first copy.
 4. **Feedback lessons** (`extract_feedback_lessons`, low effort). They run
    after version families: a superseded feedback document (an earlier draft
    or a copy of a review) gives no lessons. Each other feedback document's
@@ -470,7 +498,10 @@ note verbatim. No step caps how many deliverable types a corpus has.
    header and separator rows when they leave room for a row. Each batch is one
    structured request that returns transferable lessons: a statement and a
    verbatim quote of an accepted or resolved reviewer criticism, without
-   project-specific values. Quotes are located with `fold_for_quote`; a lesson
+   project-specific values (client, site and person names, places, fees,
+   coordinates, project dates), but keeping a house-wide equipment,
+   instrument, regulatory or methodology constant that the reviewer
+   establishes or enforces as a rule beyond the project. Quotes are located with `fold_for_quote`; a lesson
    with a blank statement or an unlocated quote gets one rerun that names it,
    and is then discarded and counted in `discarded_unlocated_quotes`. As for
    observations, a batch that proposed lessons and located none is a broken
@@ -596,7 +627,8 @@ card's type, is no feedback and is a family of its own.
 `build` prints the usage line and the build report. The build report has
 `discarded_unlocated_quotes`, `unsupported_definitions`,
 `dropped_feedback_lessons`, `judge_refusals` (per Decisions operation),
-`pruned_facet_values`, `pruned_facets` and `truncated_curator_notes`.
+`pruned_facet_values`, `pruned_facets`, `truncated_curator_notes` and
+`dropped_version_edges`.
 
 ## Provider calls
 

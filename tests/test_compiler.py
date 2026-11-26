@@ -75,6 +75,7 @@ from arkive_rag.models import (
     DocumentRole,
     DocumentRoleDraft,
     Facet,
+    FacetCanonicalisationDraft,
     FacetDraft,
     FacetValue,
     FacetValueDraft,
@@ -1183,6 +1184,7 @@ def cite_last_section(body: dict[str, Any]) -> GuideDraft:
 def scripted_api() -> ScriptedOpenAI:
     api = ScriptedOpenAI()
     api.defaults["OrganisationDraft"] = memo_organisation
+    api.defaults["FacetCanonicalisationDraft"] = FacetCanonicalisationDraft(facets=[CLIENTS])
     api.defaults["GuideDraft"] = cite_last_section
     return api
 
@@ -1219,10 +1221,11 @@ def test_unchanged_corpus_rebuilds_from_the_cache_without_provider_requests(
     assert (second.facets, second.deliverable_types) == (first.facets, first.deliverable_types)
     assert second.unit_clusters == first.unit_clusters
     # Every operation of all three passes was made once: two observations, one organisation
-    # batch and its type canonicalisation, one binding judgement per citable document, the
-    # guide, and the embeddings. The two documents share no text or title, so no version pair
-    # is judged.
+    # batch with its facet and type canonicalisations, one binding judgement per citable
+    # document, the guide, and the embeddings. The two documents share no text or title, so no
+    # version partition is requested.
     assert formats(api) == [
+        "FacetCanonicalisationDraft",
         "GuideDraft",
         "ObservationDraft",
         "ObservationDraft",
@@ -1236,11 +1239,14 @@ def test_unchanged_corpus_rebuilds_from_the_cache_without_provider_requests(
     assert efforts == {
         "ObservationDraft": "low",
         "OrganisationDraft": "medium",
+        "FacetCanonicalisationDraft": "medium",
         "TypeCanonicalisationDraft": "medium",
         "GuideDraft": "medium",
     }
     assert [t.name for t in first.deliverable_types] == ["memorandum", "proposal"]
     assert first.build_settings["efforts"]["canonicalise_types"] == "medium"
+    assert first.build_settings["efforts"]["canonicalise_facets"] == "medium"
+    assert first.build_settings["efforts"]["partition_versions"] == "medium"
     assert first.build_settings["efforts"]["extract_feedback_lessons"] == "low"
     assert first.build_settings["model"] == "gpt-6.1-sol"
 

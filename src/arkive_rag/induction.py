@@ -40,8 +40,10 @@ from arkive_rag.models import (
     CorpusDocument,
     CuratorNote,
     DeliverableType,
+    DocumentReading,
     DocumentRole,
     Facet,
+    FacetCanonicalisationDraft,
     FacetDraft,
     FacetValue,
     FeedbackLesson,
@@ -59,6 +61,7 @@ from arkive_rag.models import (
     TermObservation,
     TypeCanonicalisationDraft,
     UnitCluster,
+    VersionPartitionDraft,
     VersionStatus,
     fold_facet_label,
     fold_for_quote,
@@ -67,8 +70,8 @@ from arkive_rag.models import (
 )
 
 MAX_FACETS = 6
-# A content-bound value is assigned, a definition, feedback lesson or version relation kept,
-# when the decision model's probability reaches this threshold. A refusal never confirms.
+# A content-bound value is assigned, a definition or feedback lesson kept, when the decision
+# model's probability reaches this threshold. A refusal never confirms.
 SUPPORT_THRESHOLD = 0.5
 GLOSSARY_BATCH_CHARS = 24_000
 MAX_OCCURRENCES_PER_TERM = 6
@@ -123,24 +126,35 @@ MAX_BINDING_OUTLINE_CHARS = 12_000
 MAX_BINDING_ATTRIBUTES_CHARS = 4_000
 MAX_BINDING_DESCRIPTION_CHARS = 300
 
-# Version families. Code proposes candidate pairs; the decision model confirms each.
-# Share of one document's sampled word 4-grams the other must hold to be a candidate.
+# The facet proposals of one canonicalisation request: every value, alias and folder, with
+# value descriptions cut to the first of these lengths that fits (0: no value descriptions).
+MAX_FACET_PROPOSALS_CHARS = 54_000
+FACET_DESCRIPTION_STEPS = (200, 60, 0)
+
+# Version families. Code proposes scored candidate pairs and groups them into bounded
+# components; one structured request per component partitions it into families.
+# Share of one document's distinctive sampled word 4-grams the other must hold.
 VERSION_CANDIDATE_CONTAINMENT = 0.35
-# Share of title and file-name words two documents of one deliverable type must share.
+# Distinctive sampled 4-grams each document of a 4-gram candidate pair must have; a document
+# with fewer is paired by its title and file-name words alone.
+VERSION_MIN_GRAMS = 8
+# Share of distinctive title and file-name words two documents of one deliverable type share.
 VERSION_TITLE_OVERLAP = 0.6
 # Partners kept per document, best first, so the number of pairs grows linearly.
 MAX_VERSION_PARTNERS = 6
 # One 4-gram in this many is sampled (by checksum) to estimate containment.
 VERSION_SHINGLE_SAMPLE = 4
-# A sampled 4-gram or title word held by more documents than this is shared house text, not a
-# sign of one deliverable, and proposes no pair.
-VERSION_COMMON_POSTING = 50
+# A sampled 4-gram or title word held by more documents than this is boilerplate shared
+# across deliverables, not a sign of one deliverable: it counts in neither part of a score,
+# while a family of up to this many versions keeps every 4-gram its members share.
+VERSION_COMMON_POSTING = 12
+# Documents of one partition request, so that its cards and pairs fit well within the
+# prompt bound; weaker pairs that would join a larger component are dropped and counted.
+MAX_VERSION_COMPONENT_DOCS = 16
 VERSION_EVIDENCE_HEADINGS = 12
+VERSION_HEADING_CHARS = 120
 VERSION_SUMMARY_CHARS = 600
-# A family with more distinct members than this that dates do not order is left unordered
-# rather than judged pair by pair.
-MAX_ORDERED_FAMILY_MEMBERS = 12
-ORDERING_HEADING_CHARS = 120
+VERSION_ATTRIBUTE_CHARS = 600
 
 # A feedback document is read in batches of at most this many characters of its sections.
 FEEDBACK_BATCH_CHARS = 24_000
@@ -718,78 +732,125 @@ def check_batch(
     return Checked.accept(BatchOrganisation(tuple(facets), roles))
 
 
-def _one_per_fold(aliases: Iterable[str]) -> tuple[str, ...]:
-    """One alias per folded form, the first in (folded form, text) order, sorted by text: two
-    batches may spell one alias differently, and a filter resolves it by its folded form."""
-    chosen: dict[str, str] = {}
-    for alias in sorted(set(aliases), key=lambda a: (fold_facet_label(a), a)):
-        chosen.setdefault(fold_facet_label(alias), alias)
-    return tuple(sorted(chosen.values()))
+@dataclass(frozen=True)
+class FacetProposal:
+    """One distinct facet the organisation batches proposed, exactly as checked, and how many
+    batches proposed it."""
 
+    facet: Facet
+    batches: int
 
-def merge_facets(proposals: Sequence[Sequence[Facet]]) -> tuple[Facet, ...]:
-    """One facet set from every batch's facets, by name.
-
-    A name proposed path-bound by some batches and content-bound by others keeps the binding
-    more batches proposed (path-bound on a tie) and drops the other proposals, so a facet
-    never mixes bindings. Values merge by folded label, the first spelling and description
-    kept, folders and aliases unioned, with one spelling kept per folded alias; an alias that
-    folds like another value of the facet is dropped. When more than `MAX_FACETS` names
-    remain, those proposed by the most batches are kept, ties in first-proposal order. With
-    one batch the result is its own facets.
-    """
-    by_name: dict[str, list[Facet]] = {}
-    for facets in proposals:
-        for facet in facets:
-            by_name.setdefault(facet.name, []).append(facet)
-    merged: list[tuple[int, Facet]] = []
-    for name, proposed in by_name.items():
-        votes = Counter(f.binding for f in proposed)
-        binding = "path" if votes["path"] >= votes["content"] else "content"
-        kept = [f for f in proposed if f.binding == binding]
-        values: dict[str, FacetValue] = {}
-        for facet in kept:
-            for value in facet.values:
-                key = fold_facet_label(value.value)
-                prior = values.get(key)
-                values[key] = (
-                    value
-                    if prior is None
-                    else prior.model_copy(
-                        update={
-                            "aliases": _one_per_fold((*prior.aliases, *value.aliases)),
-                            "folders": tuple(sorted({*prior.folders, *value.folders})),
-                        }
-                    )
-                )
-        owners: Counter[str] = Counter()
-        for value in values.values():
-            owners.update({fold_facet_label(f) for f in (value.value, *value.aliases)})
-        clean = tuple(
-            value.model_copy(
-                update={
-                    "aliases": tuple(
-                        a
-                        for a in value.aliases
-                        if owners[fold_facet_label(a)] == 1
-                        and fold_facet_label(a) != fold_facet_label(value.value)
-                    )
-                }
-            )
-            for value in values.values()
+    def lines(self, description_chars: int) -> list[str]:
+        binding = "path-bound" if self.facet.binding == "path" else "content-bound"
+        head = (
+            f"- facet {self.facet.name} ({binding}; proposed by {self.batches} batch(es)):"
+            f" {one_line(self.facet.description, max(description_chars, 60))}"
         )
-        first = kept[0]
-        merged.append(
-            (
-                len(kept),
-                Facet(
-                    name=name, description=first.description, binding=first.binding, values=clean
-                ),
-            )
+        lines = [head]
+        for value in self.facet.values:
+            parts = [f"  - value {value.value!r}"]
+            if description_chars:
+                parts.append(one_line(value.description, description_chars))
+            if value.aliases:
+                parts.append(f"aliases: {'; '.join(map(repr, value.aliases))}")
+            if value.folders:
+                parts.append(f"folders: {json.dumps(list(value.folders), ensure_ascii=False)}")
+            lines.append(" | ".join(parts))
+        return lines
+
+
+def facet_proposals(batches: Sequence[Sequence[Facet]]) -> tuple[FacetProposal, ...]:
+    """Every distinct facet of the batches, in first-proposal order, with nothing dropped: the
+    canonicalisation request sees each batch's names, bindings, values, aliases and folders."""
+    counts: dict[Facet, int] = {}
+    for facets in batches:
+        for facet in dict.fromkeys(facets):
+            counts[facet] = counts.get(facet, 0) + 1
+    return tuple(FacetProposal(facet, n) for facet, n in counts.items())
+
+
+def facet_proposal_text(proposals: Sequence[FacetProposal]) -> str:
+    """Every proposal with every value, alias and folder, with descriptions as long as fit
+    `MAX_FACET_PROPOSALS_CHARS`. Values are never left out: proposals whose values alone do not
+    fit are refused."""
+    for description_chars in FACET_DESCRIPTION_STEPS:
+        text = "\n".join(line for p in proposals for line in p.lines(description_chars))
+        if len(text) <= MAX_FACET_PROPOSALS_CHARS:
+            return text
+    raise ArkiveError(
+        f"the organisation batches proposed {len(proposals)} distinct facets whose values do not"
+        f" fit one canonicalisation request of {MAX_FACET_PROPOSALS_CHARS} characters"
+    )
+
+
+CANONICALISE_FACETS_INSTRUCTIONS = f"""\
+You canonicalise the facets that readers of one document collection proposed in
+separate batches, so that agents filter the whole collection with one set of at
+most {MAX_FACETS} facets. You receive the curators' notes (their stated intent
+outranks your inference) and every distinct facet a batch proposed, with its
+binding, values, aliases, folders and how many batches proposed it.
+
+Merge facets that filter by the same property under different names into one
+facet with one snake_case name and description. Within a facet, merge values
+that name the same thing (spelling, abbreviation or wording differences) into
+one canonical value, and keep the other spellings as its aliases; keep values
+apart when they name different things. An alias names only one value of a
+facet. Keep every facet a curator note asks for. When more than {MAX_FACETS}
+distinct facets remain, keep those that best split the collection into groups
+of several documents, preferring those more batches proposed. Give no facets
+when none is useful.
+
+A facet is either path-bound, when every value lists the folders it stands for,
+or content-bound, when no value lists a folder; never mix the two in one facet.
+A path-bound value keeps every folder of the values merged into it, written
+exactly as given. Use only folders the proposals list.
+"""
+
+
+@dataclass(frozen=True)
+class CanonicaliseFacets:
+    operation: ClassVar[str] = "canonicalise_facets"
+    output: ClassVar[type[FacetCanonicalisationDraft]] = FacetCanonicalisationDraft
+    effort: ClassVar[Effort] = "medium"
+    instructions: ClassVar[str] = CANONICALISE_FACETS_INSTRUCTIONS
+    image_webp: ClassVar[None] = None
+    notes: str
+    proposals: tuple[FacetProposal, ...]
+    feedback: str | None = None
+
+    def text(self) -> str:
+        text = (
+            f"CURATOR NOTES:\n{self.notes}\n\n"
+            f"PROPOSED FACETS:\n{facet_proposal_text(self.proposals)}"
         )
-    order = {name: i for i, name in enumerate(by_name)}
-    chosen = sorted(merged, key=lambda item: (-item[0], order[item[1].name]))[:MAX_FACETS]
-    return tuple(f for _, f in sorted(chosen, key=lambda item: order[item[1].name]))
+        return f"{text}\n\n{self.feedback}" if self.feedback else text
+
+
+def check_canonical_facets(
+    draft: FacetCanonicalisationDraft, folders: frozenset[str]
+) -> Checked[tuple[Facet, ...]]:
+    facets, rejections = check_facets(draft.facets, folders)
+    if rejections:
+        return Checked.reject(rejections)
+    return Checked.accept(tuple(facets))
+
+
+def canonicalise_facets(
+    gateway: LanguageGateway, notes: str, batches: Sequence[Sequence[Facet]]
+) -> tuple[Facet, ...]:
+    """One facet set from every batch's proposals: one request whenever any batch proposed a
+    facet, a single batch included, so synonyms within one batch merge too. A canonical value
+    may list only folders some proposal lists."""
+    proposals = facet_proposals(batches)
+    if not proposals:
+        return ()
+    proposed_folders = frozenset(f for p in proposals for v in p.facet.values for f in v.folders)
+    facets = generate_checked(
+        "facet canonicalisation",
+        lambda feedback: gateway.run(CanonicaliseFacets(notes, proposals, feedback)),
+        lambda draft: check_canonical_facets(draft, proposed_folders),
+    )
+    return tuple(map(with_folder_aliases, facets))
 
 
 CANONICALISE_INSTRUCTIONS = """\
@@ -914,9 +975,10 @@ def organise(
     notes: Sequence[CuratorNote],
     pool: InductionExecutor,
 ) -> Organisation:
-    """Organise the citable documents in digest batches, merge the batches' facets, and map
-    every proposed type label to one canonical type. One path for every corpus size: a small
-    corpus is one batch, and its labels are canonicalised all the same."""
+    """Organise the citable documents in digest batches, canonicalise the batches' facets into
+    one set, and map every proposed type label to one canonical type. One path for every
+    corpus size: a small corpus is one batch, and its facets and labels are canonicalised all
+    the same."""
     folders = view.folders()
     known = frozenset(folders)
     shown_notes = notes_text(notes)
@@ -992,9 +1054,9 @@ def organise(
         )
         for doc_id, role in roles.items()
     }
-    facets = merge_facets([p.facets for p in proposals])
+    facets = canonicalise_facets(gateway, shown_notes.text, [p.facets for p in proposals])
     return Organisation(
-        tuple(map(with_folder_aliases, facets)),
+        facets,
         canon.types,
         canonical_roles,
         shown_notes.truncated,
@@ -1121,22 +1183,6 @@ def bind_facets(
 
 # Step 3: version families.
 
-VERSION_OPERATION = "confirm_versions"
-ORDER_OPERATION = "order_versions"
-
-
-def version_predicate(a: str, b: str) -> str:
-    return (
-        f"Document {a} and Document {b} are drafts, revisions, or format exports of the exact"
-        " same deliverable artifact for the exact same engagement and reporting period, not a"
-        " follow-on phase, a study with a different sensor or method, a periodic installment"
-        " for another period, or a summary deck paired with a full report."
-    )
-
-
-def order_predicate(a: str, b: str) -> str:
-    return f"Document {a} is a later, more final version superseding Document {b}."
-
 
 def _sampled_grams(doc: CorpusDocument) -> frozenset[int]:
     text = "\n".join(_passages.without_asides(s.markdown) for s in doc.reading.sections)
@@ -1150,17 +1196,22 @@ def _name_words(doc: CorpusDocument) -> frozenset[str]:
     return frozenset(_NAME_WORD.findall(fold_text(f"{stem} {doc.reading.card.title}")))
 
 
-def _overlaps(features: Sequence[frozenset[Any]]) -> list[Counter[int]]:
+def _distinctive[F](features: Sequence[frozenset[F]]) -> list[frozenset[F]]:
+    """Each document's features without those held by more than `VERSION_COMMON_POSTING`
+    documents: house text shared across many deliverables says nothing about versions."""
+    holders = Counter(f for held in features for f in held)
+    return [frozenset(f for f in held if holders[f] <= VERSION_COMMON_POSTING) for held in features]
+
+
+def _overlaps[F](features: Sequence[frozenset[F]]) -> list[Counter[int]]:
     """For each document, how many features it shares with each other document, through an
-    inverted index that skips features held by more than `VERSION_COMMON_POSTING` documents."""
-    postings: dict[Any, list[int]] = {}
+    inverted index."""
+    postings: dict[F, list[int]] = {}
     for index, held in enumerate(features):
         for feature in held:
             postings.setdefault(feature, []).append(index)
     shared: list[Counter[int]] = [Counter() for _ in features]
     for holders in postings.values():
-        if len(holders) > VERSION_COMMON_POSTING:
-            continue
         for i in holders:
             shared[i].update(j for j in holders if j != i)
     return shared
@@ -1177,30 +1228,36 @@ def byte_identical_groups(view: CorpusView) -> list[list[str]]:
 
 def version_candidates(
     view: CorpusView, roles: Mapping[str, ProposedRole]
-) -> list[tuple[str, str]]:
-    """Pairs of citable documents that may be versions of one deliverable, in path order.
+) -> list[tuple[str, str, float]]:
+    """Scored pairs of citable documents that may be versions of one deliverable, as
+    `(doc_a, doc_b, score)` with `doc_a` first in path order, sorted by path order.
 
-    Only the first of byte-identical documents takes part (`byte_identical_groups` joins the
-    others). A pair is proposed when one document holds at least
-    `VERSION_CANDIDATE_CONTAINMENT` of the other's sampled word 4-grams, or when two documents
-    of one deliverable type share at least `VERSION_TITLE_OVERLAP` of their title and
-    file-name words (two words or more each). A feedback document and a document that is not
-    feedback are never paired: a review quoting what it reviews is another artifact. Each
-    document keeps its `MAX_VERSION_PARTNERS` best partners, so the pairs grow linearly.
+    Only the first of byte-identical documents takes part. Features held by more than
+    `VERSION_COMMON_POSTING` documents count in neither the shared part nor the whole of a
+    score. A pair is proposed when one document holds at least `VERSION_CANDIDATE_CONTAINMENT`
+    of the other's distinctive sampled word 4-grams (each having `VERSION_MIN_GRAMS` or more),
+    or when two documents of one deliverable type share at least `VERSION_TITLE_OVERLAP` of
+    their distinctive title and file-name words (two words or more each); a document with too
+    few distinctive 4-grams is paired by its words alone. A feedback document and a document
+    that is not feedback are never paired: a review quoting what it reviews is another
+    artifact. Each document keeps its `MAX_VERSION_PARTNERS` best partners, so the pairs grow
+    linearly.
     """
     firsts: dict[str, CorpusDocument] = {}
     for d in view.citable:
         firsts.setdefault(d.reading.sha256, d)
     docs = list(firsts.values())
-    grams = [_sampled_grams(d) for d in docs]
-    words = [_name_words(d) for d in docs]
+    grams = _distinctive([_sampled_grams(d) for d in docs])
+    words = _distinctive([_name_words(d) for d in docs])
     shared_grams, shared_words = _overlaps(grams), _overlaps(words)
-    kept: set[tuple[int, int]] = set()
+    kept: dict[tuple[int, int], float] = {}
     for i, doc in enumerate(docs):
         scores: dict[int, float] = {}
         feedback = roles[doc.doc_id].is_feedback
         for j, count in shared_grams[i].items():
             if roles[docs[j].doc_id].is_feedback != feedback:
+                continue
+            if min(len(grams[i]), len(grams[j])) < VERSION_MIN_GRAMS:
                 continue
             score = max(count / len(grams[i]), count / len(grams[j]))
             if score >= VERSION_CANDIDATE_CONTAINMENT:
@@ -1209,152 +1266,220 @@ def version_candidates(
             if roles[docs[j].doc_id].is_feedback != feedback:
                 continue
             same_type = roles[doc.doc_id].deliverable_type == roles[docs[j].doc_id].deliverable_type
-            union = len(words[i] | words[j])
             if same_type and min(len(words[i]), len(words[j])) >= 2:
-                score = count / union
+                score = count / len(words[i] | words[j])
                 if score >= VERSION_TITLE_OVERLAP:
                     scores[j] = max(scores.get(j, 0.0), score)
-        best = sorted(scores, key=lambda j: (-scores[j], j))[:MAX_VERSION_PARTNERS]
-        kept.update((min(i, j), max(i, j)) for j in best)
-    return [(docs[i].doc_id, docs[j].doc_id) for i, j in sorted(kept)]
-
-
-def version_card(doc: CorpusDocument, deliverable_type: str, heading_chars: int) -> str:
-    card = doc.reading.card
-    headings = "\n".join(
-        f"- {one_line(heading_context(s.heading_path), heading_chars)}"
-        for s in doc.reading.sections[:VERSION_EVIDENCE_HEADINGS]
-    )
-    return (
-        f"=== {doc.doc_id} ===\nPath: {doc.rel_path}\nFormat: {doc.reading.format} | Pages:"
-        f" {len(doc.reading.pages)} | Date: {doc.reading.date_label or 'not stated'} |"
-        f" Type: {deliverable_type}\nTitle: {one_line(card.title, 300)}\n"
-        f"Summary: {one_line(card.summary, VERSION_SUMMARY_CHARS)}\nFirst headings:\n{headings}"
-    )
+        for j in sorted(scores, key=lambda j: (-scores[j], j))[:MAX_VERSION_PARTNERS]:
+            kept[(min(i, j), max(i, j))] = scores[j]
+    return [(docs[i].doc_id, docs[j].doc_id, kept[(i, j)]) for i, j in sorted(kept)]
 
 
 @dataclass(frozen=True)
-class VersionWindow:
-    evidence: str
-    pairs: tuple[tuple[str, str], ...]
+class VersionComponents:
+    # Each component's documents in path order, components in the path order of their first.
+    components: tuple[tuple[str, ...], ...]
+    # Each component's kept candidate pairs, in the order `version_candidates` gives them.
+    edges: tuple[tuple[tuple[str, str, float], ...], ...]
+    dropped_edges: int
 
 
-def version_windows(
-    view: CorpusView, roles: Mapping[str, ProposedRole], pairs: Sequence[tuple[str, str]]
-) -> list[VersionWindow]:
-    """Candidate pairs grouped, in order, into judge requests whose evidence (the cards of the
-    pairs' documents) fits one evidence window."""
-    windows: list[VersionWindow] = []
-    cards: dict[str, str] = {}
-    chosen: list[tuple[str, str]] = []
-    size = 0
+def version_components(
+    order: Mapping[str, int], edges: Sequence[tuple[str, str, float]]
+) -> VersionComponents:
+    """The connected components of two or more documents of the candidate pairs, none larger
+    than `MAX_VERSION_COMPONENT_DOCS`. Pairs join documents strongest first (ties in path order
+    of the pair); a pair that would join two components into one over the bound is dropped and
+    counted, so only the weakest links of a large cluster are cut. A document every pair of
+    which was dropped is in no component."""
+    parent: dict[str, str] = {}
+    size: dict[str, int] = {}
 
-    def card(doc_id: str) -> str:
-        doc = view.document(doc_id)
-        return version_card(doc, roles[doc_id].deliverable_type, 500)
+    def root(doc_id: str) -> str:
+        parent.setdefault(doc_id, doc_id)
+        size.setdefault(doc_id, 1)
+        while parent[doc_id] != doc_id:
+            doc_id = parent[doc_id]
+        return doc_id
 
-    def flush() -> None:
-        nonlocal size
-        if chosen:
-            windows.append(VersionWindow("\n\n".join(cards.values()), tuple(chosen)))
-        cards.clear()
-        chosen.clear()
-        size = 0
+    kept: list[tuple[str, str, float]] = []
+    dropped = 0
+    for a, b, score in sorted(edges, key=lambda e: (-e[2], order[e[0]], order[e[1]])):
+        ra, rb = root(a), root(b)
+        if ra != rb:
+            if size[ra] + size[rb] > MAX_VERSION_COMPONENT_DOCS:
+                dropped += 1
+                continue
+            first, second = sorted((ra, rb), key=order.__getitem__)
+            parent[second] = first
+            size[first] += size[second]
+        kept.append((a, b, score))
+    members: dict[str, list[str]] = {}
+    for doc_id in sorted(parent, key=order.__getitem__):
+        members.setdefault(root(doc_id), []).append(doc_id)
+    components = sorted((m for m in members.values() if len(m) > 1), key=lambda m: order[m[0]])
+    position = {doc_id: n for n, m in enumerate(components) for doc_id in m}
+    kept_by: list[list[tuple[str, str, float]]] = [[] for _ in components]
+    for edge in sorted(kept, key=lambda e: (order[e[0]], order[e[1]])):
+        kept_by[position[edge[0]]].append(edge)
+    return VersionComponents(
+        tuple(tuple(m) for m in components), tuple(tuple(e) for e in kept_by), dropped
+    )
 
-    for pair in pairs:
-        new = {d: card(d) for d in pair if d not in cards}
-        extra = sum(len(c) + 2 for c in new.values())
-        if chosen and (size + extra > EVIDENCE_WINDOW_CHARS or len(chosen) >= 400):
-            flush()
-            new = {d: card(d) for d in pair}
-            extra = sum(len(c) + 2 for c in new.values())
-        cards.update(new)
-        chosen.append(pair)
-        size += extra
-    flush()
-    return windows
+
+def version_date(reading: DocumentReading) -> str:
+    """The date a version card shows, with where it came from."""
+    if reading.date is not None and reading.date.basis == "printed":
+        return f"{reading.date.iso} (printed)"
+    if reading.card.doc_date:
+        return f"{one_line(reading.card.doc_date, 40)} (printed, not parsed)"
+    if reading.date is not None:
+        return f"{reading.date.iso} (file metadata)"
+    return "not stated"
 
 
 @dataclass(frozen=True)
-class FamilyOrder:
-    statuses: dict[str, tuple[VersionStatus, str | None]]
-    refusals: int
+class VersionCard:
+    """One document as a version partition request shows it, every field bounded."""
 
+    doc_id: str
+    rel_path: str
+    format: str
+    pages: int
+    date: str
+    observed_type: str
+    attributes: tuple[LocatedAttribute, ...]
+    title: str
+    summary: str
+    headings: tuple[str, ...]
 
-def order_family(
-    gateway: LanguageGateway,
-    view: CorpusView,
-    roles: Mapping[str, ProposedRole],
-    members: Sequence[str],
-) -> FamilyOrder:
-    """The version status of each member of a family of two or more, in path order.
-
-    Among distinct members (the first of byte-identical copies in path order), dates decide
-    when every member has one of the same precision and one is strictly latest; otherwise the
-    decision model compares each ordered pair, and a member that supersedes every other (each
-    forward answer at least 0.5, each reverse answer below it) is latest. Without such a
-    member, or with more than `MAX_ORDERED_FAMILY_MEMBERS` distinct members, every distinct
-    member is unordered. Every other member is superseded by the latest member, in one step;
-    in a family without one, a later copy is superseded by its first copy.
-    """
-    first_copy: dict[str, str] = {}
-    statuses: dict[str, tuple[VersionStatus, str | None]] = {}
-    for doc_id in members:
-        sha = view.document(doc_id).reading.sha256
-        if sha in first_copy:
-            statuses[doc_id] = ("superseded", first_copy[sha])
-        else:
-            first_copy[sha] = doc_id
-    distinct = list(first_copy.values())
-    latest: str | None = None
-    refusals = 0
-    dates = [view.document(d).reading.date for d in distinct]
-    if len(distinct) == 1:
-        latest = distinct[0]
-    elif all(dates) and len({len(d.iso) for d in dates if d}) == 1:
-        isos = [d.iso for d in dates if d]
-        newest = max(isos)
-        if isos.count(newest) == 1:
-            latest = distinct[isos.index(newest)]
-    if latest is None and len(distinct) <= MAX_ORDERED_FAMILY_MEMBERS:
-        evidence = "\n\n".join(
-            version_card(view.document(d), roles[d].deliverable_type, ORDERING_HEADING_CHARS)
-            for d in distinct
+    @classmethod
+    def of(cls, doc: CorpusDocument) -> VersionCard:
+        card = doc.reading.card
+        return cls(
+            doc.doc_id,
+            doc.rel_path,
+            doc.reading.format,
+            len(doc.reading.pages),
+            version_date(doc.reading),
+            card.deliverable_type,
+            card.attributes,
+            card.title,
+            card.summary,
+            tuple(s.heading_path for s in doc.reading.sections[:VERSION_EVIDENCE_HEADINGS]),
         )
-        ordered = [(a, b) for a in distinct for b in distinct if a != b]
-        answers = gateway.judge(
-            ORDER_OPERATION, evidence, [order_predicate(a, b) for a, b in ordered]
-        )
-        refusals = sum(p is None for p in answers)
-        verdict = dict(zip(ordered, answers, strict=True))
 
-        def beats(a: str, b: str) -> bool:
-            forward, reverse = verdict[(a, b)], verdict[(b, a)]
-            return (
-                forward is not None
-                and forward >= SUPPORT_THRESHOLD
-                and reverse is not None
-                and reverse < SUPPORT_THRESHOLD
+    def render(self) -> str:
+        stated = "; ".join(f"{a.name}: {a.value}" for a in self.attributes)
+        headings = "\n".join(
+            f"- {one_line(heading_context(h), VERSION_HEADING_CHARS)}" for h in self.headings
+        )
+        return (
+            f"=== {self.doc_id} ===\nPath: {one_line(self.rel_path, 300)}\n"
+            f"Format: {self.format} | Pages: {self.pages} | Date: {self.date}\n"
+            f"Observed type: {one_line(self.observed_type, 200)}\n"
+            f"Attributes: {one_line(stated or '-', VERSION_ATTRIBUTE_CHARS)}\n"
+            f"Title: {one_line(self.title, 300)}\n"
+            f"Summary: {one_line(self.summary, VERSION_SUMMARY_CHARS)}\n"
+            f"First headings:\n{headings or '- (none)'}"
+        )
+
+
+PARTITION_VERSIONS_INSTRUCTIONS = """\
+You decide which documents of one document collection are versions of one
+another. You receive compact cards of a few documents that share text or title
+words, and the candidate pairs code found with their overlap score (the share
+of distinctive word 4-grams or title words they share). Overlap only proposes a
+pair; shared templates and boilerplate also overlap.
+
+Two documents belong in one family only when they are drafts, revisions or
+format exports of the exact same deliverable artifact, for the exact same
+engagement and reporting period. Never join distinct projects, sites or clients;
+distinct phases or stages of one engagement (phase 1 and phase 2); periodic
+installments for different periods (one month's or quarter's issue and the
+next); an addendum or supplement and the base document it adds to; or a summary
+deck and the full report it summarises.
+
+families: every doc_id of the cards in exactly one family, written exactly as
+given; a document with no other version is a family of its own.
+latest_doc_id: the member that clearly supersedes every other member of its
+family, for example a final over its drafts, a higher revision number, or an
+unambiguously later printed issue date of the same deliverable. A date marked
+"(file metadata)" records when a file was saved or exported, not when the
+deliverable was issued: it never proves that one version supersedes another,
+and a newer file date never makes a draft supersede a final. When the order is
+ambiguous, give null; never guess. For a family of one, give null or its doc_id.
+"""
+
+
+@dataclass(frozen=True)
+class PartitionVersions:
+    operation: ClassVar[str] = "partition_versions"
+    output: ClassVar[type[VersionPartitionDraft]] = VersionPartitionDraft
+    effort: ClassVar[Effort] = "medium"
+    instructions: ClassVar[str] = PARTITION_VERSIONS_INSTRUCTIONS
+    image_webp: ClassVar[None] = None
+    # The component's documents in path order.
+    cards: tuple[VersionCard, ...]
+    overlaps: tuple[tuple[str, str, float], ...]
+    feedback: str | None = None
+
+    def text(self) -> str:
+        cards = "\n\n".join(c.render() for c in self.cards)
+        pairs = "\n".join(f"- {a} ~ {b}: {score:.2f}" for a, b, score in self.overlaps)
+        text = f"DOCUMENTS:\n{cards}\n\nCANDIDATE PAIRS:\n{pairs}"
+        return f"{text}\n\n{self.feedback}" if self.feedback else text
+
+
+@dataclass(frozen=True)
+class PartitionedFamily:
+    # Members in path order.
+    doc_ids: tuple[str, ...]
+    latest: str | None
+
+
+def check_partition(
+    draft: VersionPartitionDraft, component: Sequence[str]
+) -> Checked[tuple[PartitionedFamily, ...]]:
+    """Every document of the component in exactly one family, and a latest member only from
+    its own family."""
+    order = {doc_id: n for n, doc_id in enumerate(component)}
+    rejections: list[str] = []
+    placed: set[str] = set()
+    families: list[PartitionedFamily] = []
+    for family in draft.families:
+        if not family.doc_ids:
+            rejections.append("a family lists no documents")
+            continue
+        members: list[str] = []
+        for doc_id in family.doc_ids:
+            if doc_id not in order:
+                rejections.append(f"{doc_id!r} is not a document of these cards")
+            elif doc_id in placed:
+                rejections.append(f"{doc_id!r} is placed in more than one family")
+            else:
+                placed.add(doc_id)
+                members.append(doc_id)
+        latest = family.latest_doc_id
+        if latest is not None and latest not in family.doc_ids:
+            rejections.append(f"latest_doc_id {latest!r} is not a member of its family")
+        if members:
+            families.append(
+                PartitionedFamily(tuple(sorted(members, key=order.__getitem__)), latest)
             )
-
-        winners = [a for a in distinct if all(beats(a, b) for b in distinct if b != a)]
-        latest = winners[0] if len(winners) == 1 else None
-    for doc_id in members:
-        if latest is None:
-            if doc_id in distinct:
-                statuses[doc_id] = ("unordered", None)
-        elif doc_id == latest:
-            statuses[doc_id] = ("latest", None)
-        else:
-            statuses[doc_id] = ("superseded", latest)
-    return FamilyOrder(statuses, refusals)
+    missing = [d for d in component if d not in placed]
+    if missing:
+        rejections.append(f"no family lists the documents {', '.join(missing)}")
+    if rejections:
+        return Checked.reject(rejections)
+    return Checked.accept(tuple(sorted(families, key=lambda f: order[f.doc_ids[0]])))
 
 
 @dataclass(frozen=True)
 class VersionFamilies:
     # Citable document ID to (family ID, status, superseded by).
     members: dict[str, tuple[str, VersionStatus, str | None]]
-    refusals: dict[str, int]
+    dropped_edges: int
 
 
 def version_families(
@@ -1363,57 +1488,59 @@ def version_families(
     roles: Mapping[str, ProposedRole],
     pool: InductionExecutor,
 ) -> VersionFamilies:
-    """Join byte-identical documents and confirmed candidate pairs into families, and order
-    each family."""
-    pairs = version_candidates(view, roles)
-    windows = version_windows(view, roles, pairs)
+    """Partition the citable documents into version families and order each one.
 
-    def confirm(window: VersionWindow) -> list[float | None]:
-        return gateway.judge(
-            VERSION_OPERATION, window.evidence, [version_predicate(a, b) for a, b in window.pairs]
+    The first of byte-identical documents in path order represents them. Candidate pairs of
+    representatives form bounded components (`version_components`); each component of two or
+    more is partitioned by one `PartitionVersions` request. A family's ID is its first member
+    in path order, copies included. A family of one document is `sole`. When the request
+    names a latest member, or a family's only representative has copies, that member is
+    `latest` and every other member, copies included, is `superseded` by it in one step;
+    otherwise every representative is `unordered` and a copy is `superseded` by its first
+    copy.
+    """
+    copies: dict[str, list[str]] = {}
+    representative: dict[str, str] = {}
+    for doc in view.citable:
+        first = representative.setdefault(doc.reading.sha256, doc.doc_id)
+        copies.setdefault(first, []).append(doc.doc_id)
+    found = version_components(view.citable_order, version_candidates(view, roles))
+    by_component = dict(zip(found.components, found.edges, strict=True))
+
+    def partition(component: tuple[str, ...]) -> tuple[PartitionedFamily, ...]:
+        request = PartitionVersions(
+            tuple(VersionCard.of(view.document(d)) for d in component), by_component[component]
+        )
+        return generate_checked(
+            f"version partition of {', '.join(component)}",
+            lambda feedback: gateway.run(replace(request, feedback=feedback)),
+            lambda draft: check_partition(draft, component),
         )
 
-    answers = pool.map(confirm, windows)
-    parent = {d.doc_id: d.doc_id for d in view.citable}
-
-    def root(doc_id: str) -> str:
-        while parent[doc_id] != doc_id:
-            doc_id = parent[doc_id]
-        return doc_id
-
-    def join(a: str, b: str) -> None:
-        ra, rb = root(a), root(b)
-        if ra != rb:
-            first, second = sorted((ra, rb), key=view.citable_order.__getitem__)
-            parent[second] = first
-
-    for group in byte_identical_groups(view):
-        for other in group[1:]:
-            join(group[0], other)
-    confirm_refusals = 0
-    for window, probabilities in zip(windows, answers, strict=True):
-        for (a, b), probability in zip(window.pairs, probabilities, strict=True):
-            if probability is None:
-                confirm_refusals += 1
-            elif probability >= SUPPORT_THRESHOLD:
-                join(a, b)
-    families: dict[str, list[str]] = {}
-    for doc in view.citable:
-        families.setdefault(root(doc.doc_id), []).append(doc.doc_id)
-    multi = [members for members in families.values() if len(members) > 1]
-    orders = pool.map(lambda members: order_family(gateway, view, roles, members), multi)
+    partitions = pool.map(partition, found.components)
+    families = [f for p in partitions for f in p]
+    joined = {d for f in families for d in f.doc_ids}
+    families += [PartitionedFamily((d,), None) for d in copies if d not in joined]
     result: dict[str, tuple[str, VersionStatus, str | None]] = {}
-    for family_id, members in families.items():
+    for family in families:
+        members = sorted(
+            (m for d in family.doc_ids for m in copies[d]), key=view.citable_order.__getitem__
+        )
+        family_id = members[0]
         if len(members) == 1:
             result[family_id] = (family_id, "sole", None)
-    for members, order in zip(multi, orders, strict=True):
-        for doc_id in members:
-            status, superseded_by = order.statuses[doc_id]
-            result[doc_id] = (members[0], status, superseded_by)
-    return VersionFamilies(
-        result,
-        {VERSION_OPERATION: confirm_refusals, ORDER_OPERATION: sum(o.refusals for o in orders)},
-    )
+            continue
+        latest = family.doc_ids[0] if len(family.doc_ids) == 1 else family.latest
+        for rep in family.doc_ids:
+            for doc_id in copies[rep]:
+                if latest is not None:
+                    status: VersionStatus = "latest" if doc_id == latest else "superseded"
+                    result[doc_id] = (family_id, status, None if doc_id == latest else latest)
+                elif doc_id == rep:
+                    result[doc_id] = (family_id, "unordered", None)
+                else:
+                    result[doc_id] = (family_id, "superseded", rep)
+    return VersionFamilies(result, found.dropped_edges)
 
 
 # Step 4: feedback lessons.
@@ -1424,9 +1551,15 @@ post-project record about other deliverables. Extract the transferable writing
 and review lessons it records: criticisms a reviewer raised that an author
 accepted or resolved, and the resolution, stated generically so that they apply
 to a future deliverable of the reviewed types. Leave out items noted with no
-change, rejected or out of scope, and every project-specific number, name, place
-or date. For each lesson give a short statement and a quote: verbatim text of
-the sections that shows it. Give an empty list when the sections hold none.
+change, rejected or out of scope. Leave out every project-specific value: client,
+site and person names, places, fees, coordinates and project dates. Keep a
+house-wide constant when the reviewer establishes or enforces it as a rule that
+holds beyond this project: a standard instrument or equipment setting (such as a
+calibration sensitivity), a standard duration (such as a baseline period), a
+standard threshold (such as an alarm-rule percentage), or a regulatory or
+methodology clause and its required value. For each lesson give a short
+statement and a quote: verbatim text of the sections that shows it. Give an
+empty list when the sections hold none.
 """
 
 
@@ -2205,6 +2338,8 @@ def write_guide(gateway: LanguageGateway, request: WriteGuide, view: CorpusView)
 INDUCTION_EFFORTS: dict[str, str] = {
     OrganiseCorpus.operation: OrganiseCorpus.effort,
     CanonicaliseTypes.operation: CanonicaliseTypes.effort,
+    CanonicaliseFacets.operation: CanonicaliseFacets.effort,
+    PartitionVersions.operation: PartitionVersions.effort,
     ExtractFeedbackLessons.operation: ExtractFeedbackLessons.effort,
     WriteGlossary.operation: WriteGlossary.effort,
     WriteGuide.operation: WriteGuide.effort,
@@ -2305,7 +2440,6 @@ def induce(
         BIND_OPERATION: binding.refusals,
         DEFINITION_OPERATION: glossary.refusals,
         LESSON_SUPPORT_OPERATION: sum(r.refusals for r in lessons),
-        **versions.refusals,
     }
     report = BuildReport(
         discarded_unlocated_quotes=sum(d.reading.discarded_quotes for d in documents)
@@ -2316,6 +2450,7 @@ def induce(
         pruned_facet_values=list(binding.pruned_values),
         pruned_facets=list(binding.pruned_facets),
         truncated_curator_notes=organisation.truncated_notes,
+        dropped_version_edges=versions.dropped_edges,
     )
     return CorpusKnowledge(
         facets=binding.facets,

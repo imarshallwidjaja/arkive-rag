@@ -266,6 +266,26 @@ class OrganisationDraft(_Frozen):
     documents: list[DocumentRoleDraft]
 
 
+class FacetCanonicalisationDraft(_Frozen):
+    """The one facet set of a collection, canonicalised from every batch's proposals."""
+
+    facets: list[FacetDraft]
+
+
+class ProposedVersionFamily(_Frozen):
+    """Documents of one candidate component that are versions of one deliverable, and the
+    member that supersedes every other one, or None when no member clearly does."""
+
+    doc_ids: list[str]
+    latest_doc_id: str | None
+
+
+class VersionPartitionDraft(_Frozen):
+    """Every document of one candidate component placed in exactly one version family."""
+
+    families: list[ProposedVersionFamily]
+
+
 class CanonicalTypeDraft(_Frozen):
     name: str
     description: str
@@ -684,7 +704,9 @@ class BuildReport(_Frozen):
     did not confirm (dropped). `judge_refusals` counts decision questions the decision model
     refused, by operation; `pruned_facet_values` and `pruned_facets` name what binding left
     empty. `truncated_curator_notes` counts curator notes an induction prompt could not show
-    in full; the snapshot stores every note verbatim.
+    in full; the snapshot stores every note verbatim. `dropped_version_edges` counts candidate
+    version pairs left out so that no version partition request holds more than
+    `induction.MAX_VERSION_COMPONENT_DOCS` documents.
     """
 
     discarded_unlocated_quotes: int
@@ -694,6 +716,7 @@ class BuildReport(_Frozen):
     pruned_facet_values: list[str]
     pruned_facets: list[str]
     truncated_curator_notes: int
+    dropped_version_edges: int = 0
 
 
 # Compiled corpus.

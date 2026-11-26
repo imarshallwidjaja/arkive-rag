@@ -22,13 +22,17 @@ from arkive_rag.induction import (
     MAX_CURATOR_NOTES_PROMPT_CHARS,
     MAX_GUIDE_TEXT_CHARS,
     MAX_PROMPT_CHARS,
+    MAX_VERSION_COMPONENT_DOCS,
     MAX_VERSION_PARTNERS,
+    VERSION_COMMON_POSTING,
+    CanonicaliseFacets,
     CanonicaliseTypes,
     Checked,
     CorpusView,
     ExtractFeedbackLessons,
     InductionExecutor,
     OrganiseCorpus,
+    PartitionVersions,
     TypeLabel,
     WriteGlossary,
     WriteGuide,
@@ -37,11 +41,11 @@ from arkive_rag.induction import (
     check_types,
     generate_checked,
     induce,
-    merge_facets,
     term_clusters,
 )
 from arkive_rag.llm import StructuredRequest
 from arkive_rag.models import (
+    ArkiveError,
     CanonicalTypeDraft,
     CompiledCorpus,
     CorpusDocument,
@@ -50,6 +54,7 @@ from arkive_rag.models import (
     DocumentReading,
     DocumentRoleDraft,
     Facet,
+    FacetCanonicalisationDraft,
     FacetDraft,
     FacetValue,
     FacetValueDraft,
@@ -60,11 +65,13 @@ from arkive_rag.models import (
     LocatedAttribute,
     ObservationCard,
     OrganisationDraft,
+    ProposedVersionFamily,
     ReadSection,
     RejectedOutputError,
     SenseDraft,
     TermObservation,
     TypeCanonicalisationDraft,
+    VersionPartitionDraft,
     document_id,
 )
 from tests.support import (
@@ -503,83 +510,186 @@ def test_organisation_scales_in_bounded_batches_and_keeps_every_deliverable_type
     assert len(canonical.labels) == 13
 
 
-def test_merged_facets_never_mix_bindings_and_union_values_across_batches() -> None:
-    def path_facet(*folders: str) -> Facet:
-        return Facet(
+def content_facet(name: str, *values: FacetValue) -> Facet:
+    return Facet(name=name, description=f"The {name}.", binding="content", values=values)
+
+
+def facet_value(name: str, *aliases: str, folders: Sequence[str] = ()) -> FacetValue:
+    return FacetValue(value=name, description=name, aliases=aliases, folders=tuple(folders))
+
+
+SENSING = content_facet(
+    "sensing_technology", facet_value("Fibre optic", "FO"), facet_value("Vibrating wire")
+)
+MONITORING = content_facet(
+    "monitoring_technology", facet_value("fibre-optic"), facet_value("Laser scanning", "TLS")
+)
+PROJECT = Facet(
+    name="project",
+    description="Project folder.",
+    binding="path",
+    values=(facet_value("Harbour", folders=["p1"]), facet_value("Estuary", folders=["p2"])),
+)
+MERGED_TECHNOLOGY = FacetCanonicalisationDraft(
+    facets=[
+        FacetDraft(
+            name="monitoring_technology",
+            description="The sensing or monitoring method.",
+            values=[
+                value("Fibre optic", aliases=["fibre-optic", "FO"]),
+                value("Vibrating wire"),
+                value("Laser scanning", aliases=["TLS"]),
+            ],
+        ),
+        FacetDraft(
             name="project",
-            description="Folder.",
-            binding="path",
-            values=tuple(
-                FacetValue(value=f, description=f, aliases=(), folders=(f,)) for f in folders
-            ),
-        )
-
-    content_project = Facet(
-        name="project",
-        description="Read.",
-        binding="content",
-        values=(FacetValue(value="Harbour", description="h", aliases=(), folders=()),),
-    )
-    client_a = Facet(
-        name="client",
-        description="Client.",
-        binding="content",
-        values=(FacetValue(value="Northwind", description="n", aliases=("NW",), folders=()),),
-    )
-    client_b = client_a.model_copy(
-        update={
-            "values": (
-                FacetValue(value="northwind", description="n2", aliases=("NWM",), folders=()),
-                FacetValue(value="Contoso", description="c", aliases=("NW",), folders=()),
-            )
-        }
-    )
-
-    merged = merge_facets(
-        [[path_facet("p1"), client_a], [content_project, client_b], [path_facet("p2")]]
-    )
-
-    project, client = merged
-    # Two batches proposed `project` path-bound and one content-bound: path-bound wins, and
-    # the content-bound value is dropped.
-    assert (project.binding, [v.value for v in project.values]) == ("path", ["p1", "p2"])
-    # Values merge by folded label; an alias naming two values is dropped from both.
-    assert [(v.value, v.aliases) for v in client.values] == [
-        ("Northwind", ("NWM",)),
-        ("Contoso", ()),
+            description="Project folder.",
+            values=[value("Harbour", "p1"), value("Estuary", "p2")],
+        ),
     ]
-    assert merge_facets([[client_a]]) == (client_a,)
+)
 
 
-def test_aliases_two_batches_spell_differently_merge_into_one_the_snapshot_stores(
+def test_facet_proposals_keep_every_batch_facet_and_count_the_batches_proposing_it() -> None:
+    proposals = induction.facet_proposals([[SENSING, PROJECT], [MONITORING, PROJECT], [SENSING]])
+
+    assert [(p.facet, p.batches) for p in proposals] == [
+        (SENSING, 2),
+        (PROJECT, 2),
+        (MONITORING, 1),
+    ]
+    text = CanonicaliseFacets("(none)", proposals).text()
+    assert "- facet sensing_technology (content-bound; proposed by 2 batch(es))" in text
+    assert "- facet monitoring_technology (content-bound; proposed by 1 batch(es))" in text
+    assert "value 'Fibre optic' | Fibre optic | aliases: 'FO'" in text
+    assert "value 'Harbour' | Harbour | folders: [\"p1\"]" in text
+
+
+def test_synonymous_facets_of_several_batches_canonicalise_into_one_with_folder_aliases() -> None:
+    gateway = FakeGateway(facets_script=[MERGED_TECHNOLOGY])
+    notes = "### AGENTS.md\nFilter by monitoring technology."
+
+    facets = induction.canonicalise_facets(
+        gateway, notes, [[SENSING, PROJECT], [MONITORING, PROJECT]]
+    )
+
+    (request,) = gateway.of_type(CanonicaliseFacets)
+    assert request.notes == notes and "CURATOR NOTES:\n### AGENTS.md" in request.text()
+    assert [p.facet.name for p in request.proposals] == [
+        "sensing_technology",
+        "project",
+        "monitoring_technology",
+    ]
+    technology, project = facets
+    assert (technology.name, technology.binding) == ("monitoring_technology", "content")
+    assert [(v.value, v.aliases) for v in technology.values] == [
+        ("Fibre optic", ("FO", "fibre-optic")),
+        ("Vibrating wire", ()),
+        ("Laser scanning", ("TLS",)),
+    ]
+    # A path-bound value also answers to its folder paths.
+    assert [(v.value, v.aliases) for v in project.values] == [
+        ("Harbour", ("p1",)),
+        ("Estuary", ("p2",)),
+    ]
+    assert induction.INDUCTION_EFFORTS["canonicalise_facets"] == "medium"
+
+
+def test_invalid_facet_canonicalisation_is_rerun_once_then_raises() -> None:
+    invalid = FacetCanonicalisationDraft(
+        facets=[
+            FacetDraft(
+                name="technology",
+                description="Method.",
+                values=[value("Fibre optic", aliases=["FO"]), value("Laser", aliases=["fo"])],
+            ),
+            FacetDraft(
+                name="project",
+                description="Folder.",
+                values=[value("Harbour", "p1"), value("Estuary"), value("Reef", "p9")],
+            ),
+            *(
+                FacetDraft(name="technology", description="Again.", values=[value(f"v{n}")])
+                for n in range(5)
+            ),
+        ]
+    )
+    gateway = FakeGateway(facets_script=[invalid, invalid])
+
+    with pytest.raises(RejectedOutputError) as raised:
+        induction.canonicalise_facets(gateway, "(none)", [[SENSING], [MONITORING, PROJECT]])
+
+    message = str(raised.value)
+    assert "facet canonicalisation still rejected after one rerun" in message
+    assert "7 facets; give at most 6" in message
+    assert "facet 'technology': 'fo' names both 'Fibre optic' and 'Laser'" in message
+    assert "facet 'project' mixes values with folders and values without" in message
+    assert "unknown folder 'p9'" in message
+    assert "facet 'technology' is given twice" in message
+    first, rerun = gateway.of_type(CanonicaliseFacets)
+    assert first.feedback is None and rerun.feedback is not None and "p9" in rerun.feedback
+
+
+def test_facet_canonicalisation_may_use_only_folders_the_proposals_list() -> None:
+    # p3 is a real corpus folder, but no batch proposal lists it.
+    invented = FacetCanonicalisationDraft(
+        facets=[
+            FacetDraft(
+                name="project",
+                description="Project folder.",
+                values=[value("Harbour", "p1"), value("Estuary", "p2"), value("Reef", "p3")],
+            )
+        ]
+    )
+    gateway = FakeGateway(facets_script=[invented, invented])
+
+    with pytest.raises(RejectedOutputError, match="unknown folder 'p3'"):
+        induction.canonicalise_facets(gateway, "(none)", [[PROJECT]])
+
+    # Folder lists render as JSON, so a folder name holding the separator stays one folder.
+    joined = Facet(
+        name="project",
+        description="Project folder.",
+        binding="path",
+        values=(facet_value("Both", folders=["a; b", "c"]),),
+    )
+    text = CanonicaliseFacets("(none)", induction.facet_proposals([[joined]])).text()
+    assert 'folders: ["a; b", "c"]' in text
+
+
+def test_facets_are_canonicalised_for_one_batch_and_skipped_when_none_is_proposed(
     tmp_path: Path,
 ) -> None:
-    from arkive_rag.snapshot import TopicSnapshot, write_snapshot
+    gateway = FakeGateway()
+    corpus = compile_files(tmp_path, BATHYMETRY_CORPUS, gateway)
 
-    corpus = compile_files(tmp_path / "corpus", BATHYMETRY_CORPUS)
-    (client,) = [f for f in corpus.facets if f.name == "client"]
+    # One batch still sends its facets through the one canonicalisation path.
+    (request,) = gateway.of_type(CanonicaliseFacets)
+    assert [p.facet.name for p in request.proposals] == ["project", "client"]
+    assert [f.name for f in corpus.facets] == ["project", "client"]
+    silent = FakeGateway()
+    assert induction.canonicalise_facets(silent, "(none)", [[], []]) == ()
+    assert silent.calls == []
 
-    def spelled(alias: str) -> Facet:
-        return client.model_copy(
-            update={
-                "values": tuple(
-                    v.model_copy(update={"aliases": (alias,)})
-                    if v.value == "Northwind Marine"
-                    else v
-                    for v in client.values
-                )
-            }
-        )
 
-    (merged,) = merge_facets([[spelled("NM")], [spelled("nm")]])
-    # One spelling per folded alias: the snapshot keys aliases by their folded form.
-    assert [(v.value, v.aliases) for v in merged.values if v.value == "Northwind Marine"] == [
-        ("Northwind Marine", ("NM",))
-    ]
-    facets = tuple(merged if f.name == "client" else f for f in corpus.facets)
-    write_snapshot(replace(corpus, facets=facets), tmp_path / "t.arkive.db")
-    with TopicSnapshot.open(tmp_path / "t.arkive.db") as snap:
-        assert snap.resolve_filters({"client": "nm"}) == frozenset({HARBOUR_MEMO})
+def test_facet_proposals_whose_values_do_not_fit_one_request_are_refused() -> None:
+    wide = content_facet(
+        "client", *(facet_value(f"Client {n} " + "name " * 20) for n in range(1_000))
+    )
+    huge = induction.facet_proposals([[wide]])
+
+    with pytest.raises(ArkiveError, match="do not fit one canonicalisation request"):
+        induction.facet_proposal_text(huge)
+    # Value descriptions shrink before any value is left out.
+    described = content_facet(
+        "client",
+        *(
+            FacetValue(value=f"C{n}", description="d " * 500, aliases=(), folders=())
+            for n in range(300)
+        ),
+    )
+    text = induction.facet_proposal_text(induction.facet_proposals([[described]]))
+    assert len(text) <= induction.MAX_FACET_PROPOSALS_CHARS and text.count("value 'C") == 300
 
 
 def test_type_labels_must_each_map_to_exactly_one_canonical_type() -> None:
@@ -790,6 +900,19 @@ def memo_text(extra: str = "") -> list[str]:
     return [f"# Harbour survey\n\n{body}\n\n{extra}"]
 
 
+def report_roles(view: CorpusView) -> dict[str, induction.ProposedRole]:
+    return {d: induction.ProposedRole("report", False, ()) for d in view.citable_order}
+
+
+def families_of(
+    view: CorpusView, gateway: FakeGateway | None = None
+) -> Mapping[str, tuple[str, str, str | None]]:
+    with InductionExecutor(1) as pool:
+        return induction.version_families(
+            gateway or FakeGateway(), view, report_roles(view), pool
+        ).members
+
+
 def test_version_families_join_drafts_and_copies_but_keep_phases_apart() -> None:
     view = view_of(
         (
@@ -820,26 +943,26 @@ def test_version_families_join_drafts_and_copies_but_keep_phases_apart() -> None
         ),
     )
     copy, draft, final, phase1, phase2 = (d.doc_id for d in view.citable)
-    roles = {d: induction.ProposedRole("report", False, ()) for d in view.citable_order}
     gateway = FakeGateway()
 
-    with InductionExecutor(2) as pool:
-        families = induction.version_families(gateway, view, roles, pool)
+    families = families_of(view, gateway)
 
-    # The two byte-identical copies join without a question. The other four share most of
-    # their text, so every pair of them is a candidate; the decision model keeps only the
+    # The two byte-identical copies join without a question; the partition keeps only the
     # drafts of one deliverable together, and every superseded member names the latest.
-    assert families.members == {
+    assert families == {
         copy: (copy, "latest", None),
         draft: (copy, "superseded", copy),
         final: (copy, "superseded", copy),
         phase1: (phase1, "sole", None),
         phase2: (phase2, "sole", None),
     }
-    # Dates ordered the two distinct members; no ordering question was needed.
-    assert not [op for op, *_ in gateway.judged if op == "order_versions"]
-    confirm = [p for op, _, ps in gateway.judged if op == "confirm_versions" for p in ps]
-    assert len(confirm) == 6 and "not a follow-on phase" in confirm[0]
+    # The four distinct documents share most of their text: one component, one request,
+    # showing each distinct document once and no decision question.
+    (request,) = gateway.of_type(PartitionVersions)
+    assert [c.doc_id for c in request.cards] == [copy, draft, phase1, phase2]
+    assert len(request.overlaps) == 6 and all(score > 0.35 for *_, score in request.overlaps)
+    assert "distinct phases or stages of one engagement" in request.instructions
+    assert gateway.judged == []
 
 
 def test_byte_identical_documents_are_one_family_and_every_member_names_the_latest() -> None:
@@ -854,11 +977,9 @@ def test_byte_identical_documents_are_one_family_and_every_member_names_the_late
         ("exports/export.md", first),
     )
     report_v1, archive, copy, report_v2, export = (d.doc_id for d in view.citable)
-    roles = {d: induction.ProposedRole("report", False, ()) for d in view.citable_order}
     gateway = FakeGateway()
 
-    with InductionExecutor(1) as pool:
-        members = induction.version_families(gateway, view, roles, pool).members
+    members = families_of(view, gateway)
 
     # Two words share no 4-gram and their names no word, yet the same bytes are one artifact.
     assert members[archive] == (archive, "latest", None)
@@ -867,9 +988,9 @@ def test_byte_identical_documents_are_one_family_and_every_member_names_the_late
     assert members[report_v1] == (report_v1, "superseded", report_v2)
     assert members[copy] == (report_v1, "superseded", report_v2)
     assert members[report_v2] == (report_v1, "latest", None)
-    # Byte-identical pairs reach no decision question.
-    confirm = [p for op, _, ps in gateway.judged if op == "confirm_versions" for p in ps]
-    assert not [p for p in confirm if export in p or copy in p]
+    # Only the first of byte-identical documents reaches a partition request.
+    (request,) = gateway.of_type(PartitionVersions)
+    assert [c.doc_id for c in request.cards] == [report_v1, report_v2]
 
 
 def test_a_review_is_never_a_version_candidate_of_what_it_reviews() -> None:
@@ -887,7 +1008,7 @@ def test_a_review_is_never_a_version_candidate_of_what_it_reviews() -> None:
     assert induction.version_candidates(view, roles) == []
 
 
-def test_version_order_without_dates_asks_the_judge_and_stays_unordered_without_a_winner() -> None:
+def test_version_partition_orders_by_version_and_leaves_ambiguous_families_unordered() -> None:
     undated = view_of(
         ("a/report.md", reading(memo_text("One."), title="Survey Report v1", sha256="a" * 64)),
         ("b/report.md", reading(memo_text("Two."), title="Survey Report v2", sha256="b" * 64)),
@@ -900,42 +1021,278 @@ def test_version_order_without_dates_asks_the_judge_and_stays_unordered_without_
         ),
     )
 
-    def families(view: CorpusView) -> Mapping[str, tuple[str, str, str | None]]:
-        roles = {d: induction.ProposedRole("report", False, ()) for d in view.citable_order}
-        with InductionExecutor(1) as pool:
-            return induction.version_families(FakeGateway(), view, roles, pool).members
-
     first, second = (d.doc_id for d in undated.citable)
-    assert families(undated) == {
+    assert families_of(undated) == {
         first: (first, "superseded", second),
         second: (first, "latest", None),
     }
-    # One member is undated, so dates cannot decide; no version token lets the judge decide.
+    # One member is undated and neither has a version token: the partition names no latest
+    # member, so neither is guessed.
     one, two = (d.doc_id for d in unversioned.citable)
-    assert families(unversioned) == {one: (one, "unordered", None), two: (one, "unordered", None)}
+    assert families_of(unversioned) == {
+        one: (one, "unordered", None),
+        two: (one, "unordered", None),
+    }
+
+
+def metadata_dated(doc: DocumentReading, iso: str) -> DocumentReading:
+    return doc.model_copy(update={"date": DocumentDate(iso=iso, basis="metadata")})
+
+
+def test_a_newer_file_metadata_date_never_supersedes_a_version() -> None:
+    final = metadata_dated(reading(memo_text("Final."), title="Survey Report"), "2025-01-10")
+    draft = metadata_dated(reading(memo_text("Draft."), title="Survey Report"), "2025-06-30")
+    view = view_of(("a/report-final.md", final), ("b/report-draft.md", draft))
+    final_id, draft_id = (d.doc_id for d in view.citable)
+    gateway = FakeGateway()
+
+    members = families_of(view, gateway)
+
+    # Every member has a date of one precision and one is strictly latest, but file metadata
+    # proves no supersession: the family stays unordered.
+    assert members == {
+        final_id: (final_id, "unordered", None),
+        draft_id: (final_id, "unordered", None),
+    }
+    (request,) = gateway.of_type(PartitionVersions)
+    assert [c.date for c in request.cards] == [
+        "2025-01-10 (file metadata)",
+        "2025-06-30 (file metadata)",
+    ]
+    assert "Date: 2025-06-30 (file metadata)" in request.text()
+    assert "never proves that one version supersedes another" in request.instructions
+    assert induction.version_date(reading(["x"], date="2025-03")) == "2025-03 (printed)"
+    printed_text = reading(["x"]).model_copy(
+        update={"card": reading(["x"]).card.model_copy(update={"doc_date": "Spring 2025"})}
+    )
+    assert induction.version_date(printed_text) == "Spring 2025 (printed, not parsed)"
+    assert induction.version_date(reading(["x"])) == "not stated"
+
+
+def partition(*families: tuple[Sequence[str], str | None]) -> VersionPartitionDraft:
+    return VersionPartitionDraft(
+        families=[
+            ProposedVersionFamily(doc_ids=list(ids), latest_doc_id=latest)
+            for ids, latest in families
+        ]
+    )
+
+
+def test_a_partition_must_place_every_document_once_and_name_a_latest_member_of_its_family() -> (
+    None
+):
+    component = ["doc_a", "doc_b", "doc_c"]
+
+    def rejections(draft: VersionPartitionDraft) -> tuple[str, ...]:
+        checked = induction.check_partition(draft, component)
+        assert checked.result is None
+        return checked.rejections
+
+    accepted = induction.check_partition(
+        partition((["doc_c", "doc_a"], "doc_c"), (["doc_b"], None)), component
+    ).result
+    assert accepted == (
+        induction.PartitionedFamily(("doc_a", "doc_c"), "doc_c"),
+        induction.PartitionedFamily(("doc_b",), None),
+    )
+    assert rejections(partition((["doc_a", "doc_b"], None))) == (
+        "no family lists the documents doc_c",
+    )
+    assert "'doc_b' is placed in more than one family" in rejections(
+        partition((["doc_a", "doc_b"], None), (["doc_b", "doc_c"], None))
+    )
+    assert "'doc_x' is not a document of these cards" in rejections(
+        partition((["doc_a", "doc_b", "doc_c", "doc_x"], None))
+    )
+    assert "latest_doc_id 'doc_c' is not a member of its family" in rejections(
+        partition((["doc_a", "doc_b"], "doc_c"), (["doc_c"], None))
+    )
+    assert "a family lists no documents" in rejections(partition((component, None), ([], None)))
+
+
+def test_an_invalid_partition_is_rerun_once_then_raises() -> None:
+    view = view_of(
+        ("a/report.md", reading(memo_text("One."), title="Survey Report v1")),
+        ("b/report.md", reading(memo_text("Two."), title="Survey Report v2")),
+    )
+    first, _ = (d.doc_id for d in view.citable)
+    missing = partition(([first], None))
+    gateway = FakeGateway(versions_script=[missing, missing])
+
+    with pytest.raises(RejectedOutputError, match=r"version partition of .* still rejected"):
+        families_of(view, gateway)
+
+    initial, rerun = gateway.of_type(PartitionVersions)
+    assert initial.feedback is None and rerun.feedback is not None
+    assert "no family lists the documents" in rerun.feedback
+
+
+def test_families_from_a_partition_keep_every_snapshot_family_invariant(tmp_path: Path) -> None:
+    from arkive_rag.snapshot import TopicSnapshot, write_snapshot
+
+    body = " ".join(f"Gauge {i} was read at the north abutment every hour." for i in range(60))
+    files = {
+        "a/report.md": f"# Bridge Report\n\n{body}\n\nFinal.",
+        "b/report-copy.md": f"# Bridge Report\n\n{body}\n\nFinal.",
+        "c/report-draft.md": f"# Bridge Report\n\n{body}\n\nDraft.",
+    }
+    report, copy, draft = (document_id(p) for p in files)
+    outcomes = {
+        None: {
+            report: ("unordered", None),
+            copy: ("superseded", report),
+            draft: ("unordered", None),
+        },
+        report: {
+            report: ("latest", None),
+            copy: ("superseded", report),
+            draft: ("superseded", report),
+        },
+    }
+    for latest, expected in outcomes.items():
+        root = tmp_path / str(latest)
+        gateway = FakeGateway(versions_script=[partition(([draft, report], latest))])
+        corpus = compile_files(root / "corpus", files, gateway)
+        roles = {d.doc_id: d.role for d in corpus.documents}
+
+        assert {d: (r.version_status, r.superseded_by) for d, r in roles.items()} == expected
+        assert {r.family_id for r in roles.values()} == {report}
+        write_snapshot(corpus, root / "t.arkive.db")
+        with TopicSnapshot.open(root / "t.arkive.db") as snap:
+            assert snap.document(draft).version_status == expected[draft][0]
+
+
+def project_report(n: int, template: str, own: str, title: str) -> tuple[str, DocumentReading]:
+    return (f"p{n:02d}/report.md", reading([f"{template}\n\n{own}"], title=title))
+
+
+def test_boilerplate_shared_across_projects_proposes_no_version_pair() -> None:
+    # A long house template every project report repeats, more than VERSION_COMMON_POSTING times.
+    template = " ".join(f"Standard clause {i} of the house terms applies here." for i in range(60))
+    projects = VERSION_COMMON_POSTING + 2
+
+    def own(n: int) -> str:
+        return " ".join(f"site{n} finding{i} recorded at bay{n}x{i} today" for i in range(30))
+
+    view = view_of(
+        *(
+            project_report(n, template, own(n), f"Assessment {chr(65 + n)}")
+            for n in range(projects)
+        ),
+        ("zz/harbour-study-v1.md", reading([f"{template}\n\n{own(99)}"], title="Harbour Study v1")),
+        (
+            "zz/harbour-study-v2.md",
+            reading([f"{template}\n\n{own(99)} Revised."], title="Harbour Study v2"),
+        ),
+    )
+    v1, v2 = (d.doc_id for d in view.citable[-2:])
+
+    pairs = induction.version_candidates(view, report_roles(view))
+
+    # Only the two versions share distinctive text; the template counts in neither part of a
+    # score, so it neither proposes the project reports nor dilutes the real pair.
+    assert [(a, b) for a, b, _ in pairs] == [(v1, v2)]
+    assert pairs[0][2] > 0.9
+
+
+def test_oversized_components_drop_their_weakest_pairs_deterministically() -> None:
+    order = {f"d{n:02d}": n for n in range(20)}
+    # A chain d00 - d01 - ... - d19, its link d09 - d10 the weakest.
+    chain = [(f"d{n:02d}", f"d{n + 1:02d}", 0.2 if n == 9 else 0.9) for n in range(19)]
+
+    found = induction.version_components(order, chain)
+
+    assert found.dropped_edges == 1
+    assert found.components == (
+        tuple(f"d{n:02d}" for n in range(10)),
+        tuple(f"d{n:02d}" for n in range(10, 20)),
+    )
+    assert all((a, b) != ("d09", "d10") for edges in found.edges for a, b, _ in edges)
+    assert induction.version_components(order, list(reversed(chain))) == found
+    # Equal scores: pairs join in path order until a component would pass the bound.
+    flat = [(a, b, 0.5) for a, b, _ in chain]
+    capped = induction.version_components(order, flat)
+    assert [len(c) for c in capped.components] == [MAX_VERSION_COMPONENT_DOCS, 4]
+    assert capped.dropped_edges == 1
+
+
+def test_a_document_cut_off_by_the_component_bound_is_sole_without_a_partition_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    count = MAX_VERSION_COMPONENT_DOCS + 1
+    view = view_of(
+        *(
+            (f"r{n:02d}/report.md", reading(memo_text(f"Ring {n}."), title=f"Ring {n}"))
+            for n in range(count)
+        )
+    )
+    ids = list(view.citable_order)
+    # Equal scores join in path order, so the pair reaching the 17th document is dropped.
+    chain = [(ids[n], ids[n + 1], 0.5) for n in range(count - 1)]
+    monkeypatch.setattr(induction, "version_candidates", lambda view, roles: chain)
+    gateway = FakeGateway()
+
+    with InductionExecutor(1) as pool:
+        found = induction.version_families(gateway, view, report_roles(view), pool)
+
+    assert found.dropped_edges == 1
+    assert induction.version_components(view.citable_order, chain).components == (
+        tuple(ids[:MAX_VERSION_COMPONENT_DOCS]),
+    )
+    (request,) = gateway.of_type(PartitionVersions)
+    assert len(request.cards) == MAX_VERSION_COMPONENT_DOCS
+    assert found.members[ids[-1]] == (ids[-1], "sole", None)
+
+
+def test_a_build_reports_the_version_pairs_it_dropped_to_bound_each_partition() -> None:
+    def block(k: int) -> str:
+        return " ".join(f"block{k} word{i} at ring{k}x{i}" for i in range(40))
+
+    # Each report shares a block with the next, so they chain into one component of 20.
+    view = view_of(
+        *(
+            (
+                f"r{n:02d}/report.md",
+                reading([f"{block(n)} {block(n + 1)}"], title=f"Ring {chr(65 + n)}"),
+            )
+            for n in range(20)
+        )
+    )
+    gateway = FakeGateway()
+
+    knowledge = induce(view.documents, [], gateway, topic="t", max_concurrency=1)
+
+    requests = gateway.of_type(PartitionVersions)
+    assert knowledge.report.dropped_version_edges >= 1
+    assert sum(len(r.cards) for r in requests) == 20
+    assert max(len(r.cards) for r in requests) <= MAX_VERSION_COMPONENT_DOCS
+    assert max(prompt_chars(r) for r in requests) <= MAX_PROMPT_CHARS
+    assert induction.INDUCTION_EFFORTS["partition_versions"] == "medium"
 
 
 def test_version_candidates_keep_a_bounded_number_of_partners_per_document() -> None:
+    documents = VERSION_COMMON_POSTING
     view = view_of(
         *(
             (
                 f"p{n:02d}/report.md",
                 reading(memo_text(f"Copy {n}."), title="Same report", sha256=f"{n:064d}"),
             )
-            for n in range(20)
+            for n in range(documents)
         )
     )
-    roles = {d: induction.ProposedRole("report", False, ()) for d in view.citable_order}
 
-    pairs = induction.version_candidates(view, roles)
+    pairs = induction.version_candidates(view, report_roles(view))
 
     partners: dict[str, int] = {}
-    for a, b in pairs:
+    for a, b, _ in pairs:
         partners[a] = partners.get(a, 0) + 1
         partners[b] = partners.get(b, 0) + 1
     # Every document keeps its best MAX_VERSION_PARTNERS; a pair kept by either side stays.
-    assert len(pairs) <= 20 * MAX_VERSION_PARTNERS
-    assert all(a < b for a, b in ((view.citable_order[x], view.citable_order[y]) for x, y in pairs))
+    assert len(pairs) <= documents * MAX_VERSION_PARTNERS
+    assert all(
+        a < b for a, b in ((view.citable_order[x], view.citable_order[y]) for x, y, _ in pairs)
+    )
     assert min(partners.values()) >= MAX_VERSION_PARTNERS
 
 
@@ -1093,6 +1450,17 @@ def test_lessons_with_blank_statements_or_none_located_are_rejected() -> None:
     assert "accepted or resolved, not one they rejected" in induction.lesson_predicate("x")
 
 
+def test_lesson_instructions_strip_project_values_but_keep_house_wide_constants() -> None:
+    instructions = " ".join(ExtractFeedbackLessons.instructions.split())
+
+    assert "Leave out every project-specific value: client, site and person names" in instructions
+    assert "fees, coordinates and project dates" in instructions
+    assert "Keep a house-wide constant when the reviewer establishes or enforces it" in instructions
+    for constant in ("calibration sensitivity", "baseline period", "alarm-rule percentage"):
+        assert constant in instructions
+    assert "regulatory or methodology clause and its required value" in instructions
+
+
 def test_a_superseded_review_gives_no_lessons(tmp_path: Path) -> None:
     def review(version: str, date: str, comment: str) -> str:
         return (
@@ -1218,9 +1586,40 @@ def test_every_induction_request_stays_within_the_prompt_bound_on_its_rerun() ->
         )
     )
     (cluster,) = term_clusters(glossary_view)
+    # Facet proposals with as many values as one request lists, and a partition request of the
+    # largest component, every card field and pair at its longest.
+    proposed_values = induction.facet_proposals(
+        [
+            [
+                content_facet(
+                    f"facet_{n}",
+                    *(facet_value(f"value {n} {k}", f"alias {k}", folders=[]) for k in range(130)),
+                )
+                for n in range(6)
+            ]
+        ]
+    )
+    cards = tuple(
+        induction.VersionCard(
+            f"doc_{n:010d}",
+            "folder/" * 400,
+            "pdf",
+            900,
+            "2025-01-01 (printed)",
+            "type " * 400,
+            (LocatedAttribute(name="client", value="c " * 500, section_ordinal=1),) * 40,
+            "title " * 400,
+            "summary " * 2_000,
+            ("heading " * 400,) * 12,
+        )
+        for n in range(MAX_VERSION_COMPONENT_DOCS)
+    )
+    overlaps = tuple((a.doc_id, b.doc_id, 0.123456) for a, b in itertools.combinations(cards, 2))
     requests: list[Any] = [
         OrganiseCorpus(folders, notes, induction.digest_batches(digests)[0], "batch 1 of 9"),
         CanonicaliseTypes(labels),
+        CanonicaliseFacets(notes, proposed_values),
+        PartitionVersions(cards, overlaps),
         WriteGuide(
             "t",
             notes,
@@ -1277,6 +1676,7 @@ def test_every_induction_request_stays_within_the_prompt_bound_on_its_rerun() ->
     assert len(odd_cluster.render()) < 12_000
     assert all(q.defines for q in cluster.quotes)
     assert len(feedback) <= induction.MAX_REJECTION_FEEDBACK_CHARS
+    assert len(induction.facet_proposal_text(proposed_values)) > 40_000
     for request in requests:
         for rerun in (request, replace(request, feedback=feedback)):
             assert prompt_chars(rerun) <= MAX_PROMPT_CHARS, type(request).__name__
