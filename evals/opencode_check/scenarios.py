@@ -37,6 +37,7 @@ ArkiveTool = Literal[
     "get_document_outline",
     "search",
     "grep",
+    "query_tables",
     "read_section",
     "view_page",
     "lookup_glossary",

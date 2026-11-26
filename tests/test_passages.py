@@ -211,7 +211,7 @@ def test_one_table_parser_reads_cells_captions_and_abridges_long_tables() -> Non
     assert rendered.splitlines()[0] == "| Gauge | Level \\| datum |"
     assert split_table_cells("| a \\| b | c \\|") == ["a \\| b", "c \\|"]
     assert [(t.caption, t.headers, t.rows) for t in tables(markdown)] == [
-        ("Gauge readings", ("Gauge", "Level \\| datum"), (("North quay", "3.2"), ("South", ""))),
+        ("Gauge readings", ("Gauge", "Level | datum"), (("North quay", "3.2"), ("South", ""))),
         (None, ("x", "y"), (("1", "2"),)),
     ]
     long = render_table(("n",), [(str(i),) for i in range(10)])

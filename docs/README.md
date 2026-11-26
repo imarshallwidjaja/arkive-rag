@@ -24,7 +24,7 @@ Engineering detail, full benchmark tables, and the contributor specification.
 | Document | Covers |
 | --- | --- |
 | [Appendix A: Parsing, induction, and build pipeline](appendices/build-and-parsing.md) | The three build passes, limits, caching, snapshot contents, build model calls, and a worked example. |
-| [Appendix B: MCP tools, drafting packet, and cost scaling](appendices/mcp-tools-and-drafting.md) | All ten tools and their bounds, hybrid search, `prepare_draft` packing, model prices, and scaling. |
+| [Appendix B: MCP tools, drafting packet, and cost scaling](appendices/mcp-tools-and-drafting.md) | All eleven tools and their bounds, hybrid search, `prepare_draft` packing, model prices, and scaling. |
 | [Appendix C: Evaluation harness and full benchmark tables](appendices/evaluation-benchmarks.md) | The evaluation layers, the four collections, every result table, and the commands to run it. |
 | [Architecture and verification reference](architecture.md) | Modules, schema invariants, validation, error handling, and repository verification gates. |
 

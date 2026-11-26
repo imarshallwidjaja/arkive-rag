@@ -31,15 +31,18 @@ from arkive_rag.models import (
     CuratorNote,
     DeliverableType,
     DeliverableTypeSummary,
+    DocumentAttribute,
     DocumentInfo,
     DocumentListItem,
     DocumentOutline,
     DocumentPage,
+    DocumentProvenance,
     DraftCandidate,
     DraftExemplar,
     DraftPacket,
     ExemplarSection,
     Facet,
+    FacetGuide,
     FacetSummary,
     FacetValue,
     FamilyRecurrence,
@@ -48,19 +51,25 @@ from arkive_rag.models import (
     GlossaryLookup,
     GlossaryTermSummary,
     GrepMatch,
+    GrepResult,
     InvalidFilterError,
     NotFoundError,
     PageVisualView,
     ProviderError,
     SearchHit,
+    SearchResult,
     SectionOutlineItem,
     SectionReadView,
     SnapshotIntegrityError,
     SupplementalSection,
+    TableQueryItem,
+    TableQueryResult,
+    TableRowView,
     TopicGuide,
     TopicPage,
     TopicSummary,
     UnsafePathError,
+    VersionScope,
     choices,
     corpus_fingerprint,
     echoed,
@@ -69,7 +78,7 @@ from arkive_rag.models import (
     heading_context,
     parse_printed_date,
 )
-from arkive_rag.passages import without_asides
+from arkive_rag.passages import table_header_lines, tables, without_asides
 
 SCHEMA_VERSION = "7.0"
 RRF_K = 60.0
@@ -158,11 +167,39 @@ BOUNDARY_SECTIONS = 2
 # many per exemplar, so recurring and boundary sections keep their priority.
 MATCHED_CHUNK_RANKS = 60
 MATCHED_SECTIONS = 6
+# A listed document shows at most this many of its attributes within this many bytes, an
+# outline the attributes that fit `OUTLINE_ATTRIBUTES_MAX_BYTES`; each name is cut to
+# `ATTRIBUTE_NAME_CHARS` and each value to `ATTRIBUTE_VALUE_CHARS`.
+LIST_ATTRIBUTES = 12
+LIST_ATTRIBUTES_MAX_BYTES = 4_000
+OUTLINE_ATTRIBUTES_MAX_BYTES = 8_000
+ATTRIBUTE_NAME_CHARS = 120
+ATTRIBUTE_VALUE_CHARS = 300
+# A grep match in a table body row is shown after the table's header row, cut to this length.
+GREP_TABLE_HEADER_CHARS = 200
+# `query_tables`: at most this many tables per page, column patterns per request, columns and
+# rows per table (the rows also within `TABLE_QUERY_ROWS_MAX_BYTES`), with the caption cut to
+# `TITLE_CHARS`, header cells to `TABLE_HEADER_CHARS` and body cells to `TABLE_CELL_CHARS`, so
+# one wide or long table cannot fill a page alone.
+MAX_TABLE_QUERY = 50
+MAX_TABLE_COLUMN_PATTERNS = 20
+MAX_TABLE_QUERY_COLUMNS = 24
+MAX_TABLE_QUERY_ROWS = 20
+TABLE_QUERY_ROWS_MAX_BYTES = 12_000
+TABLE_HEADER_CHARS = 120
+TABLE_CELL_CHARS = 300
 
 DRAFTING_GUIDANCE = """\
-- Take every fact, measurement, date, quantity, parameter, personnel list and deliverable
-  file name for the new work only from the user's inputs. Enumerate listed items in full and
-  never invent unstated measurements or results.
+- Take every project-specific fact (client, site, dates, measured values, quantities, fees,
+  serial numbers, coordinates, personnel lists and deliverable file names) for the new work
+  only from the user's inputs. Enumerate listed items in full and never invent unstated
+  measurements or results.
+- Carry house-wide equipment, methodology and standard technical constants (such as a
+  standard reference constant, specification, threshold or default procedure) into the
+  draft when they appear identically across independent version families or in the lessons,
+  unless the user's inputs give a different value for this project, which always wins. A
+  value or clause held by only one version family (corpus_family_count 1) is not a house
+  constant.
 - Reproduce the collection's house wording (organisation and tool background, standard
   methodology explanations, equations, literature references, generic table column headers,
   acknowledgements, legal disclaimers and standing technical caveats) with its established
@@ -249,6 +286,22 @@ CREATE TABLE cluster_sections (
 CREATE VIRTUAL TABLE chunks_fts USING fts5(
     chunk_id UNINDEXED, content_norm, breadcrumb_norm,
     tokenize='porter unicode61 remove_diacritics 2');
+CREATE TABLE document_attributes (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id), ordinal INTEGER NOT NULL,
+    name TEXT NOT NULL, value TEXT NOT NULL,
+    section_id TEXT NOT NULL REFERENCES sections(section_id), PRIMARY KEY (doc_id, ordinal));
+CREATE TABLE document_tables (
+    table_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL REFERENCES documents(doc_id),
+    section_id TEXT NOT NULL REFERENCES sections(section_id), ordinal INTEGER NOT NULL,
+    page_start INTEGER NOT NULL, page_end INTEGER NOT NULL, heading_path TEXT NOT NULL,
+    caption TEXT, headers_json TEXT NOT NULL, column_count INTEGER NOT NULL,
+    row_count INTEGER NOT NULL);
+CREATE TABLE table_rows (
+    table_id TEXT NOT NULL REFERENCES document_tables(table_id), row_ordinal INTEGER NOT NULL,
+    cells_json TEXT NOT NULL, PRIMARY KEY (table_id, row_ordinal));
+CREATE VIRTUAL TABLE table_rows_fts USING fts5(
+    table_id UNINDEXED, row_ordinal UNINDEXED, header_norm, cells_norm,
+    tokenize='porter unicode61 remove_diacritics 2');
 """
 # Every table a snapshot of this schema holds; `TopicSnapshot.open` requires each one.
 TABLES = frozenset(re.findall(r"CREATE (?:VIRTUAL )?TABLE (\w+)", SCHEMA))
@@ -276,10 +329,22 @@ _FOLDERS: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
 _SETTINGS: TypeAdapter[dict[str, Any]] = TypeAdapter(dict[str, Any])
 _TYPES: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
 _TEXT: TypeAdapter[str] = TypeAdapter(str)
+_CELLS: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
 
 
 def _nfkc(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
+
+
+def _row_norm(cells: Sequence[str]) -> str:
+    """A table row's cells as `table_rows_fts` indexes them."""
+    return _nfkc(" | ".join(cells))
+
+
+def _indexed_rows(rows: Sequence[Sequence[str]]) -> list[tuple[int, str]]:
+    """The `table_rows_fts` entries of a table's body rows: (row ordinal, cells), or one entry
+    numbered 0 with no cells for a table without body rows, so its header is searchable."""
+    return [(n, _row_norm(cells)) for n, cells in enumerate(rows, start=1)] or [(0, "")]
 
 
 def build_fts5_query(raw_query: str) -> str | None:
@@ -483,6 +548,46 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
                     for s in doc.sections
                 ],
             )
+            db.executemany(
+                "INSERT INTO document_attributes VALUES (?, ?, ?, ?, ?)",
+                [
+                    (doc.doc_id, i, a.name, a.value, a.section_id)
+                    for i, a in enumerate(doc.attributes, start=1)
+                ],
+            )
+            for s in doc.sections:
+                for table_ordinal, table in enumerate(tables(s.markdown), start=1):
+                    table_id = f"{s.section_id}_tbl_{table_ordinal:03d}"
+                    db.execute(
+                        "INSERT INTO document_tables VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            table_id,
+                            doc.doc_id,
+                            s.section_id,
+                            table_ordinal,
+                            s.page_start,
+                            s.page_end,
+                            s.heading_path,
+                            table.caption,
+                            json.dumps(list(table.headers)),
+                            len(table.headers),
+                            len(table.rows),
+                        ),
+                    )
+                    db.executemany(
+                        "INSERT INTO table_rows VALUES (?, ?, ?)",
+                        [
+                            (table_id, row_ordinal, json.dumps(list(cells)))
+                            for row_ordinal, cells in enumerate(table.rows, start=1)
+                        ],
+                    )
+                    db.executemany(
+                        "INSERT INTO table_rows_fts VALUES (?, ?, ?, ?)",
+                        [
+                            (table_id, row_ordinal, _row_norm(table.headers), cells_norm)
+                            for row_ordinal, cells_norm in _indexed_rows(table.rows)
+                        ],
+                    )
             for chunk in doc.chunks:
                 vector = corpus.embeddings[row].astype(np.float32).tobytes()
                 row += 1
@@ -540,8 +645,12 @@ def _populate(db: sqlite3.Connection, corpus: CompiledCorpus) -> None:
             )
 
 
-def _snippet(line: str, needle: str) -> str:
-    """At most SNIPPET_CHARS of `line` centred on the first match, `...` where clipped."""
+def _snippet(line: str, needle: str, table_header: str | None = None) -> str:
+    """At most SNIPPET_CHARS of `line` centred on the first match, `...` where clipped,
+    after the line's table header row cut to `GREP_TABLE_HEADER_CHARS` when it has one."""
+    if table_header is not None:
+        header = _clipped(table_header.strip(), GREP_TABLE_HEADER_CHARS)
+        return f"{header}\n{_snippet(line, needle)}"
     if len(line) <= SNIPPET_CHARS:
         return line.strip()
     # Folding can change lengths (NFKC, casefold), so find the shortest original
@@ -570,9 +679,12 @@ _FROM_CHUNKS = """FROM chunks c JOIN sections s ON s.section_id = c.section_id
 @dataclass(frozen=True)
 class _GrepSection:
     fields: dict[str, Any]
+    section_id: str
     doc_id: str
     lines: tuple[str, ...]
     normalized: tuple[str, ...]
+    # The header row line of the table each table body line belongs to, by line index.
+    table_headers: dict[int, str]
 
 
 @dataclass(frozen=True)
@@ -588,6 +700,18 @@ class _SectionRow:
 
 
 @dataclass(frozen=True)
+class _Table:
+    """One `document_tables` row with its body rows, each padded to the header's width."""
+
+    table_id: str
+    doc_id: str
+    section_id: str
+    caption: str | None
+    headers: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
 class _Ranking:
     """One query's channels over the candidate chunks, keyed by chunk row index."""
 
@@ -598,18 +722,14 @@ class _Ranking:
     order: list[int]
 
 
-def response_text(result: BaseModel | Sequence[BaseModel]) -> str:
-    """The one text block an MCP client reads for a tool result: the result as compact JSON,
-    a list as one JSON array. The MCP server renders every structured result with this
-    function, so a result that `fits_response` reaches the client whole."""
-    if isinstance(result, BaseModel):
-        return result.model_dump_json()
-    return f"[{','.join(item.model_dump_json() for item in result)}]"
+def response_text(result: BaseModel) -> str:
+    """The one text block an MCP client reads for a tool result: the result as compact JSON.
+    The MCP server renders every structured result with this function, so a result that
+    `fits_response` reaches the client whole."""
+    return result.model_dump_json()
 
 
-def fits_response(
-    result: BaseModel | Sequence[BaseModel], *, max_bytes: int = RESPONSE_MAX_BYTES
-) -> bool:
+def fits_response(result: BaseModel, *, max_bytes: int = RESPONSE_MAX_BYTES) -> bool:
     """Whether `response_text(result)` is within `max_bytes` UTF-8 bytes and
     `RESPONSE_MAX_LINES` lines."""
     text = response_text(result)
@@ -625,7 +745,7 @@ def _json_bytes(value: BaseModel | str) -> int:
 
 def _most_that_fit(
     most: int,
-    make: Callable[[int], BaseModel | Sequence[BaseModel]],
+    make: Callable[[int], BaseModel],
     what: str,
     *,
     max_bytes: int = RESPONSE_MAX_BYTES,
@@ -805,7 +925,9 @@ class TopicSnapshot:
         for section in sections:
             self._doc_sections.setdefault(section.doc_id, []).append(section)
         self._load_families()
+        self._load_attributes(db)
         self._load_knowledge(db)
+        self._load_tables(db)
         # Chunks and sections load in path order (document ordinal, then their own ordinal),
         # the order `list_documents` gives. A chunk's row index is its tie-break in every
         # ranking, so ties never fall to the hash order of document IDs.
@@ -837,9 +959,11 @@ class TopicSnapshot:
                     "page_start": s.page_start,
                     "page_end": s.page_end,
                 },
+                s.section_id,
                 s.doc_id,
                 tuple(lines := s.markdown.split("\n")),
                 tuple(fold_text(line) for line in lines),
+                table_header_lines(lines),
             )
             for s in sections
         ]
@@ -876,6 +1000,9 @@ class TopicSnapshot:
                 "is_feedback": bool(fields.pop("is_feedback")),
                 "feedback_for_types": _TYPES.validate_json(fields.pop("feedback_for_json")),
                 "facets": self.facets_of(row["doc_id"]),
+                # Filled by `_load_attributes` once every document and section is loaded.
+                "superseded_doc_ids": [],
+                "attributes": [],
             }
         )
 
@@ -983,6 +1110,148 @@ class TopicSnapshot:
             if problem:
                 raise SnapshotIntegrityError(f"{self.path}: version family {family_id}: {problem}")
         self._families = families
+
+    def _load_attributes(self, db: sqlite3.Connection) -> None:
+        """Each document's verified attributes, each with a nonblank name and value, numbered
+        from 1 in card order and each in a section of its own document, and the family members
+        each document supersedes, in path order."""
+        attributes: dict[str, list[DocumentAttribute]] = {}
+        for r in db.execute(
+            "SELECT doc_id, ordinal, name, value, section_id FROM document_attributes"
+            " ORDER BY doc_id, ordinal"
+        ):
+            held = attributes.setdefault(r["doc_id"], [])
+            section = self._sections.get(r["section_id"])
+            if r["ordinal"] != len(held) + 1 or section is None or section.doc_id != r["doc_id"]:
+                raise SnapshotIntegrityError(
+                    f"{self.path}: attribute {r['ordinal']} of {r['doc_id']} is out of order or"
+                    f" cites {r['section_id']!r}, which is not a section of that document"
+                )
+            if not r["name"].strip() or not r["value"].strip():
+                raise SnapshotIntegrityError(
+                    f"{self.path}: attribute {r['ordinal']} of {r['doc_id']} has a blank name"
+                    " or value"
+                )
+            held.append(
+                DocumentAttribute(name=r["name"], value=r["value"], section_id=section.section_id)
+            )
+        supersedes: dict[str, list[str]] = {}
+        for doc in self._documents.values():
+            if doc.superseded_by is not None:
+                supersedes.setdefault(doc.superseded_by, []).append(doc.doc_id)
+        for doc_id, doc in self._documents.items():
+            superseded = supersedes.get(doc_id, [])
+            self._documents[doc_id] = doc.model_copy(
+                update={
+                    "attributes": attributes.get(doc_id, []),
+                    "superseded_doc_ids": superseded[:MAX_FAMILY_DOC_IDS],
+                    "omitted_superseded_doc_ids": max(0, len(superseded) - MAX_FAMILY_DOC_IDS),
+                }
+            )
+
+    def _load_tables(self, db: sqlite3.Connection) -> None:
+        """The Markdown tables of every section with their rows and row index, checked against
+        the sections they come from: each section's tables are exactly what `tables` reads
+        from its Markdown (headers, rows and caption, numbered from 1 in order), each table's
+        pages and heading path follow its section, its rows are numbered from 1 to `row_count`
+        with `column_count` cells each, and the row index holds each entry `_indexed_rows`
+        makes once, as written."""
+        rows: dict[str, list[tuple[str, ...]]] = {}
+        stored: dict[str, list[tuple[int, _Table]]] = {}
+        try:
+            for r in db.execute(
+                "SELECT table_id, row_ordinal, cells_json FROM table_rows"
+                " ORDER BY table_id, row_ordinal"
+            ):
+                held = rows.setdefault(r["table_id"], [])
+                if r["row_ordinal"] != len(held) + 1:
+                    raise SnapshotIntegrityError(
+                        f"{self.path}: table {r['table_id']} rows are not numbered from 1"
+                    )
+                held.append(_CELLS.validate_json(r["cells_json"]))
+            for r in db.execute(
+                "SELECT table_id, doc_id, section_id, ordinal, page_start, page_end,"
+                " heading_path, caption, headers_json, column_count, row_count FROM document_tables"
+            ):
+                if not (
+                    type(r["ordinal"]) is int
+                    and (r["caption"] is None or isinstance(r["caption"], str))
+                ):
+                    raise SnapshotIntegrityError(
+                        f"{self.path}: table {r['table_id']!r} has a malformed ordinal or caption"
+                    )
+                section = self._sections.get(r["section_id"])
+                headers = _CELLS.validate_json(r["headers_json"])
+                body = rows.pop(r["table_id"], [])
+                if (
+                    section is None
+                    or section.doc_id != r["doc_id"]
+                    or r["table_id"] != f"{section.section_id}_tbl_{r['ordinal']:03d}"
+                    or (r["page_start"], r["page_end"], r["heading_path"])
+                    != (section.page_start, section.page_end, section.heading_path)
+                    or len(headers) != r["column_count"]
+                    or len(body) != r["row_count"]
+                ):
+                    raise SnapshotIntegrityError(
+                        f"{self.path}: table {r['table_id']} does not match its section or rows"
+                    )
+                table = _Table(
+                    r["table_id"],
+                    section.doc_id,
+                    section.section_id,
+                    r["caption"],
+                    headers,
+                    tuple(body),
+                )
+                stored.setdefault(section.section_id, []).append((r["ordinal"], table))
+        except ValidationError as exc:
+            raise SnapshotIntegrityError(f"{self.path}: a table row is malformed: {exc}") from exc
+        if rows:
+            raise SnapshotIntegrityError(f"{self.path}: rows of unknown tables {sorted(rows)}")
+        self._tables: list[_Table] = []
+        for section in self._sections.values():
+            numbered = sorted(stored.pop(section.section_id, []), key=lambda p: p[0])
+            if [n for n, _ in numbered] != list(range(1, len(numbered) + 1)):
+                raise SnapshotIntegrityError(
+                    f"{self.path}: the tables of section {section.section_id} are not numbered"
+                    " from 1"
+                )
+            in_section = [t for _, t in numbered]
+            projected = tables(section.markdown)
+            if [(t.caption, t.headers, t.rows) for t in in_section] != [
+                (m.caption, m.headers, m.rows) for m in projected
+            ] or [t.table_id for t in in_section] != [
+                f"{section.section_id}_tbl_{n:03d}" for n in range(1, len(projected) + 1)
+            ]:
+                raise SnapshotIntegrityError(
+                    f"{self.path}: the tables of section {section.section_id} are not the"
+                    " tables of its Markdown"
+                )
+            self._tables += in_section
+        indexed: set[tuple[str, int]] = set()
+        expected = {
+            (t.table_id, ordinal): (_row_norm(t.headers), cells_norm)
+            for t in self._tables
+            for ordinal, cells_norm in _indexed_rows(t.rows)
+        }
+        for r in db.execute(
+            "SELECT table_id, row_ordinal, header_norm, cells_norm FROM table_rows_fts"
+        ):
+            key = (r["table_id"], r["row_ordinal"])
+            if (
+                type(r["row_ordinal"]) is not int
+                or expected.get(key) != (r["header_norm"], r["cells_norm"])
+                or key in indexed
+            ):
+                raise SnapshotIntegrityError(
+                    f"{self.path}: table_rows_fts row {r['table_id']!r} {r['row_ordinal']!r}"
+                    " does not match a table row or repeats one"
+                )
+            indexed.add(key)
+        if len(indexed) != len(expected):
+            raise SnapshotIntegrityError(
+                f"{self.path}: table_rows_fts does not index every table row exactly once"
+            )
 
     def _load_knowledge(self, db: sqlite3.Connection) -> None:
         """Glossary, deliverable types, feedback lessons and recurring units, validated and
@@ -1166,18 +1435,56 @@ class TopicSnapshot:
         """How many text units recur across documents of this topic (`UnitCluster`)."""
         return len(self._cluster_sections)
 
-    def _active_pool(self, allowed: frozenset[str] | None) -> frozenset[str]:
-        """The documents of `allowed` (every document when None) that are not superseded by
-        another document of it: a superseded draft stays only while the version superseding it
-        is filtered out."""
-        pool = frozenset(self._documents) if allowed is None else allowed
-        return frozenset(d for d in pool if self._documents[d].superseded_by not in pool)
+    def _resolve_scope(
+        self,
+        *,
+        filters: Mapping[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
+    ) -> tuple[frozenset[str], int]:
+        """The documents a read covers, and how many of them `current` left out.
+
+        The pool is every document holding each filter's value (`resolve_filters`) and, with a
+        nonblank `deliverable_type`, of that canonical type (no curator note). With `current`,
+        a document superseded by another document of the pool is left out: a superseded draft
+        stays only while the version superseding it is outside the pool. `all` keeps the whole
+        pool. An unknown facet, value or `versions` raises `InvalidFilterError`, an unknown
+        type `NotFoundError`."""
+        if versions not in ("current", "all"):
+            raise InvalidFilterError(f"versions must be 'current' or 'all', not {echoed(versions)}")
+        allowed = self.resolve_filters(filters)
+        requested = self._resolve_type(deliverable_type)
+        pool = frozenset(
+            d.doc_id
+            for d in self._documents.values()
+            if (allowed is None or d.doc_id in allowed)
+            and (requested is None or (d.deliverable_type == requested and not d.is_curator_note))
+        )
+        if versions == "all":
+            return pool, 0
+        active = frozenset(d for d in pool if self._documents[d].superseded_by not in pool)
+        return active, len(pool) - len(active)
+
+    def _provenance(self, doc_id: str) -> dict[str, Any]:
+        """The `DocumentProvenance` fields of a document, for a read result built from them."""
+        return self._documents[doc_id].model_dump(include=set(DocumentProvenance.model_fields))
 
     def facets_of(self, doc_id: str) -> dict[str, list[str]]:
         """The document's values per facet, in facet order; facets it holds no value of omitted."""
         return {k: list(v) for k, v in self._doc_facets.get(doc_id, {}).items()}
 
     # Catalogue reads.
+
+    def _citable_count(self) -> int:
+        return sum(not d.is_curator_note for d in self._documents.values())
+
+    def _facet_coverage(self, facet: str) -> int:
+        """How many citable documents hold at least one value of `facet`."""
+        return sum(
+            facet in self._doc_facets.get(d.doc_id, {})
+            for d in self._documents.values()
+            if not d.is_curator_note
+        )
 
     def type_summaries(self) -> list[DeliverableTypeSummary]:
         citable = [d for d in self._documents.values() if not d.is_curator_note]
@@ -1197,6 +1504,8 @@ class TopicSnapshot:
         fit, each list counting what it leaves out. The title is cut to `TITLE_CHARS`, and the
         summary fits a `list_topics` page of its own with `TOPIC_PAGE_MARGIN_BYTES` to spare."""
         types = [t.name for t in self.deliverable_types]
+        citable = self._citable_count()
+        coverage = {f.name: self._facet_coverage(f.name) for f in self.facets}
 
         def make(names: int) -> TopicSummary:
             return TopicSummary(
@@ -1206,12 +1515,14 @@ class TopicSnapshot:
                 corpus_fingerprint=self.corpus_fingerprint,
                 arkive_version=self.arkive_version,
                 document_count=len(self._documents),
+                citable_document_count=citable,
                 facets=[
                     FacetSummary(
                         name=f.name,
                         binding=f.binding,
                         values=[v.value for v in f.values[:names]],
                         omitted_values=max(0, len(f.values) - names),
+                        document_count=coverage[f.name],
                     )
                     for f in self.facets
                 ],
@@ -1249,7 +1560,13 @@ class TopicSnapshot:
             for t in self.type_summaries()
         ]
         facets = [
-            f.model_copy(update={"description": _clipped(f.description, GUIDE_DESCRIPTION_CHARS)})
+            FacetGuide(
+                name=f.name,
+                description=_clipped(f.description, GUIDE_DESCRIPTION_CHARS),
+                binding=f.binding,
+                values=f.values,
+                document_count=self._facet_coverage(f.name),
+            )
             for f in self.facets
         ]
         most_values = max((len(f.values) for f in facets), default=0)
@@ -1260,6 +1577,7 @@ class TopicSnapshot:
                 topic=self.topic,
                 title=self.title,
                 guide_markdown=self.guide_markdown,
+                citable_document_count=self._citable_count(),
                 curator_notes=shown,
                 omitted_curator_notes=len(notes) - len(shown),
                 facets=[f.model_copy(update={"values": f.values[:values]}) for f in facets],
@@ -1360,22 +1678,42 @@ class TopicSnapshot:
             allowed = set(docs) if allowed is None else allowed & docs
         return frozenset(allowed or ())
 
-    def list_documents(self, *, filters: Mapping[str, str] | None = None) -> list[DocumentInfo]:
-        """Every document passing `filters`, in path order, unpaginated."""
-        allowed = self.resolve_filters(filters)
-        return [d for d in self._documents.values() if allowed is None or d.doc_id in allowed]
+    def list_documents(
+        self,
+        *,
+        filters: Mapping[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "all",
+    ) -> list[DocumentInfo]:
+        """Every document of the scope (`_resolve_scope`) in path order, unpaginated, with every
+        attribute; every version unless `versions` is `current`. `list_documents_page` is the
+        MCP view."""
+        scope, _ = self._resolve_scope(
+            filters=filters, deliverable_type=deliverable_type, versions=versions
+        )
+        return [d for d in self._documents.values() if d.doc_id in scope]
 
     def list_documents_page(
-        self, *, filters: Mapping[str, str] | None = None, limit: int = 50, offset: int = 0
+        self,
+        *,
+        filters: Mapping[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
+        limit: int = 50,
+        offset: int = 0,
     ) -> DocumentPage:
-        """One page of `list_documents` without source hashes: at most `limit` documents from
-        `offset`, fewer when more would not fit one tool result, each summary cut to
-        `LIST_SUMMARY_CHARS`."""
+        """One page of the documents of the scope without source hashes, current versions
+        only unless `versions` is `all`: at most `limit` documents from `offset`, fewer when
+        more would not fit one tool result, each summary cut to `LIST_SUMMARY_CHARS` and each
+        showing at most `LIST_ATTRIBUTES` attributes within `LIST_ATTRIBUTES_MAX_BYTES`."""
         if not 1 <= limit <= MAX_DOCUMENT_PAGE:
             raise InvalidFilterError(f"limit must be between 1 and {MAX_DOCUMENT_PAGE}")
         if offset < 0:
             raise InvalidFilterError("offset must not be negative")
-        documents = self.list_documents(filters=filters)
+        scope, excluded = self._resolve_scope(
+            filters=filters, deliverable_type=deliverable_type, versions=versions
+        )
+        documents = [d for d in self._documents.values() if d.doc_id in scope]
         items = [
             DocumentListItem.model_validate(
                 d.model_dump(exclude={"sha256"})
@@ -1383,6 +1721,7 @@ class TopicSnapshot:
                     "title": _clipped(d.title, TITLE_CHARS),
                     "summary": _clipped(d.summary, LIST_SUMMARY_CHARS),
                 }
+                | _attribute_view(d.attributes, LIST_ATTRIBUTES, LIST_ATTRIBUTES_MAX_BYTES)
             )
             for d in documents[offset : offset + limit]
         ]
@@ -1395,6 +1734,7 @@ class TopicSnapshot:
                 offset=offset,
                 limit=limit,
                 next_offset=end if end < len(documents) else None,
+                excluded_superseded_count=excluded,
             )
 
         what = f"{self.path}: a document page"
@@ -1439,6 +1779,9 @@ class TopicSnapshot:
                 "title": _clipped(document.title, TITLE_CHARS),
                 "summary": _clipped(document.summary, SUMMARY_CHARS),
             }
+            | _attribute_view(
+                document.attributes, len(document.attributes), OUTLINE_ATTRIBUTES_MAX_BYTES
+            )
         )
 
         def make(count: int) -> DocumentOutline:
@@ -1493,7 +1836,7 @@ class TopicSnapshot:
         self,
         fts_query: str | None,
         query_vector: NDArray[np.float32] | None,
-        allowed: frozenset[str] | None,
+        allowed: frozenset[str],
     ) -> _Ranking:
         """The BM25 channel, the dense channel when a query vector is given, and their RRF
         fusion over the chunks of `allowed` documents, each channel `CHANNEL_DEPTH` deep."""
@@ -1501,9 +1844,7 @@ class TopicSnapshot:
         dense: dict[int, int] = {}
         cosine: dict[int, float] = {}
         if query_vector is not None:
-            candidates = [
-                i for i, hit in enumerate(self._hits) if allowed is None or hit["doc_id"] in allowed
-            ]
+            candidates = [i for i, hit in enumerate(self._hits) if hit["doc_id"] in allowed]
             similarity = self._matrix[candidates] @ query_vector.astype(np.float32)
             cosine = dict(zip(candidates, similarity.tolist(), strict=True))
             order = np.argsort(-similarity, kind="stable")[:CHANNEL_DEPTH]
@@ -1516,9 +1857,10 @@ class TopicSnapshot:
         return _Ranking(lexical, dense, fused, ranked)
 
     def _hit(self, ranking: _Ranking, index: int, more: int) -> SearchHit:
+        doc_id = self._hits[index]["doc_id"]
         return SearchHit(
-            **self._hits[index],
-            facets=self.facets_of(self._hits[index]["doc_id"]),
+            **(self._hits[index] | self._provenance(doc_id)),
+            facets=self.facets_of(doc_id),
             rrf_score=ranking.fused[index],
             lexical_rank=ranking.lexical.get(index),
             dense_rank=ranking.dense.get(index),
@@ -1550,26 +1892,27 @@ class TopicSnapshot:
         embed_query: QueryEmbedder,
         *,
         filters: Mapping[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
         top_k: int = 8,
-    ) -> list[SearchHit]:
+    ) -> SearchResult:
         """Hybrid search: BM25 and dense ranks fused by Reciprocal Rank Fusion, diversified by
         version family.
 
-        Only the active pool is ranked (`_active_pool`): a superseded document's chunks are
-        left out before ranking when the member that supersedes it passes the filters, so they
-        never take the channels' places. At most `SEARCH_FAMILY_CAP` chunks of one family are
+        Only the documents of the scope are ranked (`_resolve_scope`): with `current`, a
+        superseded document's chunks are left out before ranking when the member that
+        supersedes it is in scope, so they never take the channels' places, and the result
+        counts such documents. At most `SEARCH_FAMILY_CAP` chunks of one family are
         taken first; when that leaves fewer than `top_k` hits (as when the filters name one
         document), the held-back chunks fill the list. Hits keep fused-rank order, the list
         fits one tool result, and each hit counts the further ranked chunks of its document the
         list does not show. The request is validated before `embed_query` runs, so a blank
         query or an invalid filter costs no provider call.
         """
-        allowed = self._validate_search(query, filters, top_k)
-        ranking = self._rank(
-            build_fts5_query(query),
-            self._query_vector(query, embed_query),
-            self._active_pool(allowed),
+        scope, excluded = self._validate_search(
+            query, top_k, filters=filters, deliverable_type=deliverable_type, versions=versions
         )
+        ranking = self._rank(build_fts5_query(query), self._query_vector(query, embed_query), scope)
         order = ranking.order
         taken: list[int] = []
         held_back: list[int] = []
@@ -1587,11 +1930,12 @@ class TopicSnapshot:
         rank = {i: n for n, i in enumerate(order)}
         shown = sorted(taken, key=rank.__getitem__)
 
-        def make(count: int) -> list[SearchHit]:
+        def make(count: int) -> SearchResult:
             kept = set(shown[:count])
-            return self._hits_of(
+            hits = self._hits_of(
                 ranking, [*shown[:count], *(i for i in order if i not in kept)], count
             )
+            return SearchResult(hits=hits, excluded_superseded_count=excluded)
 
         count = _most_that_fit(len(shown), make, f"{self.path}: a search result")
         if shown and not count:
@@ -1599,14 +1943,24 @@ class TopicSnapshot:
         return make(count)
 
     def _validate_search(
-        self, query: str, filters: Mapping[str, str] | None, top_k: int
-    ) -> frozenset[str] | None:
+        self,
+        query: str,
+        top_k: int,
+        *,
+        filters: Mapping[str, str] | None,
+        deliverable_type: str | None = None,
+        versions: VersionScope,
+    ) -> tuple[frozenset[str], int]:
+        """The scope of a search request (`_resolve_scope`), once its query and `top_k` are
+        valid."""
         if not query.strip():
             raise InvalidFilterError("search query must not be blank")
-        allowed = self.resolve_filters(filters)
+        scope = self._resolve_scope(
+            filters=filters, deliverable_type=deliverable_type, versions=versions
+        )
         if not 1 <= top_k <= MAX_TOP_K:
             raise InvalidFilterError(f"top_k must be between 1 and {MAX_TOP_K}")
-        return allowed
+        return scope
 
     def rank_channels(
         self,
@@ -1622,10 +1976,8 @@ class TopicSnapshot:
         how candidates are ordered; no family diversity or size limit applies. Every hit
         carries its fused score and both channel ranks.
         """
-        allowed = self._validate_search(query, filters, top_k)
-        ranking = self._rank(
-            build_fts5_query(query), self._query_vector(query, embed_query), allowed
-        )
+        scope, _ = self._validate_search(query, top_k, filters=filters, versions="all")
+        ranking = self._rank(build_fts5_query(query), self._query_vector(query, embed_query), scope)
         return {
             "bm25_only": self._hits_of(
                 ranking, sorted(ranking.lexical, key=ranking.lexical.__getitem__), top_k
@@ -1636,21 +1988,17 @@ class TopicSnapshot:
             "hybrid_rrf": self._hits_of(ranking, ranking.order, top_k),
         }
 
-    def _lexical_ranks(
-        self, fts_query: str | None, allowed: frozenset[str] | None
-    ) -> dict[int, int]:
+    def _lexical_ranks(self, fts_query: str | None, allowed: frozenset[str]) -> dict[int, int]:
         """Rank of each matching chunk, keyed by its row index in `self._hits`."""
         if fts_query is None:
             return {}
-        doc_ids = None if allowed is None else json.dumps(sorted(allowed))
         rows = self._rows(
             "SELECT c.chunk_id, bm25(chunks_fts, 0.0, 10.0, 2.0) AS score"
             " FROM chunks_fts JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id"
             " JOIN documents d ON d.doc_id = c.doc_id"
-            " WHERE chunks_fts MATCH ?"
-            " AND (? IS NULL OR c.doc_id IN (SELECT value FROM json_each(?)))"
+            " WHERE chunks_fts MATCH ? AND c.doc_id IN (SELECT value FROM json_each(?))"
             " ORDER BY score, d.ordinal, c.ordinal LIMIT ?",
-            (fts_query, doc_ids, doc_ids, CHANNEL_DEPTH),
+            (fts_query, json.dumps(sorted(allowed)), CHANNEL_DEPTH),
         )
         return {self._hit_index[row["chunk_id"]]: rank for rank, row in enumerate(rows, start=1)}
 
@@ -1659,36 +2007,199 @@ class TopicSnapshot:
         pattern: str,
         *,
         filters: Mapping[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
         max_matches: int = 20,
-    ) -> list[GrepMatch]:
-        """Literal, case-insensitive, dash- and NFKC-folded line search over section text."""
+    ) -> GrepResult:
+        """Literal, case-insensitive, dash- and NFKC-folded line search over the section text
+        of the scope (`_resolve_scope`), in path order. A matching table body row is shown
+        after the header row of the table it belongs to (`table_header_lines`)."""
         if not pattern.strip():
             raise InvalidFilterError("grep pattern must not be blank")
         if not 1 <= max_matches <= MAX_GREP_MATCHES:
             raise InvalidFilterError(f"max_matches must be between 1 and {MAX_GREP_MATCHES}")
-        allowed = self.resolve_filters(filters)
+        scope, excluded = self._resolve_scope(
+            filters=filters, deliverable_type=deliverable_type, versions=versions
+        )
         needle = fold_text(pattern)
         matches = (
             GrepMatch(
-                **section.fields,
+                **(section.fields | self._provenance(section.doc_id)),
                 facets=self.facets_of(section.doc_id),
                 line_number=number,
-                snippet=_snippet(line, needle),
+                snippet=_snippet(line, needle, section.table_headers.get(number - 1)),
             )
             for section in self._grep_sections
-            if allowed is None or section.doc_id in allowed
+            if section.doc_id in scope
             for number, (line, folded) in enumerate(
                 zip(section.lines, section.normalized, strict=True), start=1
             )
             if needle in folded
         )
-        found = list(islice(matches, max_matches))
-        count = _most_that_fit(len(found), lambda n: found[:n], f"{self.path}: a grep result")
-        if found and not count:
-            raise SnapshotIntegrityError(
-                f"{self.path}: grep match in {found[0].section_id} does not fit one tool result"
+        # One match past the limit says whether the result is cut.
+        found = list(islice(matches, max_matches + 1))
+        shown = found[:max_matches]
+
+        def make(n: int) -> GrepResult:
+            return GrepResult(
+                matches=shown[:n], excluded_superseded_count=excluded, truncated=n < len(found)
             )
-        return found[:count]
+
+        count = _most_that_fit(len(shown), make, f"{self.path}: a grep result")
+        if shown and not count:
+            raise SnapshotIntegrityError(
+                f"{self.path}: grep match in {shown[0].section_id} does not fit one tool result"
+            )
+        return make(count)
+
+    def query_tables(
+        self,
+        *,
+        query: str | None = None,
+        columns: Sequence[str] | None = None,
+        filters: Mapping[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> TableQueryResult:
+        """The Markdown tables of the scope (`_resolve_scope`) in path order (document, section,
+        table), one page from `offset` within one tool result.
+
+        `columns` keeps the tables whose folded headers (`fold_text`) contain each pattern,
+        and shows only the matched columns and column 0. `query` keeps the tables whose header
+        and cells together match its FTS5 expression (`build_fts5_query`); a table with rows
+        whose cells match shows those rows, one whose header alone matches its leading rows. A
+        query with no words matches no table. Without a query, every table shows its leading
+        rows. Each table shows at most `MAX_TABLE_QUERY_COLUMNS` columns and
+        `MAX_TABLE_QUERY_ROWS` rows within `TABLE_QUERY_ROWS_MAX_BYTES`, counting the rest."""
+        if not 1 <= limit <= MAX_TABLE_QUERY:
+            raise InvalidFilterError(f"limit must be between 1 and {MAX_TABLE_QUERY}")
+        if offset < 0:
+            raise InvalidFilterError("offset must not be negative")
+        patterns: list[str] | None = None
+        if columns is not None:
+            patterns = [fold_text(c).strip() for c in columns]
+            if not patterns or not all(patterns) or len(patterns) > MAX_TABLE_COLUMN_PATTERNS:
+                raise InvalidFilterError(
+                    f"columns must name 1 to {MAX_TABLE_COLUMN_PATTERNS} nonblank column names"
+                    " or parts of them; omit it to match every table"
+                )
+        scope, excluded = self._resolve_scope(
+            filters=filters, deliverable_type=deliverable_type, versions=versions
+        )
+        fts_query = None if query is None else build_fts5_query(query)
+        matched_tables: set[str] = set()
+        cell_rows: dict[str, list[int]] = {}
+        if fts_query is not None:
+            matched_tables = {
+                r["table_id"]
+                for r in self._rows(
+                    "SELECT DISTINCT table_id FROM table_rows_fts WHERE table_rows_fts MATCH ?",
+                    (fts_query,),
+                )
+            }
+            # Best-scoring rows first: the query ORs its words, so a table's leading rows by
+            # position may all match one common word and crowd out the row it names.
+            for r in self._rows(
+                "SELECT table_id, row_ordinal FROM table_rows_fts WHERE table_rows_fts MATCH ?"
+                " ORDER BY bm25(table_rows_fts), row_ordinal",
+                (f"cells_norm : ({fts_query})",),
+            ):
+                cell_rows.setdefault(r["table_id"], []).append(r["row_ordinal"])
+        selected: list[tuple[_Table, list[int], list[int] | None]] = []
+        for table in self._tables:
+            if table.doc_id not in scope:
+                continue
+            if query is not None and table.table_id not in matched_tables:
+                continue
+            shown_columns = list(range(len(table.headers)))
+            if patterns is not None:
+                folded = [fold_text(h) for h in table.headers]
+                matched = [[i for i, h in enumerate(folded) if p in h] for p in patterns]
+                if not all(matched):
+                    continue
+                shown_columns = sorted({0, *(i for found in matched for i in found)})
+            rows = cell_rows.get(table.table_id)
+            selected.append((table, shown_columns[:MAX_TABLE_QUERY_COLUMNS], rows))
+        page = [
+            self._table_item(table, shown_columns, rows)
+            for table, shown_columns, rows in selected[offset : offset + limit]
+        ]
+
+        def make(items: list[TableQueryItem]) -> TableQueryResult:
+            end = offset + len(items)
+            return TableQueryResult(
+                tables=items,
+                total_tables=len(selected),
+                next_offset=end if end < len(selected) else None,
+                excluded_superseded_count=excluded,
+            )
+
+        count = _most_that_fit(
+            len(page), lambda n: make(page[:n]), f"{self.path}: a table query result"
+        )
+        if page and not count:
+            # A lone table that does not fit with all its rows shows the rows that fit.
+            first = selected[offset]
+            kept = _most_that_fit(
+                MAX_TABLE_QUERY_ROWS,
+                lambda n: make([self._table_item(*first, max_rows=n)]),
+                f"{self.path}: table {page[0].table_id}",
+            )
+            return make([self._table_item(*first, max_rows=kept)])
+        return make(page[:count])
+
+    def _table_item(
+        self,
+        table: _Table,
+        columns: Sequence[int],
+        matched: Sequence[int] | None,
+        *,
+        max_rows: int = MAX_TABLE_QUERY_ROWS,
+    ) -> TableQueryItem:
+        """One table as `query_tables` shows it: `columns` of the rows numbered `matched` (from
+        1, best match first), or of its leading rows when None. It shows the first `max_rows`
+        of them within `TABLE_QUERY_ROWS_MAX_BYTES`, in row order; a first row wider than that
+        alone has its cells cut shorter until it fits."""
+        ordinals = list(matched) if matched is not None else list(range(1, len(table.rows) + 1))
+        rows: list[TableRowView] = []
+        spent = 0
+        for ordinal in ordinals[:max_rows]:
+            cells = table.rows[ordinal - 1]
+            chars = TABLE_CELL_CHARS
+            while True:
+                row = TableRowView(
+                    row_ordinal=ordinal, cells=[_clipped(cells[i], chars) for i in columns]
+                )
+                size = _json_bytes(row) + 1
+                if rows or size <= TABLE_QUERY_ROWS_MAX_BYTES or chars == 1:
+                    break
+                chars = max(1, min(chars - 1, chars * TABLE_QUERY_ROWS_MAX_BYTES // size))
+            spent += size
+            if spent > TABLE_QUERY_ROWS_MAX_BYTES:
+                break
+            rows.append(row)
+        rows.sort(key=lambda r: r.row_ordinal)
+        section = self._sections[table.section_id]
+        return TableQueryItem(
+            **self._provenance(table.doc_id),
+            table_id=table.table_id,
+            section_id=table.section_id,
+            doc_title=_clipped(self._documents[table.doc_id].title, TITLE_CHARS),
+            heading_path=heading_context(section.heading_path),
+            page_start=section.page_start,
+            page_end=section.page_end,
+            facets=self.facets_of(table.doc_id),
+            caption=None if table.caption is None else _clipped(table.caption, TITLE_CHARS),
+            column_count=len(table.headers),
+            row_count=len(table.rows),
+            headers=[_clipped(table.headers[i], TABLE_HEADER_CHARS) for i in columns],
+            omitted_columns=len(table.headers) - len(columns),
+            matched_rows=len(matched) if matched is not None else 0,
+            rows=rows,
+            omitted_rows=len(ordinals) - len(rows),
+        )
 
     def read_section(self, section_id: str, *, offset: int = 0) -> SectionReadView:
         """The section's Markdown from character `offset`, as much as fits one tool result: the
@@ -1894,7 +2405,7 @@ class TopicSnapshot:
 
         Exemplars are ranked against `project_inputs` with hybrid search, or BM25 alone when
         `embed_query` is None; no model writes anything. The pool is every citable document of
-        the active pool (`_active_pool` of the documents passing `filters`) that is not
+        the current versions of the documents passing `filters` (`_resolve_scope`) that is not
         feedback; a feedback document of the requested type stays. A document's relevance sums
         the fused-rank scores of its best `RELEVANCE_CHUNKS` chunks, plus a small bonus for
         input words in its title, type and summary (`_relevance`). With a requested type, its
@@ -1907,15 +2418,16 @@ class TopicSnapshot:
 
         Lessons are the house rules for the requested type, or for the first exemplar's type
         when none is requested, from every feedback document of the topic whatever the
-        filters. Section text is packed whole, never cut (`_pack`). Blank inputs or invalid
-        filters raise `InvalidFilterError` and an unknown type `NotFoundError`, before any
-        embedding call.
+        filters. Supplemental sections come from documents of that same type. Section text is
+        packed whole, never cut (`_pack`). Blank inputs or invalid filters raise
+        `InvalidFilterError` and an unknown type `NotFoundError`, before any embedding call.
         """
         if not project_inputs.strip():
             raise InvalidFilterError("project_inputs must not be blank; pass the user's inputs")
-        allowed = self.resolve_filters(filters)
+        # The requested type ranks exemplars; it does not narrow the scope, so related types
+        # can still fill free exemplar slots.
+        active, _ = self._resolve_scope(filters=filters)
         requested = self._resolve_type(deliverable_type)
-        active = self._active_pool(allowed)
         pool = [
             d
             for d in self._documents.values()
@@ -1976,7 +2488,9 @@ class TopicSnapshot:
             others,
             scores,
             section_rank,
-            self._supplemental(exemplars, requested, rare_words, active),
+            []
+            if lesson_type is None
+            else self._supplemental(exemplars, lesson_type, rare_words, active),
             lessons,
         )
 
@@ -2020,12 +2534,14 @@ class TopicSnapshot:
            first always has its complete outline, and the first's is cut only when it is the
            only exemplar.
         4. Whole sections, each added only while the packet fits, a skipped one leaving room
-           for later, smaller ones: the first exemplar's input-matched, recurring and first
-           and last two sections; the rare-word supplemental sections; the rest of the first
-           exemplar; then the other exemplars' input-matched sections, their recurring
-           sections that show a unit no included section shows yet, their boundary sections,
-           and the rest of them. Each included section adds its sample of each recurring
-           prose unit it is the first to show (`ClusterHolder`), at most
+           for later, smaller ones, in tiers: the first exemplar's input-matched sections; the
+           rare-word supplemental sections; the other exemplars' input-matched sections; the
+           first exemplar's first and last two sections; every exemplar's recurring sections
+           that show a unit no included section shows yet; the other exemplars' boundary
+           sections; the remaining recurring sections; the rest of the first exemplar; the
+           rest of the others. So a long first exemplar fills the packet only after every
+           exemplar's matched and boundary sections. Each included section adds its sample of
+           each recurring prose unit it is the first to show (`ClusterHolder`), at most
            `MAX_RECURRING_SAMPLES`.
 
         Summaries are cut to `SUMMARY_CHARS` and family members listed up to
@@ -2083,6 +2599,17 @@ class TopicSnapshot:
                     recurrence[s.section_id] = self._recurrence(s.section_id, ids, family_total)
                     entry_bytes[s.section_id] = _json_bytes(entry(s)) + 1
 
+        def input_matched(rows: Sequence[_SectionRow]) -> list[_SectionRow]:
+            """The nonblank sections of `rows` whose chunks rank within
+            `MATCHED_CHUNK_RANKS` for the inputs, best first, at most `MATCHED_SECTIONS`."""
+            hits = [
+                s
+                for s in rows
+                if bodies[s.section_id]
+                and section_rank.get(s.section_id, MATCHED_CHUNK_RANKS + 1) <= MATCHED_CHUNK_RANKS
+            ]
+            return sorted(hits, key=lambda s: section_rank[s.section_id])[:MATCHED_SECTIONS]
+
         def prioritized_sections(doc: DocumentInfo) -> list[_SectionRow]:
             """Sections of `doc` ordered so structural, recurring, input-matched and boundary
             sections survive when a huge document's outline is capped."""
@@ -2095,16 +2622,7 @@ class TopicSnapshot:
                 s.section_id
                 for s in [*nonempty[:BOUNDARY_SECTIONS], *nonempty[-BOUNDARY_SECTIONS:]]
             }
-            hits = sorted(
-                (
-                    s
-                    for s in nonempty
-                    if section_rank.get(s.section_id, MATCHED_CHUNK_RANKS + 1)
-                    <= MATCHED_CHUNK_RANKS
-                ),
-                key=lambda s: section_rank[s.section_id],
-            )[:MATCHED_SECTIONS]
-            hit_ids = {s.section_id for s in hits}
+            hit_ids = {s.section_id for s in input_matched(rows)}
             high = [
                 s
                 for s in rows
@@ -2252,7 +2770,6 @@ class TopicSnapshot:
             shown_rows[chosen[0].doc_id] = select_outline(chosen[0], room)
         size = measured()
         # 4. Whole sections, priced by the bytes each adds.
-        first = chosen[0] if chosen else None
         shown_units: set[int] = set()
         taken_back: list[Callable[[], None]] = []
 
@@ -2267,12 +2784,7 @@ class TopicSnapshot:
             return [*sections[:BOUNDARY_SECTIONS], *sections[-BOUNDARY_SECTIONS:]]
 
         def matched(doc: DocumentInfo) -> list[_SectionRow]:
-            hits = [
-                s
-                for s in nonblank(doc)
-                if section_rank.get(s.section_id, MATCHED_CHUNK_RANKS + 1) <= MATCHED_CHUNK_RANKS
-            ]
-            return sorted(hits, key=lambda s: section_rank[s.section_id])[:MATCHED_SECTIONS]
+            return input_matched(outlined(doc))
 
         def recurring(doc: DocumentInfo) -> list[_SectionRow]:
             return [s for s in nonblank(doc) if recurrence[s.section_id] is not None]
@@ -2338,26 +2850,31 @@ class TopicSnapshot:
             supplemental.append(item)
             taken_back.append(lambda: supplemental.remove(item))
 
+        # Tiers, so that one long first exemplar cannot drain the packet before the others
+        # show their input-matched and boundary sections.
         rest = chosen[1:]
-        if first is not None:
-            for s in [*matched(first), *recurring(first), *boundary(first)]:
+        for doc in chosen[:1]:
+            for s in matched(doc):
                 include(s)
         for row in supplements:
             supplement(row)
         for doc in rest:
             for s in matched(doc):
                 include(s)
-        for doc in rest:
+        for doc in chosen[:1]:
+            for s in boundary(doc):
+                include(s)
+        for doc in chosen:
             for s in recurring(doc):
                 if shows_new_unit(s):
                     include(s)
-        if first is not None:
-            for s in outlined(first):
-                include(s)
         for doc in rest:
             for s in boundary(doc):
                 include(s)
-        for doc in rest:
+        for doc in chosen:
+            for s in recurring(doc):
+                include(s)
+        for doc in chosen:
             for s in outlined(doc):
                 include(s)
         result = packet()
@@ -2373,14 +2890,13 @@ class TopicSnapshot:
     def _supplemental(
         self,
         chosen: Sequence[DocumentInfo],
-        requested: str | None,
+        deliverable_type: str,
         rare_words: Mapping[str, set[str]],
         active: frozenset[str],
     ) -> list[_SectionRow]:
-        """Sections of deliverables of the active pool outside the exemplars' families that
-        hold the most rare input words: of the requested type's documents when a type is
-        requested, else of any deliverable. At most `MAX_SUPPLEMENTAL_SECTIONS`, best first,
-        ties in path order."""
+        """Sections of deliverables of `deliverable_type` in the active pool outside the
+        exemplars' families that hold the most rare input words. At most
+        `MAX_SUPPLEMENTAL_SECTIONS`, best first, ties in path order."""
         families = {d.family_id for d in chosen}
         held = Counter(section for sections in rare_words.values() for section in sections)
         eligible = []
@@ -2392,13 +2908,35 @@ class TopicSnapshot:
                 or doc.is_feedback
                 or doc.family_id in families
                 or doc.doc_id not in active
-                or (requested is not None and doc.deliverable_type != requested)
+                or doc.deliverable_type != deliverable_type
             ):
                 continue
             eligible.append((-found, self._ordinal[doc.doc_id], row.ordinal, row))
         return [
             row for *_, row in sorted(eligible, key=lambda t: t[:3])[:MAX_SUPPLEMENTAL_SECTIONS]
         ]
+
+
+def _attribute_view(
+    attributes: Sequence[DocumentAttribute], most: int, max_bytes: int
+) -> dict[str, Any]:
+    """The `attributes` and `omitted_attributes` of a view showing the leading attributes,
+    each name cut to `ATTRIBUTE_NAME_CHARS` and value to `ATTRIBUTE_VALUE_CHARS`, at most
+    `most` of them within `max_bytes` of JSON."""
+    shown: list[DocumentAttribute] = []
+    spent = 0
+    for attribute in attributes[:most]:
+        clipped = attribute.model_copy(
+            update={
+                "name": _clipped(attribute.name, ATTRIBUTE_NAME_CHARS),
+                "value": _clipped(attribute.value, ATTRIBUTE_VALUE_CHARS),
+            }
+        )
+        spent += _json_bytes(clipped) + 1
+        if spent > max_bytes:
+            break
+        shown.append(clipped)
+    return {"attributes": shown, "omitted_attributes": len(attributes) - len(shown)}
 
 
 def _with_citations(entry: GlossaryEntry, most: int) -> GlossaryEntry:

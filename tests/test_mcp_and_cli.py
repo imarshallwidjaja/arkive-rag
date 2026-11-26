@@ -22,6 +22,7 @@ from arkive_rag.cli import app
 from arkive_rag.models import ArkiveError, ObservationDraft, TopicPage, document_id
 from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import (
+    DRAFTING_GUIDANCE,
     RESPONSE_MAX_BYTES,
     RESPONSE_MAX_LINES,
     TOPIC_PAGE_MARGIN_BYTES,
@@ -113,22 +114,29 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
                 },
             ),
             ("list_documents", {"topic": marine, "limit": 1, "offset": 1}),
+            ("query_tables", {"topic": marine, "columns": ["FILE"], "query": "dry season"}),
+            ("grep", {"topic": marine, "pattern": "dry_depth"}),
         ],
         FakeGateway().embed_query,
     )
     topics, guide, memos, outline, hits, matches, section, page, soils, soils_grep = results[:10]
-    terms, lat, packet, page_two = results[10:]
+    terms, lat, packet, page_two, layers, row = results[10:]
 
     assert [(t["topic"], t["document_count"]) for t in data(topics)["topics"]] == [
         ("bathymetry", 4),
         ("soils", 1),
     ]
     assert [len(t["corpus_fingerprint"]) for t in data(topics)["topics"]] == [64, 64]
-    project = data(topics)["topics"][0]["facets"][0]
+    project, client = data(topics)["topics"][0]["facets"]
     assert (project["name"], project["values"]) == (
         "project",
         ["p101-harbour-lidar", "p102-estuary-multibeam", "p103-reef-sonar"],
     )
+    # Coverage counts citable documents: the curator note holds a project but is not one.
+    assert data(topics)["topics"][0]["citable_document_count"] == 3
+    assert (project["document_count"], client["document_count"]) == (3, 2)
+    assert [f["document_count"] for f in data(guide)["facets"]] == [3, 2]
+    assert data(guide)["citable_document_count"] == 3
     assert f"[{CHART_MEMO}:" in data(guide)["guide_markdown"]
     assert [
         (t["deliverable_type"], t["document_count"]) for t in data(guide)["deliverable_types"]
@@ -143,7 +151,7 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
     assert draft["deliverable_type"] == "survey memorandum"
     assert draft["exemplars"][0]["doc_id"] == HARBOUR_MEMO
     assert all(s["included"] for s in draft["exemplars"][0]["sections"])
-    assert draft["drafting_guidance"].startswith("- Take every fact")
+    assert draft["drafting_guidance"] == DRAFTING_GUIDANCE
     assert [d["rel_path"] for d in data(page_two)["documents"]] == [
         "p101-harbour-lidar/harbour-memo.md"
     ]
@@ -155,8 +163,24 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
         "p101-harbour-lidar/harbour-memo.md",
     ]
     assert [s["heading_path"] for s in data(outline)["sections"]] == ["Rainfall", "Outputs"]
-    assert len(data(hits)) == 3 and "330.9" in data(hits)[0]["content"]
-    assert {m["doc_id"] for m in data(matches)} == {CHART_MEMO, HARBOUR_MEMO}
+    assert len(data(hits)["hits"]) == 3 and "330.9" in data(hits)["hits"][0]["content"]
+    assert data(hits)["excluded_superseded_count"] == 0
+    assert {m["doc_id"] for m in data(matches)["matches"]} == {CHART_MEMO, HARBOUR_MEMO}
+    assert data(matches)["truncated"] is False
+    (table,) = data(layers)["tables"]
+    assert (table["table_id"], table["doc_id"]) == (f"{HARBOUR_MEMO}_sec_002_tbl_001", HARBOUR_MEMO)
+    assert (table["headers"], table["matched_rows"], table["omitted_columns"]) == (
+        ["Layer", "File"],
+        1,
+        0,
+    )
+    assert table["rows"] == [
+        {"row_ordinal": 1, "cells": ["Dry season", "harbour_dry_depth_thresh.tif"]}
+    ]
+    assert (table["deliverable_type"], table["version_status"]) == ("survey memorandum", "sole")
+    # A matching table row comes after its header row.
+    (match,) = data(row)["matches"]
+    assert match["snippet"] == "| Layer | File |\n| Dry season | harbour_dry_depth_thresh.tif |"
     assert data(section)["markdown"] == "# Outputs\n\nRaster estuary_2024_grid.tif"
     assert data(section)["prev_section_id"] == f"{CHART_MEMO}_sec_001"
     text, image = page.content
@@ -164,7 +188,7 @@ def test_mcp_session_exercises_every_tool_across_isolated_topics(
     assert isinstance(image, ImageContent) and image.mime_type == "image/webp"
     assert base64.b64decode(image.data)[8:12] == b"WEBP"
     assert [d["rel_path"] for d in data(soils)["documents"]] == ["p900-soils/soils-memo.md"]
-    assert data(soils_grep) == []
+    assert data(soils_grep)["matches"] == []
     assert [(t["term"], t["defined"]) for t in data(terms)["terms"]] == [("LAT", True)]
     (entry,) = data(lat)["matches"]
     assert entry["aliases"] == ["lowest astronomical tide"]
@@ -198,8 +222,8 @@ def test_mcp_errors_name_valid_options_and_offline_search_explains_itself(
     search, grep, section, page, bad_topic, bad_project, bad_page, bad_facet, blank = results[:9]
     bad_type, offline_draft, too_many = results[9:]
 
-    assert "OPENAI_API_KEY" in error_text(search) and "grep" in error_text(search)
-    assert len(data(grep)) == 1
+    assert "OPENAI_API_KEY" in error_text(search) and "query_tables" in error_text(search)
+    assert len(data(grep)["matches"]) == 1 and data(grep)["truncated"] is True
     assert data(section)["section_id"] == f"{CHART_MEMO}_sec_001"
     assert isinstance(page.content[1], ImageContent)
     assert error_text(bad_topic).endswith("unknown topic 'mining'; valid topics: bathymetry, soils")
@@ -247,7 +271,8 @@ def _with_large_catalogue(path: Path, topic: str | None = None) -> None:
 def _oversized_snapshot(tmp_path: Path) -> Path:
     """A topic built to overflow every tool result: a 600-section manual defining a term in
     each section, a full-length section of two-byte characters, 30 long curator notes, 15
-    reviews with long lessons, 150 small documents and a two-page PDF. The snapshot is then
+    reviews with long lessons, 150 small documents, 30 tables of 40 columns and 20 rows, a
+    table with a 5,000-character cell and a two-page PDF. The snapshot is then
     edited past what a build writes: the manual's summary is 60,000 characters and its title
     and second clause heading 20,000 three-byte characters each, the small documents are
     drafts it supersedes, one glossary term has four senses citing 500 sections each, the
@@ -279,6 +304,23 @@ def _oversized_snapshot(tmp_path: Path) -> Path:
             for k in range(15)
         },
         **{f"zz-drafts/draft-{n:03d}.md": f"# Draft {n}\n\nDraft {n}." for n in range(150)},
+        **{
+            f"tables/wide-{t:02d}.md": f"# Gauges {t}\n\n"
+            + "| "
+            + " | ".join(f"Gauge datum {c}" for c in range(40))
+            + " |\n|"
+            + " --- |" * 40
+            + "\n"
+            + "".join(
+                "| " + " | ".join(f"datum value r{r}c{c}" for c in range(40)) + " |\n"
+                for r in range(20)
+            )
+            for t in range(30)
+        },
+        "tables/long-cell.md": "# Long cell\n\n| Station | Gauge datum note |\n| --- | --- |\n"
+        + "| S1 | "
+        + "datum " * 850
+        + "|\n",
     }
     path = compile_snapshot(
         tmp_path, files, topic="oversized", pdfs={"scans/scan.pdf": [["# Scan"], ["# Page"]]}
@@ -364,6 +406,8 @@ def test_every_tool_result_fits_one_opencode_tool_result(tmp_path: Path) -> None
         ("prepare_draft", {"topic": topic, "project_inputs": "x", "deliverable_type": "q" * 5_000}),
         ("get_topic_guide", {"topic": "t" * 5_000}),
         ("read_section", {"topic": topic, "section_id": "s" * 5_000}),
+        ("query_tables", {"topic": topic, "columns": ["gauge datum"], "limit": 50}),
+        ("query_tables", {"topic": topic, "query": "datum value", "limit": 50}),
     ]
 
     results = call_tools((path, *others), calls, FakeGateway().embed_query)
@@ -390,7 +434,8 @@ def test_every_tool_result_fits_one_opencode_tool_result(tmp_path: Path) -> None
     ]
     assert "at most 1000" in error_text(results[11])
     view, long_heading, long_part = results[12], data(results[13]), data(results[14])
-    bad_value, bad_type, bad_topic, bad_section = (error_text(r) for r in results[15:])
+    bad_value, bad_type, bad_topic, bad_section = (error_text(r) for r in results[15:19])
+    by_column, by_query = data(results[19]), data(results[20])
     # Twenty topics come in several pages, each topic once and in order.
     assert len(pages) > 1 and topics["total"] == 20
     listed = [t["topic"] for p in pages for t in p["topics"]]
@@ -411,7 +456,7 @@ def test_every_tool_result_fits_one_opencode_tool_result(tmp_path: Path) -> None
     assert caption.text.count("\n") < 1_500 and "lines omitted ..." in caption.text
     assert "\u884c 0" in caption.text and "Shape 0." in caption.text
     # A match in a section with a 20,000-character heading is returned with the heading cut.
-    ((match,),) = [long_heading]
+    (match,) = long_heading["matches"]
     assert match["section_id"] == f"{manual}_sec_002"
     assert match["heading_path"].endswith("\u2026") and len(match["heading_path"]) == 500
     assert match["doc_title"].endswith("\u2026") and len(match["doc_title"]) == 500
@@ -422,6 +467,23 @@ def test_every_tool_result_fits_one_opencode_tool_result(tmp_path: Path) -> None
     assert "unknown topic" in bad_topic and "(5000 characters)" in bad_topic
     assert "unknown section" in bad_section and "(5000 characters)" in bad_section
     assert page["documents"][0]["summary"].endswith("\u2026")
+    # The manual supersedes the 150 drafts, so the page of current versions leaves them out.
+    assert page["excluded_superseded_count"] == 150
+    assert page["documents"][0]["omitted_superseded_doc_ids"] == 150 - 24
+    # Tables come in pages: each shows at most 24 columns, 20 rows and cells cut to 300.
+    for tables in (by_column, by_query):
+        assert tables["total_tables"] == 31 and 1 < len(tables["tables"]) < 31
+        assert tables["next_offset"] == len(tables["tables"])
+        for item in tables["tables"]:
+            assert len(item["headers"]) <= 24 and len(item["rows"]) <= 20
+            assert all(len(c) <= 300 for row in item["rows"] for c in row["cells"])
+            assert item["omitted_rows"] + len(item["rows"]) == (
+                item["matched_rows"] or item["row_count"]
+            )
+    (long_cell,) = [t for t in by_column["tables"] if t["column_count"] == 2]
+    assert long_cell["rows"][0]["cells"][1].endswith("\u2026")
+    wide = by_column["tables"][1]
+    assert (wide["column_count"], len(wide["headers"]), wide["omitted_columns"]) == (40, 24, 16)
     assert (outline["total_sections"], outline["offset"]) == (601, 0)
     assert 0 < len(outline["sections"]) == outline["next_offset"] < 601
     assert part["next_offset"] == len(part["markdown"]) < part["total_chars"]
@@ -550,6 +612,10 @@ def test_cli_inspect_and_grep_work_offline(
     repeated = runner.invoke(app, ["grep", str(snapshots[0]), "x", *twice])
     malformed = runner.invoke(app, ["grep", str(snapshots[0]), "x", "--filter", "project"])
     search = runner.invoke(app, ["search", str(snapshots[0]), "rainfall"])
+    typed = runner.invoke(
+        app, ["grep", str(snapshots[0]), "sentinel-2", "--type", "PROPOSAL", "--versions", "all"]
+    )
+    bad_versions = runner.invoke(app, ["grep", str(snapshots[0]), "x", "--versions", "some"])
 
     assert inspected.exit_code == 0, inspected.output
     summary = json.loads(inspected.stdout)
@@ -574,7 +640,11 @@ def test_cli_inspect_and_grep_work_offline(
         "family_id": CHART_MEMO,
         "version_status": summary["documents"][0]["version_status"],
         "superseded_by": None,
+        "superseded_doc_ids": [],
+        "omitted_superseded_doc_ids": 0,
         "facets": {"project": ["p101-harbour-lidar"]},
+        "attributes": [],
+        "omitted_attributes": 0,
         "sections": 2,
     }
     assert [f["name"] for f in summary["facets"]] == ["project", "client"]
@@ -591,7 +661,15 @@ def test_cli_inspect_and_grep_work_offline(
     assert summary["build_settings"]["efforts"]["observe"] == "low"
     assert summary["build_report"]["discarded_unlocated_quotes"] == 0
     assert grepped.exit_code == 0, grepped.output
-    assert [m["doc_id"] for m in json.loads(grepped.stdout)] == [HARBOUR_MEMO]
+    assert [m["doc_id"] for m in json.loads(grepped.stdout)["matches"]] == [HARBOUR_MEMO]
+    assert typed.exit_code == 0, typed.output
+    assert json.loads(typed.stdout) | {"matches": []} == {
+        "matches": [],
+        "excluded_superseded_count": 0,
+        "truncated": False,
+    }
+    assert {m["deliverable_type"] for m in json.loads(typed.stdout)["matches"]} == {"proposal"}
+    assert bad_versions.exit_code == 2
     assert bad_facet.exit_code == 1 and "valid facets: project, client" in bad_facet.stderr
     assert repeated.exit_code == 2 and "given twice" in repeated.output
     assert malformed.exit_code == 2 and "not FACET=VALUE" in malformed.output
@@ -623,7 +701,7 @@ def test_installed_cli_serves_snapshots_over_stdio(
     version, grep, search = anyio.run(run)
 
     assert version == __version__
-    assert {m["doc_id"] for m in data(grep)} == {CHART_MEMO, HARBOUR_MEMO}
+    assert {m["doc_id"] for m in data(grep)["matches"]} == {CHART_MEMO, HARBOUR_MEMO}
     assert "OPENAI_API_KEY" in error_text(search)
 
 

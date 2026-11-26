@@ -1456,7 +1456,11 @@ def test_lesson_instructions_strip_project_values_but_keep_house_wide_constants(
     assert "Leave out every project-specific value: client, site and person names" in instructions
     assert "fees, coordinates and project dates" in instructions
     assert "Keep a house-wide constant when the reviewer establishes or enforces it" in instructions
-    for constant in ("calibration sensitivity", "baseline period", "alarm-rule percentage"):
+    for constant in (
+        "standard reference value or equipment setting",
+        "standard period or duration",
+        "standard threshold or tolerance",
+    ):
         assert constant in instructions
     assert "regulatory or methodology clause and its required value" in instructions
 

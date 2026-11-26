@@ -22,7 +22,7 @@ from arkive_rag.llm import (
     UsageMeter,
     load_dotenv_if_present,
 )
-from arkive_rag.models import ArkiveError
+from arkive_rag.models import ArkiveError, VersionScope
 from arkive_rag.server import LOOPBACK_HOSTS, TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot, check_build_paths, write_snapshot
 
@@ -34,6 +34,17 @@ FilterOption = Annotated[
         "--filter",
         help="FACET=VALUE; only documents holding this facet value or alias. Repeat for"
         " several facets, which combine with AND.",
+    ),
+]
+TypeOption = Annotated[
+    str | None,
+    typer.Option("--type", help="Only documents of this deliverable type (case-insensitive)."),
+]
+VersionsOption = Annotated[
+    VersionScope,
+    typer.Option(
+        help="current leaves out documents superseded by another document in scope; all keeps"
+        " every version."
     ),
 ]
 
@@ -191,6 +202,8 @@ def search(
     snapshot: Path,
     query: str,
     filter_values: FilterOption = None,
+    deliverable_type: TypeOption = None,
+    versions: VersionsOption = "current",
     top_k: int = 8,
 ) -> None:
     """Hybrid search of a snapshot (needs OPENAI_API_KEY)."""
@@ -199,8 +212,15 @@ def search(
         embedder = _embedder_for([snap])
         if embedder is None:
             raise ArkiveError("search needs OPENAI_API_KEY; use grep for offline exact matching")
-        hits = snap.search(query, embedder, filters=filters, top_k=top_k)
-        _echo_json([hit.model_dump() for hit in hits])
+        result = snap.search(
+            query,
+            embedder,
+            filters=filters,
+            deliverable_type=deliverable_type,
+            versions=versions,
+            top_k=top_k,
+        )
+        _echo_json(result.model_dump())
 
 
 @app.command()
@@ -208,13 +228,21 @@ def grep(
     snapshot: Path,
     pattern: str,
     filter_values: FilterOption = None,
+    deliverable_type: TypeOption = None,
+    versions: VersionsOption = "current",
     max_matches: int = 20,
 ) -> None:
     """Literal case-insensitive search of section text (offline)."""
     filters = _parse_filters(filter_values)
     with _domain_errors(), TopicSnapshot.open(snapshot) as snap:
-        matches = snap.grep(pattern, filters=filters, max_matches=max_matches)
-        _echo_json([match.model_dump() for match in matches])
+        result = snap.grep(
+            pattern,
+            filters=filters,
+            deliverable_type=deliverable_type,
+            versions=versions,
+            max_matches=max_matches,
+        )
+        _echo_json(result.model_dump())
 
 
 @app.command()

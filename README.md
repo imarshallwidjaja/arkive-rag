@@ -12,7 +12,7 @@ A team uses one snapshot for two jobs:
 ## At a glance
 
 - **No data preparation.** Put the documents in any folder layout. Tagging, renaming, and reformatting are not needed. Optional plain-English `AGENTS.md` notes tell Arkive how the collection fits together.
-- **Local, read-only serving.** The server reads the knowledge file on your machine and makes no generative AI calls. Nine of its ten tools work fully offline, and only `search` needs an OpenAI key, to embed the query. `prepare_draft` ranks past work by keywords when no key is set. When a key is set, it also sends the project inputs to OpenAI for embedding.
+- **Local, read-only serving.** The server reads the knowledge file on your machine and makes no generative AI calls. Ten of its eleven tools work fully offline, and only `search` needs an OpenAI key, to embed the query. `prepare_draft` ranks past work by keywords when no key is set. When a key is set, it also sends the project inputs to OpenAI for embedding.
 - **Capped build spend.** `--max-cost` stops new paid model calls once the estimated spend reaches your limit.
 - **Private data stays out of Git.** Keep client documents and `*.arkive.db` files in a private store. The repository's `.gitignore` excludes snapshots and private evaluation packs.
 

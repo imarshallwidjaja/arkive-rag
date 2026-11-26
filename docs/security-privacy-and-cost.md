@@ -15,7 +15,7 @@ Arkive sends document content to OpenAI only while it builds a snapshot. After t
 | **First build** | Page images and page text for transcription, document sections for summaries, folder names, curator notes, and document summaries for organising the collection, and chunk text for embeddings (numeric vectors used for meaning-based search). | Source files, rendered pages, and the finished snapshot. |
 | **Unchanged rebuild with `--cache`** | Nothing. The cache answers every request, so the build makes zero provider calls. | Everything. |
 | **Serving with an API key** | The text of each `search` query, and the project inputs given to `prepare_draft`, to turn them into embeddings. No document content is sent. | The snapshot and every tool result. |
-| **Serving without an API key** | Nothing. Nine of the ten tools work, and `search` reports that it needs a key. | Everything. |
+| **Serving without an API key** | Nothing. Ten of the eleven tools work, and `search` reports that it needs a key. | Everything. |
 
 The AI assistant that calls Arkive is a separate program. It sends the tool results it receives to whatever model it uses, under that assistant's own data terms.
 

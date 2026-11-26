@@ -99,7 +99,7 @@ def run_layer1(
             rankings = snapshot.rank_channels(
                 case.query, embedded, filters=case.filters, top_k=TOP_K
             )
-            served = snapshot.search(case.query, embedded, filters=case.filters, top_k=TOP_K)
+            served = snapshot.search(case.query, embedded, filters=case.filters, top_k=TOP_K).hits
             arms: dict[RetrievalArm, Sequence[RankedText]] = {a: h for a, h in rankings.items()}
             arms["served_search"] = served
             results.append(

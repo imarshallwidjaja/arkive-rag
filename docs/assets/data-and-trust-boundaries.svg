@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="data-and-trust-boundaries-title data-and-trust-boundaries-desc" id="data-and-trust-boundaries-root">
         <title id="data-and-trust-boundaries-title">Arkive RAG Data and Trust Boundaries</title>
-        <desc id="data-and-trust-boundaries-desc">Documents, the build cache, the read-only snapshot, the local MCP server and the AI assistant stay in the local environment; OpenAI is called during the build and, when a key is configured, to embed a search query or draft brief at serve time; nine of the ten tools also work offline.</desc>
+        <desc id="data-and-trust-boundaries-desc">Documents, the build cache, the read-only snapshot, the local MCP server and the AI assistant stay in the local environment; OpenAI is called during the build and, when a key is configured, to embed a search query or draft brief at serve time; ten of the eleven tools also work offline.</desc>
         <defs>
       <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
       #data-and-trust-boundaries-root { --color-paper:       #F4F1EA;
@@ -80,7 +80,7 @@
         <rect x="756" y="340" width="160" height="48" rx="2" fill="#EEEDE6"/>
         <text x="836" y="352" fill="#1B5E63" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">OPTIONAL</text>
         <text x="836" y="368" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">search query or draft brief</text>
-        <text x="836" y="382" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">9/10 tools work offline</text>
+        <text x="836" y="382" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">10/11 tools work offline</text>
 
         <!-- NODES (painted after connectors) -->
         <!-- 1. Curated Folder -->
@@ -154,5 +154,5 @@
         <text x="476" y="572" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Build-time external call</text>
 
         <line x1="648" y1="568" x2="676" y2="568" stroke="#1B5E63" stroke-width="1.1" stroke-dasharray="5,4"/>
-        <text x="684" y="572" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Optional call; 9/10 tools offline</text>
+        <text x="684" y="572" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Optional call; 10/11 tools offline</text>
       </svg>

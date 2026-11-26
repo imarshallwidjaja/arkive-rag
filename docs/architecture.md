@@ -30,7 +30,7 @@ their text and the factual provenance of that text.
 | `native_formats.py` | What a file's own structure holds, read from its bytes: Excel workbooks (`xlsx_markdown`) and HTML pages (`html_markdown`) as Markdown through Docling's spreadsheet and HTML backends, the Office archive limits (`open_office_archive`), the accepted-revision copy of a Word file (`accepted_revision_copy`), Word comments and tracked changes (`docx_asides`), and PowerPoint speaker notes, comments and chart data (`pptx_supplements`). It is the only module that imports Docling or openpyxl; `compiler` imports it inside the functions that read those formats. |
 | `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what an aside (a visual transcript or an annotation) is and its removal (`without_asides`), the one GFM table parser and renderer (`split_table_cells`, `tables`, `render_table`, `abridge_tables`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a corpus recur (`recurring_units`, over plain `TextDocument` records). Induction, the drafting packet and the evaluation harness all measure text with it. |
 | `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup, document pages and the drafting packet). |
-| `server.py` | `TopicCatalog` (open snapshots keyed by topic), the ten MCP tools and the server instructions. |
+| `server.py` | `TopicCatalog` (open snapshots keyed by topic), the eleven MCP tools and the server instructions. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
 
 Dependencies point one way: `cli` → `server` → `snapshot`, and `cli` →
@@ -769,6 +769,9 @@ Tables (schema version `7.0`):
 | `unit_clusters`, `cluster_sections` | Each recurring unit's kind and text, and every section of a deliverable that holds it, in order, with that section's sample of a prose unit. |
 | `sections`, `pages`, `chunks` | Section Markdown with heading path and pages; native text, visual summary and WebP per page; chunk content, breadcrumb and float32 embedding. |
 | `chunks_fts` | FTS5 over NFKC-normalised chunk content and breadcrumb (`porter unicode61 remove_diacritics 2`). |
+| `document_attributes` | Each document's verified card attributes (`DocumentAttribute`): `ordinal` from 1 in card order, `name`, `value` and the `section_id` of the document's section where the attribute's quote was located. The quote itself stays in the section text. |
+| `document_tables`, `table_rows` | Every GFM table `passages.tables` finds in a section's Markdown, written at build time with no model call: `table_id` (`<section_id>_tbl_<NNN>`, numbered from 1 within the section), the section's pages and heading path, the caption line, `headers_json`, `column_count` and `row_count`; and each body row's `cells_json`, numbered from 1, padded or cut to the header's width. Each cell is the text the table shows, an escaped pipe (`\\|`) read as `\|`. |
+| `table_rows_fts` | FTS5 over each table row: `header_norm` (the NFKC header cells joined by ` \| `) and `cells_norm` (the row's cells, likewise), keyed by `table_id` and `row_ordinal`. A table without body rows has one entry numbered 0 with empty `cells_norm`, so its header is searchable. |
 
 The corpus fingerprint is the SHA-256 hex digest of the lines `rel_path NUL
 sha256`, one per document sorted by `rel_path` and joined by newlines. It
@@ -799,8 +802,15 @@ one and only a family of one is `sole`, at most one member is `latest`, and a
 superseded member names another member that is not superseded itself, the
 latest member when the family has one (so supersession takes one step and has
 no cycle); that each feedback lesson cites a section of its feedback source and
-names listed types; and that every recurring unit is held by citable sections
-of two documents, none of them feedback. It loads the
+names listed types; that every recurring unit is held by citable sections
+of two documents, none of them feedback; that each document's attributes are
+numbered from 1, have a nonblank name and value, and cite a section of that
+document; that each section's stored tables are exactly the tables
+`passages.tables` reads from its Markdown (headers, rows and caption, numbered
+from 1), so stored rows cannot contradict `read_section`; that each table's
+pages and heading path follow its section, its rows are numbered from 1 to
+`row_count` with `column_count` cells, and `table_rows_fts` holds every
+index entry exactly once with the text the row holds. It loads the
 facets, aliases, document-to-facets map, sections, families and recurring units
 once, with chunk metadata and the embedding matrix. `list_topics` and
 `arkive-rag inspect` report the fingerprint and version; `inspect` also prints
@@ -832,8 +842,9 @@ local packs are not staged by accident.
 
 ## Retrieval
 
-- **Filters.** `list_documents`, `search`, `rank_channels`, `grep` and
-  `prepare_draft` take `filters`, a mapping from facet name to one value. A
+- **Filters.** `list_documents`, `search`, `rank_channels`, `grep`,
+  `query_tables` and `prepare_draft` take `filters`, a mapping from facet name
+  to one value. A
   value matches a canonical facet value or one of its aliases after
   `fold_text`. Several facets combine with AND; an empty mapping means no
   filter. `TopicSnapshot.resolve_filters` turns the mapping into the set of
@@ -862,11 +873,26 @@ local packs are not staged by accident.
   which a client such as OpenCode cuts a tool result. Every result is measured
   as served (`fits_response`) before it is returned; the drafting packet
   prices each addition by its exact bytes and measures the finished packet.
-- **Active pool.** A superseded document is left out wherever the document
-  that supersedes it passes the filters (`_active_pool`), so a copy or draft
-  stays reachable when filters leave out the version that replaces it.
-- **search** returns the fused ranking diversified by version family. Only
-  the active pool is ranked, so a long superseded draft cannot take the
+- **Version scope.** `_resolve_scope(filters, deliverable_type, versions)` is
+  the one rule every scoped read uses (`list_documents`, `search`, `grep`,
+  `query_tables`, and `prepare_draft` with its filters only). The pool is the
+  documents passing the filters and, with a nonblank `deliverable_type`
+  (matched by `fold_facet_label`; an unknown type raises `NotFoundError`), of
+  that canonical type, curator notes excluded. With `versions="current"`, the
+  MCP default, a document superseded by another document of the pool is left
+  out, so a copy or draft stays reachable when the filters leave out the
+  version that replaces it; each result reports `excluded_superseded_count`.
+  `versions="all"` keeps every version. Any other value raises
+  `InvalidFilterError`. The unpaginated `TopicSnapshot.list_documents` that
+  `inspect` and the evaluation harness read defaults to `all`.
+- **Document provenance.** Document pages, outlines, search hits, grep matches
+  and table results carry the same `DocumentProvenance` fields: `doc_id`,
+  `deliverable_type`, `doc_date`, `family_id`, `version_status`,
+  `superseded_by`, and `superseded_doc_ids`, the family members the document
+  supersedes, at most 24 with the rest in `omitted_superseded_doc_ids`.
+- **search** returns `SearchResult(hits, excluded_superseded_count)`: the fused
+  ranking diversified by version family. Only
+  the documents of the scope are ranked, so a long superseded draft cannot take the
   channels' 300 places from its latest version. At most three chunks of one family
   (`SEARCH_FAMILY_CAP`) are taken first; when that leaves fewer than `top_k`
   hits, as when the filters name one document, the held-back chunks fill the
@@ -879,8 +905,32 @@ local packs are not staged by accident.
   Pattern and text are compared by `fold_text` (NFKC, Unicode dashes as `-`,
   case-folded), so `2016-2017` finds `2016–2017` and `km2` finds `km²`. A
   snippet is at most 400 characters of the line, centred on the first match.
-  `max_matches` is 1 to 50 (`MAX_GREP_MATCHES`); the matches that fit one
-  tool result are returned.
+  When the line is a body row of a table, the snippet starts with the header
+  row line of that table (`passages.table_header_lines`, by line position, so
+  identical rows of two tables keep their own headers), cut to 200
+  characters, on a line of its own. `max_matches` is 1 to 50 (`MAX_GREP_MATCHES`); the
+  matches that fit one tool result are returned as
+  `GrepResult(matches, excluded_superseded_count, truncated)`, `truncated`
+  true when further lines match.
+- **Table queries.** `query_tables(query, columns, filters, deliverable_type,
+  versions, limit=20, offset=0)` returns the stored tables of the scope in path
+  order (document, section, table). `columns` (1 to 20 nonblank patterns)
+  keeps the tables whose `fold_text` headers contain each pattern and shows the
+  matched columns plus column 0, the row labels. `query` runs
+  `build_fts5_query` against `header_norm` and `cells_norm` together, keeping
+  the tables with a matching row; a table with rows whose cells match shows
+  those rows (`matched_rows`), and one whose header alone matches shows its
+  leading rows with `matched_rows` 0. A table without body rows is indexed as
+  one entry numbered 0 with no cells, so its header is found too. A query with
+  no words matches no table. `limit` outside 1 to 50 (`MAX_TABLE_QUERY`), a
+  negative offset or a blank column pattern raises `InvalidFilterError`. Each
+  table shows at most 24 columns (`MAX_TABLE_QUERY_COLUMNS`, the rest in
+  `omitted_columns`) and 20 rows (`MAX_TABLE_QUERY_ROWS`) within 12,000 bytes
+  (`TABLE_QUERY_ROWS_MAX_BYTES`, the rest in `omitted_rows`), header cells cut
+  to 120 characters, body cells to 300 and captions to 500, so one wide or long
+  table cannot fill a page. The page holds the tables that fit one tool
+  result, with `total_tables`, `next_offset` and
+  `excluded_superseded_count`.
 - **Glossary lookup.** Without a query, `lookup_glossary` lists terms with
   their kind, aliases and whether any sense has a definition. With a query, it
   returns the full entries whose folded term or alias contains the folded
@@ -895,7 +945,12 @@ local packs are not staged by accident.
   of them without hashes: `limit` from 1 to 100 (default 50) from `offset`,
   fewer when more would not fit one tool result, with `total` and
   `next_offset`. A summary in a listing is cut to 240 characters
-  (`LIST_SUMMARY_CHARS`).
+  (`LIST_SUMMARY_CHARS`). Each listed document shows at most 12 attributes
+  (`LIST_ATTRIBUTES`) within 4,000 bytes (`LIST_ATTRIBUTES_MAX_BYTES`) and an
+  outline's document the attributes that fit 8,000 bytes
+  (`OUTLINE_ATTRIBUTES_MAX_BYTES`), each name cut to 120 characters
+  (`ATTRIBUTE_NAME_CHARS`) and each value to 300, the rest counted in
+  `omitted_attributes`.
 - **Outlines and sections.** `outline(doc_id, offset)` returns the sections
   from `offset` that fit one tool result, each heading path cut by
   `heading_context`, with `total_sections` and `next_offset`.
@@ -918,6 +973,10 @@ local packs are not staged by accident.
   deliverable types up to 50 each (`SUMMARY_MAX_NAMES`), fewer when more
   would not fit, counting the rest in `omitted_values` and
   `omitted_deliverable_types`.
+- **Facet coverage.** Each facet in `list_topics` and `get_topic_guide`
+  carries `document_count`, the citable documents holding at least one of its
+  values, beside the topic's `citable_document_count`, so a facet few
+  documents hold reads as partial. Both are derived when read.
 - **Topic guide.** `guide()` keeps the guide text and the facet names and
   descriptions (cut to 300 characters, `GUIDE_DESCRIPTION_CHARS`, as are the
   deliverable type descriptions), then as many deliverable types as fit, then
@@ -941,7 +1000,8 @@ unknown type raises `NotFoundError` listing the topic's types with their
 document counts, all before any embedding; a type matches after
 `fold_facet_label`, and a blank type is no type.
 
-- **Pool.** Every citable document of the active pool that is not feedback; a
+- **Pool.** Every citable document of the current versions of the documents
+  passing the filters (`_resolve_scope`) that is not feedback; a
   feedback document of the requested type stays, so a review can be drafted
   as a review.
 - **Relevance.** The inputs are ranked with the hybrid ranking above, or BM25
@@ -999,12 +1059,15 @@ document counts, all before any embedding; a type matches after
   exemplars, and any remaining outline headroom expands capped outlines in rank
   order; if the capped outlines still exceed the budget, the last exemplar
   moves to the candidates. Section text is then
-  packed whole, never cut, each addition kept only while the packet fits:
-  the first exemplar's input-matched sections (at most six), sections with
-  recurring units, and first and last two sections; up to two supplemental
-  sections; the other exemplars' input-matched sections and recurring sections
-  that show a unit no included section shows yet; the rest of the first
-  exemplar; then the other exemplars' boundary and remaining sections.
+  packed whole, never cut, each addition kept only while the packet fits, in
+  tiers: the first exemplar's input-matched sections (at most six); up to two
+  supplemental sections; the other exemplars' input-matched sections; the
+  first exemplar's first and last two sections; every exemplar's sections
+  with recurring units that show a unit no included section shows yet; the
+  other exemplars' boundary sections; the remaining recurring sections; the
+  rest of the first exemplar; then the rest of the others. So a long first
+  exemplar fills the packet only after every exemplar's matched and boundary
+  sections.
   A section that does not fit is skipped, its entry kept, and counted in
   `omitted_sections`; later, smaller ones may still fit. The packet is
   serialized a handful of times, not once per section: the envelope and the
@@ -1013,8 +1076,10 @@ document counts, all before any embedding; a type matches after
   (`PACKET_MARGIN_BYTES`, for the counters' digits), and the finished packet
   is measured once, the last additions taken back if it still does not
   fit.
-- **Supplemental sections.** Sections of deliverables of the active pool,
-  outside the exemplars' families and of the requested type, that hold the
+- **Supplemental sections.** Sections of deliverables of the pool, outside
+  the exemplars' families and of the lesson type (the requested type, else the
+  first exemplar's), so an unrelated equipment list holding another project's
+  serial is not pulled in, that hold the
   most rare input words: words of four or more characters, not numbers, held
   by at most two version families of deliverables (reviews, curator notes and
   superseded drafts do not count). A named team
@@ -1024,8 +1089,12 @@ document counts, all before any embedding; a type matches after
   feedback document of the topic whatever the filters (they are house rules
   for the type), up to 6,000 bytes; `curator_notes` the topic's notes up to
   6,000 bytes; each with a count of what was left out.
-  `drafting_guidance` (`DRAFTING_GUIDANCE`) tells the agent to take every fact
-  of the new work only from the user's inputs, reuse and adapt method text
+  `drafting_guidance` (`DRAFTING_GUIDANCE`) tells the agent to take every
+  project-specific fact (client, site, dates, measured values, fees, serials,
+  coordinates) only from the user's inputs; to carry house-wide equipment,
+  methodology and standard technical constants that appear identically across
+  independent version families or in the lessons, unless the inputs give a
+  project value, which wins, and never a value held by one family only; to reuse and adapt method text
   where the inputs use the same method, weigh dates, families and recurrence
   counts as provenance (asking the user when an institutional policy is
   genuinely uncertain in an interactive session), follow the closest
@@ -1038,7 +1107,7 @@ document counts, all before any embedding; a type matches after
 `TopicCatalog` and refuses two snapshots with the same topic. Every structured
 tool result is one text block of `response_text` (compact JSON) beside its
 structured content, so what the snapshot measured is what the client reads. It
-has ten tools:
+has eleven tools:
 
 - `list_topics(offset=0)`: one page of the served topics (`TopicPage`), each
   with its title cut to 500 characters, its facets and allowed values and its
@@ -1049,13 +1118,18 @@ has ten tools:
   document count and feedback count.
 - `prepare_draft(topic, project_inputs, deliverable_type=None, filters=None)`:
   the drafting packet above.
-- `list_documents(topic, filters=None, limit=50, offset=0)`: one document
-  page.
+- `list_documents(topic, filters=None, deliverable_type=None,
+  versions="current", limit=50, offset=0)`: one document page.
 - `get_document_outline(topic, doc_id, offset=0)` and
   `read_section(topic, section_id, offset=0)`: one page of an outline, one part
   of a section.
-- `search`, `grep`, `view_page` and `lookup_glossary(topic, query=None,
-  offset=0)`.
+- `search(topic, query, filters=None, deliverable_type=None,
+  versions="current", top_k=5)` and `grep(topic, pattern, filters=None,
+  deliverable_type=None, versions="current", max_matches=12)`.
+- `query_tables(topic, query=None, columns=None, filters=None,
+  deliverable_type=None, versions="current", limit=20, offset=0)`: one page of
+  table rows (`TableQueryResult`).
+- `view_page` and `lookup_glossary(topic, query=None, offset=0)`.
 
 `view_page` returns the caption as text content and the page as `image/webp`
 image content. The caption (`page_caption`) holds the title cut to 500
@@ -1066,10 +1140,13 @@ out. Domain errors become tool errors whose message names the valid topics,
 facets, values, deliverable types or pages: at most 40 of them with a count
 of the rest, and at most 200 characters of the caller's input.
 
-The server's instructions are short. They name `list_topics` and facet
-filters; for questions, the read tools, citing `doc_id`, `section_id` and
-pages, and saying that the corpus does not establish a fact when `search` and
-`grep` find no evidence for it; and for drafting, `prepare_draft` with the
+The server's instructions are short. They name `list_topics`, facet filters
+and `deliverable_type`; for questions, the read tools, `query_tables` for
+values in tables, citing `doc_id`, `section_id` and pages, repeating a call
+with `versions="all"` when `excluded_superseded_count` is above zero and the
+user asks about earlier drafts or version history, and saying that the corpus
+does not establish a fact when `search` and `grep` find no evidence for it;
+and for drafting, `prepare_draft` with the
 user's full inputs, following the packet's guidance and reading omitted
 sections with `read_section`.
 
@@ -1083,7 +1160,9 @@ server still starts; `search` returns an error that points to the offline
 tools, and `prepare_draft` ranks with BM25 alone.
 
 The CLI's `search` and `grep` take repeated `--filter FACET=VALUE`; naming a
-facet twice is a usage error, because each facet takes one value.
+facet twice is a usage error, because each facet takes one value. They also
+take `--type` and `--versions current|all`, and print the `SearchResult` or
+`GrepResult` as JSON.
 
 ## Evaluation
 
@@ -1208,7 +1287,7 @@ of that collection (see Example corpora). Real packs stay in the private store.
 | Layer | Module | Measures |
 | --- | --- | --- |
 | 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of four rankings over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks three arms over raw chunk channels: `bm25_only`, `dense_only` and `hybrid_rrf`. The fourth, `served_search`, is `TopicSnapshot.search` with the same top-k, the ranking agents get: it leaves out a superseded document whose replacement passes the case's filters and takes at most `SEARCH_FAMILY_CAP` (3) chunks of one version family before held-back chunks fill the list; it shows whether that collapse and cap keep or improve completion. All four use one query embedding per case, made only after the first ranking has validated the query, filters and top-k, so an invalid case fails with no embedding call. |
-| 2 | `agents.py` | An agent conversation answers each QA case once with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and once with the ten Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score with evidence, below. Raw-file extraction runs once before timing. The report groups results by `kind`. |
+| 2 | `agents.py` | An agent conversation answers each QA case once with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and once with the eleven Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score with evidence, below. Raw-file extraction runs once before timing. The report groups results by `kind`. |
 | 3 | `drafting.py` | For each holdout, or the one `--holdout` names, builds a holdout snapshot, records which documents `prepare_draft` selects, and runs `--drafts` rounds of four draft arms, and a fifth when the holdout's `exemplar_paths` is not empty, measured against a reference deliverable; the procedure, guards and measures are below. |
 
 The Q&A judge sees the question, the reference facts, the anchors and their

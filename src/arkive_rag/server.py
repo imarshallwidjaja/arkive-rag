@@ -21,12 +21,14 @@ from arkive_rag.models import (
     DocumentPage,
     DraftPacket,
     GlossaryLookup,
-    GrepMatch,
+    GrepResult,
     NotFoundError,
-    SearchHit,
+    SearchResult,
     SectionReadView,
+    TableQueryResult,
     TopicGuide,
     TopicPage,
+    VersionScope,
     choices,
     echoed,
 )
@@ -43,13 +45,17 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 INSTRUCTIONS = """\
 Arkive serves reference collections ("topics").
 1. Call list_topics only when more than one topic is served or a topic's facets are unknown.
-   Facets filter list_documents, search, grep and prepare_draft (`filters` combine with AND).
-2. Answering questions: start with targeted search or grep; use read_section only when a hit
-   needs surrounding context, get_topic_guide for scope or curator notes, lookup_glossary for
+   Facets filter list_documents, search, grep, query_tables and prepare_draft (`filters`
+   combine with AND); deliverable_type narrows the first four to one document type.
+2. Answering questions: start with targeted search or grep, or query_tables for values in
+   tables (columns names the headers you need); use read_section only when a hit needs
+   surrounding context, get_topic_guide for scope or curator notes, lookup_glossary for
    terms, and view_page for charts, maps or visual layout. Cite doc_id, section_id and pages,
    and answer as soon as the evidence is sufficient. Delivered final reports and memoranda
-   outrank provisional proposals or earlier drafts; note both when they differ. When search
-   and grep find no evidence, state that the corpus does not establish it and stop.
+   outrank provisional proposals or earlier drafts; note both when they differ. Reads cover
+   current versions; when excluded_superseded_count > 0 and the user asks about earlier
+   drafts or version history, repeat the call with versions="all". When search and grep find
+   no evidence, state that the corpus does not establish it and stop.
 3. Drafting: call prepare_draft with the user's full project_inputs, follow its
    drafting_guidance, exemplars, lessons and curator_notes, and read_section for omitted
    sections.
@@ -103,17 +109,13 @@ class TopicCatalog:
         self.close()
 
 
-def _structured(result: BaseModel | Sequence[BaseModel]) -> CallToolResult:
+def _structured(result: BaseModel) -> CallToolResult:
     """A structured tool result whose text block is `response_text`, the compact JSON the
     snapshot measures its results by, so a result that fits its budget reaches the client
-    whole. A list result is structured as `{"result": [...]}`, as the SDK wraps one."""
-    if isinstance(result, BaseModel):
-        structured = result.model_dump(mode="json")
-    else:
-        structured = {"result": [item.model_dump(mode="json") for item in result]}
+    whole."""
     return CallToolResult(
         content=[TextContent(type="text", text=response_text(result))],
-        structured_content=structured,
+        structured_content=result.model_dump(mode="json"),
     )
 
 
@@ -174,12 +176,24 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
 
     @server.tool()
     def list_documents(
-        topic: str, filters: dict[str, str] | None = None, limit: int = 50, offset: int = 0
+        topic: str,
+        filters: dict[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
+        limit: int = 50,
+        offset: int = 0,
     ) -> Annotated[CallToolResult, DocumentPage]:
-        """Paged documents in path order with type, feedback role and version family."""
+        """Paged documents in path order with type, stated attributes, feedback role and
+        version family."""
         with _as_tool_errors():
             return _structured(
-                catalog.get(topic).list_documents_page(filters=filters, limit=limit, offset=offset)
+                catalog.get(topic).list_documents_page(
+                    filters=filters,
+                    deliverable_type=deliverable_type,
+                    versions=versions,
+                    limit=limit,
+                    offset=offset,
+                )
             )
 
     @server.tool()
@@ -192,27 +206,80 @@ def create_mcp_server(catalog: TopicCatalog, embed_query: QueryEmbedder | None =
 
     @server.tool()
     def search(
-        topic: str, query: str, filters: dict[str, str] | None = None, top_k: int = 5
-    ) -> Annotated[CallToolResult, list[SearchHit]]:
+        topic: str,
+        query: str,
+        filters: dict[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
+        top_k: int = 5,
+    ) -> Annotated[CallToolResult, SearchResult]:
         """Hybrid keyword and semantic chunk search, diversified by version family."""
         with _as_tool_errors():
             snapshot = catalog.get(topic)
             if embed_query is None:
                 raise ToolError(
                     "semantic search needs OPENAI_API_KEY on the server. grep, list_documents,"
-                    " get_document_outline, read_section, view_page, lookup_glossary and"
-                    " prepare_draft work without it."
+                    " get_document_outline, read_section, view_page, lookup_glossary,"
+                    " query_tables and prepare_draft work without it."
                 )
-            return _structured(snapshot.search(query, embed_query, filters=filters, top_k=top_k))
+            return _structured(
+                snapshot.search(
+                    query,
+                    embed_query,
+                    filters=filters,
+                    deliverable_type=deliverable_type,
+                    versions=versions,
+                    top_k=top_k,
+                )
+            )
 
     @server.tool()
     def grep(
-        topic: str, pattern: str, filters: dict[str, str] | None = None, max_matches: int = 12
-    ) -> Annotated[CallToolResult, list[GrepMatch]]:
-        """Case-insensitive literal search for exact strings, numbers and filenames (max 50)."""
+        topic: str,
+        pattern: str,
+        filters: dict[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
+        max_matches: int = 12,
+    ) -> Annotated[CallToolResult, GrepResult]:
+        """Case-insensitive literal search for exact strings, numbers and filenames (max 50);
+        a table row match shows its header row."""
         with _as_tool_errors():
             return _structured(
-                catalog.get(topic).grep(pattern, filters=filters, max_matches=max_matches)
+                catalog.get(topic).grep(
+                    pattern,
+                    filters=filters,
+                    deliverable_type=deliverable_type,
+                    versions=versions,
+                    max_matches=max_matches,
+                )
+            )
+
+    @server.tool()
+    def query_tables(
+        topic: str,
+        query: str | None = None,
+        columns: list[str] | None = None,
+        filters: dict[str, str] | None = None,
+        deliverable_type: str | None = None,
+        versions: VersionScope = "current",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Annotated[CallToolResult, TableQueryResult]:
+        """Rows of Markdown tables: columns keeps tables whose headers contain every given
+        name and shows those columns plus the row labels; query keeps rows matching its words
+        (paged by offset)."""
+        with _as_tool_errors():
+            return _structured(
+                catalog.get(topic).query_tables(
+                    query=query,
+                    columns=columns,
+                    filters=filters,
+                    deliverable_type=deliverable_type,
+                    versions=versions,
+                    limit=limit,
+                    offset=offset,
+                )
             )
 
     @server.tool()

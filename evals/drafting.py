@@ -748,7 +748,7 @@ async def run_layer3_holdout(
         )
 
         def search_chunks(args: dict[str, Any]) -> str:
-            hits = built.search(str(args["query"]), embedder, top_k=5)
+            hits = built.search(str(args["query"]), embedder, top_k=5).hits
             return json.dumps(
                 [
                     [h.chunk_id, h.doc_title, f"{h.page_start}-{h.page_end}", h.content]

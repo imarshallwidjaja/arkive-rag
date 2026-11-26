@@ -168,21 +168,35 @@ def _caption_above(lines: Sequence[str], start: int, floor: int) -> str | None:
     return text
 
 
+def _cell_texts(line: str) -> list[str]:
+    """The cells of one table row as text, an escaped pipe read as the pipe it shows."""
+    return [cell.replace("\\|", "|") for cell in split_table_cells(line)]
+
+
 def tables(markdown: str) -> list[MarkdownTable]:
-    """Every GFM table of `markdown` in order, parsed with `split_table_cells`. A body row is
-    padded or cut to the header's width, as GFM renders it."""
+    """Every GFM table of `markdown` in order, parsed with `split_table_cells`, each cell the
+    text GFM shows (`\\|` read as `|`). A body row is padded or cut to the header's width, as
+    GFM renders it."""
     lines = markdown.splitlines()
     found: list[MarkdownTable] = []
     floor = 0
     for start, end in _table_spans(lines):
-        headers = tuple(split_table_cells(lines[start]))
+        headers = tuple(_cell_texts(lines[start]))
         rows = tuple(
-            tuple((split_table_cells(line) + [""] * len(headers))[: len(headers)])
+            tuple((_cell_texts(line) + [""] * len(headers))[: len(headers)])
             for line in lines[start + 2 : end]
         )
         found.append(MarkdownTable(headers, rows, _caption_above(lines, start, floor)))
         floor = end
     return found
+
+
+def table_header_lines(lines: Sequence[str]) -> dict[int, str]:
+    """The header row line of the table each body row of `lines` belongs to, keyed by the
+    body row's index in `lines`."""
+    return {
+        index: lines[start] for start, end in _table_spans(lines) for index in range(start + 2, end)
+    }
 
 
 def abridge_tables(

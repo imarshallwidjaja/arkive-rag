@@ -1217,15 +1217,6 @@ def _overlaps[F](features: Sequence[frozenset[F]]) -> list[Counter[int]]:
     return shared
 
 
-def byte_identical_groups(view: CorpusView) -> list[list[str]]:
-    """Citable documents with the same bytes, two or more per group, each in path order: one
-    artifact under several paths, so one version family whatever its length."""
-    groups: dict[str, list[str]] = {}
-    for doc in view.citable:
-        groups.setdefault(doc.reading.sha256, []).append(doc.doc_id)
-    return [members for members in groups.values() if len(members) > 1]
-
-
 def version_candidates(
     view: CorpusView, roles: Mapping[str, ProposedRole]
 ) -> list[tuple[str, str, float]]:
@@ -1554,10 +1545,9 @@ to a future deliverable of the reviewed types. Leave out items noted with no
 change, rejected or out of scope. Leave out every project-specific value: client,
 site and person names, places, fees, coordinates and project dates. Keep a
 house-wide constant when the reviewer establishes or enforces it as a rule that
-holds beyond this project: a standard instrument or equipment setting (such as a
-calibration sensitivity), a standard duration (such as a baseline period), a
-standard threshold (such as an alarm-rule percentage), or a regulatory or
-methodology clause and its required value. For each lesson give a short
+holds beyond this project: a standard reference value or equipment setting, a
+standard period or duration, a standard threshold or tolerance, or a regulatory
+or methodology clause and its required value. For each lesson give a short
 statement and a quote: verbatim text of the sections that shows it. Give an
 empty list when the sections hold none.
 """

@@ -35,14 +35,24 @@ from arkive_rag.models import (
     choices,
     document_id,
 )
+from arkive_rag.passages import render_table
 from arkive_rag.snapshot import (
+    ATTRIBUTE_NAME_CHARS,
+    ATTRIBUTE_VALUE_CHARS,
     DRAFTING_GUIDANCE,
+    GREP_TABLE_HEADER_CHARS,
+    LIST_ATTRIBUTES_MAX_BYTES,
     MAX_GREP_MATCHES,
     MAX_OTHER_CANDIDATES,
+    MAX_TABLE_QUERY_COLUMNS,
+    MAX_TABLE_QUERY_ROWS,
     MAX_TOP_K,
     RESPONSE_MAX_BYTES,
     SCHEMA_VERSION,
     SNIPPET_CHARS,
+    TABLE_HEADER_CHARS,
+    TABLE_QUERY_ROWS_MAX_BYTES,
+    TITLE_CHARS,
     TopicSnapshot,
     build_fts5_query,
     fits_response,
@@ -123,7 +133,7 @@ def snapshot(tmp_path: Path) -> Iterator[TopicSnapshot]:
 
 
 def query(snap: TopicSnapshot, text: str) -> list[SearchHit]:
-    return snap.search(text, FakeGateway().embed_query)
+    return snap.search(text, FakeGateway().embed_query).hits
 
 
 def test_fts_battery_never_raises_and_always_finds_lexical_hits(snapshot: TopicSnapshot) -> None:
@@ -213,7 +223,7 @@ def test_rrf_ranks_chunks_found_by_both_channels_above_single_channel_hits(
     gateway = KeywordGateway()
     path = compile_snapshot(tmp_path, files, gateway=gateway)
     with TopicSnapshot.open(path) as snap:
-        hits = snap.search("alpha", gateway.embed_query, top_k=3)
+        hits = snap.search("alpha", gateway.embed_query, top_k=3).hits
 
     assert [h.content for h in hits] == [
         "alpha dense-match",
@@ -242,7 +252,7 @@ def test_rank_channels_order_one_embedding_by_each_channel_and_handle_empty_snap
 
     with TopicSnapshot.open(compile_snapshot(tmp_path, files, gateway=gateway)) as snap:
         channels = snap.rank_channels("alpha", embed, top_k=3)
-        assert channels["hybrid_rrf"] == snap.search("alpha", gateway.embed_query, top_k=3)
+        assert channels["hybrid_rrf"] == snap.search("alpha", gateway.embed_query, top_k=3).hits
     assert calls == ["alpha"]
     bm25, dense = channels["bm25_only"], channels["dense_only"]
     assert [h.lexical_rank for h in bm25] == list(range(1, len(bm25) + 1))
@@ -312,17 +322,23 @@ def test_filters_combine_with_and_resolve_aliases_and_restrict_every_read(
     assert paths({"client": "Northwind Marine", "project": "p102-estuary-multibeam"}) == []
     assert snapshot.resolve_filters({}) is None
 
-    hits = snapshot.search("Sentinel-2", FakeGateway().embed_query, filters={"client": "Contoso"})
+    hits = snapshot.search(
+        "Sentinel-2", FakeGateway().embed_query, filters={"client": "Contoso"}
+    ).hits
     assert hits and {tuple(h.facets["client"]) for h in hits} == {("Contoso Ports",)}
-    assert {m.facets["project"][0] for m in snapshot.grep("sentinel-2")} == {
+    assert {m.facets["project"][0] for m in snapshot.grep("sentinel-2").matches} == {
         "p101-harbour-lidar",
         "p102-estuary-multibeam",
         "p103-reef-sonar",
     }
-    only_estuary = snapshot.grep("sentinel-2", filters={"project": "p102-estuary-multibeam"})
+    only_estuary = snapshot.grep(
+        "sentinel-2", filters={"project": "p102-estuary-multibeam"}
+    ).matches
     assert {m.doc_id for m in only_estuary} == {ESTUARY_PROPOSAL}
     assert (
-        snapshot.grep("sentinel-2", filters={"client": "Contoso", "project": "p101-harbour-lidar"})
+        snapshot.grep(
+            "sentinel-2", filters={"client": "Contoso", "project": "p101-harbour-lidar"}
+        ).matches
         == []
     )
 
@@ -339,7 +355,8 @@ def test_every_read_follows_path_order_not_the_hash_order_of_document_ids(
 
     with TopicSnapshot.open(path) as snap:
         assert [d.doc_id for d in snap.list_documents()] == ids
-        assert [m.doc_id for m in snap.grep("tide gauge")] == ids
+        # The copies supersede one another, so only every version lists all three.
+        assert [m.doc_id for m in snap.grep("tide gauge", versions="all").matches] == ids
         channels = snap.rank_channels("harbour tide gauge", FakeGateway().embed_query)
         for channel, hits in channels.items():
             assert [h.doc_id for h in hits] == ids, channel
@@ -347,19 +364,19 @@ def test_every_read_follows_path_order_not_the_hash_order_of_document_ids(
 
 def test_curator_guidance_answers_status_questions(snapshot: TopicSnapshot) -> None:
     text = "Where is the reef Sentinel-2 case study?"
-    top = snapshot.search(text, FakeGateway().embed_query, top_k=1)[0]
+    top = snapshot.search(text, FakeGateway().embed_query, top_k=1).hits[0]
     assert (top.kind, top.facets) == ("guidance", {"project": ["p103-reef-sonar"]})
-    assert snapshot.document(snapshot.grep("case study")[0].doc_id).is_curator_note
+    assert snapshot.document(snapshot.grep("case study").matches[0].doc_id).is_curator_note
 
 
 def test_grep_folds_dashes_compatibility_forms_and_case(snapshot: TopicSnapshot) -> None:
-    (dash,) = snapshot.grep("2016-2017")
+    (dash,) = snapshot.grep("2016-2017").matches
     assert "2016\u20132017" in dash.snippet
     assert dash.heading_path == "Rainfall" and dash.line_number == 3
-    assert snapshot.grep("KM2")[0].snippet.count("km\u00b2") == 1
-    assert len(snapshot.grep("C12-SUM(C13:C15)")) == 1
-    assert len(snapshot.grep("bathymetry", max_matches=2)) == 2
-    assert snapshot.grep("no such text anywhere") == []
+    assert snapshot.grep("KM2").matches[0].snippet.count("km\u00b2") == 1
+    assert len(snapshot.grep("C12-SUM(C13:C15)").matches) == 1
+    assert len(snapshot.grep("bathymetry", max_matches=2).matches) == 2
+    assert snapshot.grep("no such text anywhere").matches == []
     with pytest.raises(InvalidFilterError, match="blank"):
         snapshot.grep("  ")
 
@@ -477,7 +494,7 @@ def test_snapshot_paths_with_uri_syntax_open_read_only(tmp_path: Path, name: str
     shutil.copy(compile_snapshot(tmp_path / "build", BATHYMETRY_CORPUS), target)
 
     with TopicSnapshot.open(target) as snap:
-        assert snap.topic == "bathymetry" and snap.grep("330.9")
+        assert snap.topic == "bathymetry" and snap.grep("330.9").matches
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             snap._db.execute("DELETE FROM chunks")
     assert [p.name for p in folder.iterdir()] == [name]
@@ -490,7 +507,7 @@ def test_grep_snippet_centres_on_a_match_beyond_the_first_400_characters(
     path = compile_snapshot(tmp_path, {"p1/long.md": f"# Long\n\n{line}"})
 
     with TopicSnapshot.open(path) as snap:
-        (match,) = snap.grep("NEEDLE\u2011777")
+        (match,) = snap.grep("NEEDLE\u2011777").matches
 
     assert "needle-777" in match.snippet
     assert match.snippet.startswith("...") and match.snippet.endswith("...")
@@ -821,7 +838,7 @@ def test_document_pages_omit_hashes_validate_limits_and_shrink_to_the_response_b
 
 def test_grep_returns_at_most_fifty_matches(snapshot: TopicSnapshot) -> None:
     assert MAX_GREP_MATCHES == 50
-    assert len(snapshot.grep("a", max_matches=MAX_GREP_MATCHES)) <= 50
+    assert len(snapshot.grep("a", max_matches=MAX_GREP_MATCHES).matches) <= 50
     for bad in (0, MAX_GREP_MATCHES + 1):
         with pytest.raises(InvalidFilterError, match="between 1 and 50"):
             snapshot.grep("bathymetry", max_matches=bad)
@@ -844,6 +861,294 @@ VERSIONED = {
 }
 
 
+def _readings(version: str, date: str, first: str, second: str, note: str) -> str:
+    return (
+        f"# Survey Report {version}\n\nDate: {date}\nDeliverable: survey report\n\n"
+        "## Readings\n\n| Station | Reading (m) | Note |\n| --- | --- | --- |\n"
+        f"| S1 | {first} | {note} |\n| S2 | {second} | {note} |\n"
+    )
+
+
+TABLED = {
+    "p1/drafts/survey-report-v0.9.md": _readings("v0.9", "2025-03-01", "1.10", "2.20", "draft"),
+    "p1/survey-report.md": _readings("v1.0", "2025-04-01", "1.15", "2.25", "final"),
+    "p2/other.md": (
+        "# Other Note\n\nDeliverable: field note\n\n| Station | Depth |\n| --- | --- |\n"
+        "| S9 | 9.9 |\n"
+    ),
+    "p3/sheet.md": "# Sheet\n\n"
+    + "".join(f"Attr{chr(97 + i)}: value {i}\n" for i in range(15))
+    + "Deliverable: field note\n",
+}
+
+
+def test_reads_cover_current_versions_unless_every_version_is_asked_for(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, TABLED, topic="tabled")
+    draft, final, other, sheet = (document_id(p) for p in TABLED)
+    embed = FakeGateway().embed_query
+
+    with TopicSnapshot.open(path) as snap:
+        current = snap.list_documents_page()
+        every = snap.list_documents_page(versions="all")
+        notes = snap.list_documents_page(deliverable_type="FIELD NOTE")
+        hits = snap.search("station reading", embed)
+        all_hits = snap.search("station reading", embed, versions="all")
+        grepped, grepped_all = snap.grep("| S1 |"), snap.grep("| S1 |", versions="all")
+        outline = snap.outline(sheet)
+        assert [d.doc_id for d in snap.list_documents()] == [draft, final, other, sheet]
+        for bad in ("some", "CURRENT"):
+            with pytest.raises(InvalidFilterError, match="versions must be"):
+                snap.grep("S1", versions=bad)  # type: ignore[arg-type]
+        with pytest.raises(NotFoundError, match="valid types"):
+            snap.search("station", embed, deliverable_type="press release")
+
+    assert [d.doc_id for d in current.documents] == [final, other, sheet]
+    assert current.excluded_superseded_count == 1 and every.excluded_superseded_count == 0
+    assert [d.doc_id for d in every.documents] == [draft, final, other, sheet]
+    assert [d.doc_id for d in notes.documents] == [other, sheet]
+    # Every read result names the document's version standing the same way.
+    latest = every.documents[1]
+    assert (latest.version_status, latest.superseded_doc_ids, latest.family_id) == (
+        "latest",
+        [draft],
+        draft,
+    )
+    assert (every.documents[0].version_status, every.documents[0].superseded_by) == (
+        "superseded",
+        final,
+    )
+    assert [(a.name, a.value) for a in latest.attributes] == [
+        ("date", "2025-04-01"),
+        ("deliverable", "survey report"),
+    ]
+    assert all(a.section_id == f"{final}_sec_001" for a in latest.attributes)
+    # A listing shows twelve attributes; the outline shows every one that fits.
+    listed = current.documents[2]
+    assert (len(listed.attributes), listed.omitted_attributes) == (12, 4)
+    assert (len(outline.document.attributes), outline.document.omitted_attributes) == (16, 0)
+    assert draft not in {h.doc_id for h in hits.hits} and hits.excluded_superseded_count == 1
+    assert draft in {h.doc_id for h in all_hits.hits}
+    assert {h.version_status for h in all_hits.hits} >= {"superseded", "latest"}
+    (row,) = grepped.matches
+    assert (row.doc_id, row.version_status, grepped.excluded_superseded_count) == (
+        final,
+        "latest",
+        1,
+    )
+    assert row.snippet == "| Station | Reading (m) | Note |\n| S1 | 1.15 | final |"
+    assert [m.doc_id for m in grepped_all.matches] == [draft, final]
+
+
+def test_query_tables_selects_columns_rows_types_and_versions(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, TABLED, topic="tabled")
+    draft, final, other, _ = (document_id(p) for p in TABLED)
+
+    with TopicSnapshot.open(path) as snap:
+        readings = snap.query_tables(columns=["READING"])
+        readings_all = snap.query_tables(columns=["reading"], versions="all")
+        depth = snap.query_tables(columns=["depth", "stat"])
+        s9 = snap.query_tables(query="S9")
+        header_only = snap.query_tables(query="station")
+        typed = snap.query_tables(deliverable_type="survey report", versions="all")
+        paged = snap.query_tables(limit=1, offset=1)
+        # A query with no words to match matches no table.
+        assert snap.query_tables(query="!!!").tables == []
+        bad: dict[str, Any]
+        for bad in (
+            {"columns": []},
+            {"columns": [" "]},
+            {"columns": ["reading", "\t"]},
+            {"limit": 0},
+            {"limit": 51},
+            {"offset": -1},
+            {"filters": {"stage": "x"}},
+        ):
+            with pytest.raises(InvalidFilterError):
+                snap.query_tables(**bad)
+
+    (table,) = readings.tables
+    assert (table.table_id, table.doc_id, readings.excluded_superseded_count) == (
+        f"{final}_sec_002_tbl_001",
+        final,
+        1,
+    )
+    # The matched column and the row labels in column 0; the Note column is left out.
+    assert (table.headers, table.omitted_columns, table.column_count) == (
+        ["Station", "Reading (m)"],
+        1,
+        3,
+    )
+    assert [(r.row_ordinal, r.cells) for r in table.rows] == [
+        (1, ["S1", "1.15"]),
+        (2, ["S2", "2.25"]),
+    ]
+    assert (table.matched_rows, table.omitted_rows, table.version_status) == (0, 0, "latest")
+    assert [t.doc_id for t in readings_all.tables] == [draft, final]
+    assert [(t.doc_id, t.headers) for t in depth.tables] == [(other, ["Station", "Depth"])]
+    (hit,) = s9.tables
+    assert (hit.doc_id, hit.matched_rows, [r.cells for r in hit.rows]) == (
+        other,
+        1,
+        [["S9", "9.9"]],
+    )
+    # A header match shows each table's leading rows.
+    assert [(t.doc_id, t.matched_rows, len(t.rows)) for t in header_only.tables] == [
+        (final, 0, 2),
+        (other, 0, 1),
+    ]
+    assert [t.doc_id for t in typed.tables] == [draft, final]
+    assert (paged.total_tables, paged.next_offset, [t.doc_id for t in paged.tables]) == (
+        2,
+        None,
+        [other],
+    )
+
+
+_WIDE_HEADERS = [f"H{i:02d} " + "w" * 400 for i in range(26)]
+EDGE_TABLES = {
+    "a/alarms.md": (
+        "# Alarms\n\n## Levels\n\n| Site | Alarm Level |\n| --- | --- |\n| Greyscar | High |\n"
+        "| Ashby | Low |\n\n| Item | Note |\n| --- | --- |\n| a \\| b | c |\n"
+    ),
+    "b/empty.md": "# Empty\n\n## Limits\n\n| Threshold | Value |\n| --- | --- |\n",
+    "c/twin.md": (
+        "# Twin\n\n## Twin\n\n| Station | Depth (m) |\n| --- | --- |\n| S1 | 7 |\n\nBetween.\n\n"
+        "| Station | Cost ($) |\n| --- | --- |\n| S1 | 7 |\n"
+    ),
+    "d/wide.md": (
+        "# Wide\n\n## Wide\n\n"
+        + "Caption " * 2_500
+        + "\n\n"
+        + render_table(_WIDE_HEADERS, [[f"c{i}" for i in range(26)]])
+        + "\n"
+    ),
+    "e/long-header.md": "# Long header\n\n" + render_table(["Y" * 10_000, "Z"], [["needle", "z"]]),
+    "f/fenced.md": (
+        "# Fenced\n\n## Fenced\n\n| Probe | Depth |\n| --- | --- |\n| P1 | 3 |\n\n"
+        "```\n| Probe | Depth |\n| --- | --- |\n| P1 | fencedvalue |\n```\n"
+    ),
+}
+
+
+def test_query_tables_and_grep_read_each_table_as_shown_and_bounded(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, EDGE_TABLES, topic="edges")
+    alarms, empty, twin, wide, _, fenced = (document_id(p) for p in EDGE_TABLES)
+
+    with TopicSnapshot.open(path) as snap:
+        greyscar = snap.query_tables(query="Greyscar alarm")
+        threshold = snap.query_tables(query="Threshold")
+        threshold_column = snap.query_tables(columns=["threshold"])
+        piped = snap.query_tables(query="item note")
+        broad = snap.query_tables(columns=["w"])
+        twins = snap.grep("| S1 | 7 |")
+        needle = snap.grep("needle")
+        in_fence = snap.grep("fencedvalue")
+
+    # Header and cells match together; the row whose cells match is the one shown.
+    (alarm,) = greyscar.tables
+    assert (alarm.doc_id, alarm.matched_rows, [r.cells for r in alarm.rows]) == (
+        alarms,
+        1,
+        [["Greyscar", "High"]],
+    )
+    # A table of a header alone is found by its header, by query or by column.
+    for result, headers in ((threshold, ["Threshold", "Value"]), (threshold_column, ["Threshold"])):
+        (header_only,) = result.tables
+        assert (header_only.doc_id, header_only.headers, header_only.rows) == (empty, headers, [])
+    # An escaped pipe is the pipe the table shows.
+    (items,) = piped.tables
+    assert (items.headers, [r.cells for r in items.rows]) == (["Item", "Note"], [["a | b", "c"]])
+    # A 20 KB caption and 26 headers of 400 characters stay within their cuts: column 0 and
+    # the first matched columns up to the cap, the rest counted.
+    (shown,) = broad.tables
+    assert shown.doc_id == wide and fits_response(broad)
+    assert shown.caption is not None and len(shown.caption) == TITLE_CHARS
+    assert len(shown.headers) == MAX_TABLE_QUERY_COLUMNS and shown.omitted_columns == 2
+    assert all(len(h) <= TABLE_HEADER_CHARS for h in shown.headers)
+    # A grep match shows the header of the table it is in, even beside an identical row of
+    # another table, and a huge header row is cut.
+    assert [m.snippet for m in twins.matches] == [
+        "| Station | Depth (m) |\n| S1 | 7 |",
+        "| Station | Cost ($) |\n| S1 | 7 |",
+    ]
+    assert all(m.doc_id == twin for m in twins.matches)
+    (match,) = needle.matches
+    header, row = match.snippet.split("\n")
+    assert len(header) == GREP_TABLE_HEADER_CHARS and row == "| needle | z |"
+    # A pipe line inside a fenced code block is code, not a table row: no header is shown.
+    (fenced_match,) = in_fence.matches
+    assert (fenced_match.doc_id, fenced_match.snippet) == (fenced, "| P1 | fencedvalue |")
+
+
+_WIDE_ROW_HEADERS = [f"Q{i:02d}" for i in range(MAX_TABLE_QUERY_COLUMNS)]
+RANKED_TABLES = {
+    "a/sensors.md": "# Sensors\n\n## Readings\n\n"
+    + render_table(["Sensor", "Reading"], [[f"Sensor S{n:02d}", str(n)] for n in range(1, 41)])
+    + "\n",
+    "b/wide.md": "# Wide rows\n\n## Quotes\n\n"
+    + render_table(_WIDE_ROW_HEADERS, [['\u20ac"' * 200 for _ in _WIDE_ROW_HEADERS]] * 3)
+    + "\n",
+    "c/gauges.md": "# Gauges\n\n## Gauges\n\n"
+    + render_table(["Gauge", "Note"], [[f"Gauge G{n:02d}", "\u00e9" * 250] for n in range(1, 41)])
+    + "\n",
+}
+
+
+def test_query_tables_shows_the_best_matched_rows_and_at_least_one_row(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, RANKED_TABLES, topic="ranked")
+    gauges = document_id("c/gauges.md")
+
+    with TopicSnapshot.open(path) as snap:
+        s35 = snap.query_tables(query="Sensor S35")
+        wide = snap.query_tables(query="Q00")
+        # A document whose facet values alone fill most of a tool result.
+        snap._doc_facets[gauges] = {"site": [f"site {n} " + "\u00e9" * 200 for n in range(90)]}
+        crowded = snap.query_tables(query="Gauge")
+
+    # Every row matches "Sensor", but the row that also matches "S35" is kept among the
+    # shown rows, which read in row order.
+    (sensors,) = s35.tables
+    assert [r.row_ordinal for r in sensors.rows] == [*range(1, 20), 35]
+    assert (sensors.matched_rows, sensors.omitted_rows) == (40, 20)
+    # A row wider than the row budget is cut to fit it rather than left out.
+    (quotes,) = wide.tables
+    assert len(quotes.rows) == 1 and quotes.omitted_rows == 2
+    assert sum(len(r.model_dump_json().encode()) + 1 for r in quotes.rows) <= (
+        TABLE_QUERY_ROWS_MAX_BYTES
+    )
+    assert all(c.endswith("\u2026") for c in quotes.rows[0].cells)
+    # A lone table that does not fit with all its rows shows the rows that fit.
+    (gauge,) = crowded.tables
+    assert fits_response(crowded) and 0 < len(gauge.rows) < MAX_TABLE_QUERY_ROWS
+    assert gauge.omitted_rows == 40 - len(gauge.rows)
+
+
+def test_a_listing_cuts_attribute_names_and_values_to_a_byte_budget(tmp_path: Path) -> None:
+    path = compile_snapshot(tmp_path, TABLED, topic="tabled")
+    sheet = document_id("p3/sheet.md")
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE document_attributes SET name = printf('%.*c', 4000, 'N') || ordinal,"
+            " value = printf('%.*c', 1000, 'V') WHERE doc_id = ?",
+            (sheet,),
+        )
+    db.close()
+
+    with TopicSnapshot.open(path) as snap:
+        page = snap.list_documents_page()
+        outline = snap.outline(sheet)
+
+    (listed,) = [d for d in page.documents if d.doc_id == sheet]
+    assert fits_response(page) and fits_response(outline)
+    assert all(len(a.name) == ATTRIBUTE_NAME_CHARS for a in listed.attributes)
+    assert all(len(a.value) == ATTRIBUTE_VALUE_CHARS for a in listed.attributes)
+    assert sum(len(a.model_dump_json()) + 1 for a in listed.attributes) <= LIST_ATTRIBUTES_MAX_BYTES
+    assert 0 < len(listed.attributes) < 12 and listed.omitted_attributes == 16 - len(
+        listed.attributes
+    )
+    assert outline.document.omitted_attributes == 16 - len(outline.document.attributes)
+
+
 def test_search_collapses_superseded_drafts_caps_families_and_backfills(tmp_path: Path) -> None:
     path = compile_snapshot(tmp_path, VERSIONED, topic="versions")
     draft, final = (
@@ -854,8 +1159,8 @@ def test_search_collapses_superseded_drafts_caps_families_and_backfills(tmp_path
 
     with TopicSnapshot.open(path) as snap:
         assert snap.document(draft).superseded_by == final
-        hits = snap.search("gauge reading tidal survey line", embed, top_k=4)
-        alone = snap.search("gauge reading", embed, filters={"project": "p1"}, top_k=6)
+        hits = snap.search("gauge reading tidal survey line", embed, top_k=4).hits
+        alone = snap.search("gauge reading", embed, filters={"project": "p1"}, top_k=6).hits
         ranked = snap.rank_channels("gauge reading tidal survey line", embed, top_k=8)
 
     # The superseded draft is left behind its latest version, and the final report shows
@@ -889,7 +1194,7 @@ def test_a_long_superseded_draft_cannot_crowd_its_latest_version_out_of_search(
 
     with TopicSnapshot.open(path) as snap:
         assert snap.document(draft).superseded_by == final
-        hits = snap.search("gauge reading tidal line", FakeGateway().embed_query, top_k=5)
+        hits = snap.search("gauge reading tidal line", FakeGateway().embed_query, top_k=5).hits
 
     # The draft's 320 chunks would fill both ranking channels; only the latest is ranked.
     assert hits and {h.doc_id for h in hits} == {final}
@@ -904,16 +1209,17 @@ def test_search_results_stay_within_the_response_bound(tmp_path: Path) -> None:
 
     embed = FakeGateway().embed_query
     with TopicSnapshot.open(path) as snap:
-        hits = snap.search("tidal gauge reading", embed, top_k=MAX_TOP_K)
+        result = snap.search("tidal gauge reading", embed, top_k=MAX_TOP_K)
         ranking = snap._rank(
             build_fts5_query("tidal gauge reading"),
             embed("tidal gauge reading"),
-            snap._active_pool(None),
+            snap._resolve_scope()[0],
         )
         ranked = Counter(snap._hits[i]["doc_id"] for i in ranking.order)
 
-    assert 1 <= len(hits) < MAX_TOP_K and fits_response(hits)
-    assert len(response_text(hits).encode()) <= RESPONSE_MAX_BYTES
+    hits = result.hits
+    assert 1 <= len(hits) < MAX_TOP_K and fits_response(result)
+    assert len(response_text(result).encode()) <= RESPONSE_MAX_BYTES
     # Each hit counts the ranked chunks of its document the cut list does not show.
     shown = Counter(h.doc_id for h in hits)
     assert all(h.more_from_document == ranked[h.doc_id] - shown[h.doc_id] for h in hits)
@@ -979,6 +1285,56 @@ def test_search_results_stay_within_the_response_bound(tmp_path: Path) -> None:
             "has an inconsistent date",
         ),
         ("UPDATE facet_values SET folders_json = '{' WHERE ordinal = 1", "facet row is malformed"),
+        # Attributes and tables are checked against the sections they come from.
+        (
+            "UPDATE document_attributes SET section_id = (SELECT min(s.section_id) FROM sections s"
+            " WHERE s.doc_id != document_attributes.doc_id) WHERE ordinal = 1",
+            "which is not a section of that document",
+        ),
+        ("UPDATE document_attributes SET ordinal = ordinal + 5", "is out of order"),
+        ("UPDATE document_attributes SET name = ' ' WHERE ordinal = 1", "blank name or value"),
+        ("UPDATE document_attributes SET value = '' WHERE ordinal = 1", "blank name or value"),
+        (
+            "INSERT INTO table_rows VALUES ('nowhere_tbl_001', 1, '[]')",
+            "dangling foreign keys in table_rows",
+        ),
+        ("UPDATE table_rows SET cells_json = '[\"only\"]'", "not the tables of its Markdown"),
+        # Stored tables that agree with each other and the row index but not with the section
+        # text `read_section` returns.
+        ("UPDATE document_tables SET caption = 'Forged'", "not the tables of its Markdown"),
+        (
+            "UPDATE document_tables SET headers_json = replace(headers_json, 'e', 'E');"
+            " UPDATE table_rows_fts SET header_norm = replace(header_norm, 'e', 'E')",
+            "not the tables of its Markdown",
+        ),
+        (
+            "UPDATE table_rows SET cells_json = replace(cells_json, 'a', 'A');"
+            " UPDATE table_rows_fts SET cells_norm = replace(cells_norm, 'a', 'A')",
+            "not the tables of its Markdown",
+        ),
+        # Tables renumbered consistently everywhere but from 0, or with a gap.
+        *(
+            (
+                "".join(
+                    f"UPDATE {t} SET table_id = replace(table_id, '_tbl_001', '_tbl_{n:03d}');"
+                    for t in ("document_tables", "table_rows", "table_rows_fts")
+                )
+                + f" UPDATE document_tables SET ordinal = {n} WHERE ordinal = 1",
+                "are not numbered from 1",
+            )
+            for n in (0, 5)
+        ),
+        ("UPDATE document_tables SET ordinal = 'one'", "has a malformed ordinal or caption"),
+        ("UPDATE document_tables SET caption = X'4869'", "has a malformed ordinal or caption"),
+        ("UPDATE document_tables SET row_count = 7", "does not match its section or rows"),
+        ("UPDATE document_tables SET page_end = 99", "does not match its section or rows"),
+        ("UPDATE document_tables SET headers_json = '{'", "a table row is malformed"),
+        ("DELETE FROM table_rows_fts", "does not index every table row exactly once"),
+        ("UPDATE table_rows_fts SET cells_norm = 'altered'", "does not match a table row"),
+        (
+            "UPDATE table_rows_fts SET row_ordinal = CAST(row_ordinal AS REAL)",
+            "does not match a table row",
+        ),
     ],
 )
 def test_a_damaged_snapshot_fails_to_open_with_an_integrity_error(
@@ -1053,7 +1409,7 @@ def test_draft_ranking_prefers_the_closer_document_over_the_longer_one(tmp_path:
         offline = snap.prepare_draft(GDV_INPUTS, None)
         online = snap.prepare_draft(GDV_INPUTS, embed, deliverable_type="Technical Memorandum")
         lexical = snap._draft_terms(GDV_INPUTS, snap.list_documents())[0] or ""
-        matched = snap._lexical_ranks(lexical, None)
+        matched = snap._lexical_ranks(lexical, frozenset(d.doc_id for d in snap.list_documents()))
         chunks = {d: sum(snap._hits[i]["doc_id"] == d for i in matched) for d in (gdv, waterbodies)}
 
     # The long memo has many more matching chunks, but relevance sums each document's best
@@ -1650,3 +2006,81 @@ def test_a_free_slot_takes_only_a_relevant_document_of_another_type(tmp_path: Pa
     # word with the inputs, so it stays a candidate.
     assert [e.doc_id for e in packet.exemplars] == [document_id("a/letter.md")]
     assert [c.doc_id for c in packet.other_candidates] == [document_id("b/fees.md")]
+
+
+def test_supplemental_sections_without_a_requested_type_follow_the_first_exemplars_type(
+    tmp_path: Path,
+) -> None:
+    survey = "Harbour berth depth survey with gauge datum soundings at every berth."
+    files = {
+        **{
+            f"p{k}/memo.md": memo(
+                f"Berth Memo {k}", "survey memo", [("Survey", survey), ("Depths", survey)]
+            )
+            for k in range(4)
+        },
+        # Another project's equipment sheet names a serial the inputs repeat.
+        "z/stock.md": memo("Stock List", "equipment list", [("Units", "Logger XQ-7731 Corvexa.")]),
+    }
+    path = compile_snapshot(tmp_path, files, topic="stock")
+    inputs = f"{survey} Logger Corvexa."
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(inputs, None)
+        typed = snap.prepare_draft(inputs, None, deliverable_type="equipment list")
+
+    assert {e.deliverable_type for e in packet.exemplars} == {"survey memo"}
+    assert packet.supplemental_sections == []
+    # Asked for, the equipment list is the exemplar itself.
+    assert typed.exemplars[0].doc_id == document_id("z/stock.md")
+
+
+def test_a_long_first_exemplar_leaves_room_for_the_compact_exemplars_matched_sections(
+    tmp_path: Path,
+) -> None:
+    house = [
+        f"House method {i}: the crew levels gauge {i} against the benchmark, logs tide"
+        f" readings every ten minutes and files the field sheet {i} the same day. "
+        + f"Unique site observation {i} of the seabed. "
+        * 30
+        for i in range(40)
+    ]
+    files = {
+        "a/big.md": memo(
+            "Dredge Spoil Report",
+            "survey report",
+            [
+                ("Dredge spoil", "Dredge spoil volumes at the berth pocket."),
+                ("Spoil disposal", "Dredge spoil disposal from the berth pocket."),
+                ("Berth pocket", "Berth pocket dredge depths."),
+            ]
+            + [(f"Method {i}", text) for i, text in enumerate(house)],
+        ),
+        "b/small.md": memo(
+            "Apron Report",
+            "survey report",
+            # A matched section too large for the room a drained packet leaves.
+            [("Scope", "Apron settlement survey of the quay. " + "Kerb line level. " * 250)],
+        ),
+        "c/manual.md": memo(
+            "House Manual", "field manual", [(f"Rule {i}", text) for i, text in enumerate(house)]
+        ),
+    }
+    path = compile_snapshot(tmp_path, files, topic="tiers")
+    big, small = document_id("a/big.md"), document_id("b/small.md")
+    inputs = (
+        "Dredge spoil volumes, spoil disposal and dredge depths at the berth pocket;"
+        " apron settlement of the quay."
+    )
+
+    with TopicSnapshot.open(path) as snap:
+        packet = snap.prepare_draft(inputs, None, deliverable_type="survey report")
+
+    assert fits_response(packet)
+    first, second = packet.exemplars
+    assert (first.doc_id, second.doc_id) == (big, small)
+    assert any(s.family_recurrence for s in first.sections)
+    # The long exemplar's recurring sections no longer drain the packet first.
+    assert packet.omitted_sections > 0
+    assert all(s.included for s in second.sections)
+    assert first.sections[1].included and first.sections[1].heading_path.endswith("Dredge spoil")

@@ -181,7 +181,9 @@ def test_example_collection_packs_match_their_collections_and_hold_out_their_ref
                 family_id=holdout.reference_doc_id,
                 version_status="sole",
                 superseded_by=None,
+                superseded_doc_ids=[],
                 facets={},
+                attributes=[],
             )
             check_reference_held_out(holdout, reference)
             select_holdout_sources(corpus_dir, holdout, reference)
@@ -350,7 +352,7 @@ def test_layer1_runs_the_example_pack_with_one_embedding_per_case(
         assert all(r.ranks[arm] is not None for r in rows), [r.ranks for r in rows]
     with TopicSnapshot.open(snapshot_path) as snapshot:
         served = [
-            [h.doc_id for h in snapshot.search(c.query, embed, filters=c.filters, top_k=TOP_K)]
+            [h.doc_id for h in snapshot.search(c.query, embed, filters=c.filters, top_k=TOP_K).hits]
             for c in cases
         ]
     assert [r.top_docs["served_search"] for r in rows] == served
@@ -849,13 +851,17 @@ def test_exemplars_prompt_labels_documents_by_path_without_visuals_and_ends_with
 PINNED_SERVER_INSTRUCTIONS = """\
 Arkive serves reference collections ("topics").
 1. Call list_topics only when more than one topic is served or a topic's facets are unknown.
-   Facets filter list_documents, search, grep and prepare_draft (`filters` combine with AND).
-2. Answering questions: start with targeted search or grep; use read_section only when a hit
-   needs surrounding context, get_topic_guide for scope or curator notes, lookup_glossary for
+   Facets filter list_documents, search, grep, query_tables and prepare_draft (`filters`
+   combine with AND); deliverable_type narrows the first four to one document type.
+2. Answering questions: start with targeted search or grep, or query_tables for values in
+   tables (columns names the headers you need); use read_section only when a hit needs
+   surrounding context, get_topic_guide for scope or curator notes, lookup_glossary for
    terms, and view_page for charts, maps or visual layout. Cite doc_id, section_id and pages,
    and answer as soon as the evidence is sufficient. Delivered final reports and memoranda
-   outrank provisional proposals or earlier drafts; note both when they differ. When search
-   and grep find no evidence, state that the corpus does not establish it and stop.
+   outrank provisional proposals or earlier drafts; note both when they differ. Reads cover
+   current versions; when excluded_superseded_count > 0 and the user asks about earlier
+   drafts or version history, repeat the call with versions="all". When search and grep find
+   no evidence, state that the corpus does not establish it and stop.
 3. Drafting: call prepare_draft with the user's full project_inputs, follow its
    drafting_guidance, exemplars, lessons and curator_notes, and read_section for omitted
    sections.
@@ -869,15 +875,23 @@ PINNED_SERVER_TOOLS = (
     "list_topics",
     "lookup_glossary",
     "prepare_draft",
+    "query_tables",
     "read_section",
     "search",
     "view_page",
 )
 
 PINNED_DRAFTING_GUIDANCE = """\
-- Take every fact, measurement, date, quantity, parameter, personnel list and deliverable
-  file name for the new work only from the user's inputs. Enumerate listed items in full and
-  never invent unstated measurements or results.
+- Take every project-specific fact (client, site, dates, measured values, quantities, fees,
+  serial numbers, coordinates, personnel lists and deliverable file names) for the new work
+  only from the user's inputs. Enumerate listed items in full and never invent unstated
+  measurements or results.
+- Carry house-wide equipment, methodology and standard technical constants (such as a
+  standard reference constant, specification, threshold or default procedure) into the
+  draft when they appear identically across independent version families or in the lessons,
+  unless the user's inputs give a different value for this project, which always wins. A
+  value or clause held by only one version family (corpus_family_count 1) is not a house
+  constant.
 - Reproduce the collection's house wording (organisation and tool background, standard
   methodology explanations, equations, literature references, generic table column headers,
   acknowledgements, legal disclaimers and standing technical caveats) with its established
@@ -1011,7 +1025,9 @@ def reference_doc(**overrides: Any) -> DocumentInfo:
         "family_id": "doc_001",
         "version_status": "sole",
         "superseded_by": None,
+        "superseded_doc_ids": [],
         "facets": {},
+        "attributes": [],
     }
     return DocumentInfo.model_validate(fields | overrides)
 
@@ -2507,7 +2523,7 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
     ]
     assert mcp_call[0]["result_chars"] > 200 and len(mcp_call[0]["result_head"]) == 200
     # The server renders a result as one compact JSON text block.
-    assert mcp_call[0]["result_head"].startswith(f'[{{"doc_id":"{HARBOUR_MEMO}"')
+    assert mcp_call[0]["result_head"].startswith(f'{{"matches":[{{"doc_id":"{HARBOUR_MEMO}"')
     assert qa_rows[0]["judge"]["claims"][1] == {
         "claim": "The memo is from 2019.",
         "status": "unverifiable",
@@ -2811,6 +2827,11 @@ def test_eval_cli_refuses_outputs_it_cannot_write_and_inputs_it_cannot_convert_o
             chunks = "SELECT chunk_id FROM chunks WHERE doc_id = ?"
             db.execute(f"DELETE FROM chunks_fts WHERE chunk_id IN ({chunks})", doc_id)
             db.execute("DELETE FROM chunks WHERE doc_id = ?", doc_id)
+            tables = "SELECT table_id FROM document_tables WHERE doc_id = ?"
+            db.execute(f"DELETE FROM table_rows_fts WHERE table_id IN ({tables})", doc_id)
+            db.execute(f"DELETE FROM table_rows WHERE table_id IN ({tables})", doc_id)
+            db.execute("DELETE FROM document_tables WHERE doc_id = ?", doc_id)
+            db.execute("DELETE FROM document_attributes WHERE doc_id = ?", doc_id)
             db.execute("DELETE FROM sections WHERE doc_id = ?", doc_id)
             db.execute("DELETE FROM glossary")
             db.execute("DELETE FROM cluster_sections")

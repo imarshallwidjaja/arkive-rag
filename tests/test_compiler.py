@@ -819,6 +819,33 @@ def test_quotes_still_unlocated_after_the_rerun_are_discarded_and_counted(tmp_pa
     assert entry.term == "LAT"
 
 
+def test_attributes_with_a_blank_name_or_value_are_discarded_before_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    observed = draft(LOCATED).model_copy(
+        update={
+            "attributes": [
+                StatedAttribute(name=" ", value="LAT", quote=LOCATED),
+                StatedAttribute(name="datum", value="\t", quote=LOCATED),
+                StatedAttribute(name=" datum ", value=" LAT ", quote=LOCATED),
+            ]
+        }
+    )
+    gateway = FakeGateway(observe_script=[observed, observed])
+    corpus_dir = write_files(tmp_path / "corpus", DATUM_CORPUS)
+
+    corpus = compile_corpus(corpus_dir, gateway, topic="t", title="T")
+
+    _, rerun = gateway.of_type(ObserveSections)
+    assert rerun.feedback is not None and "blank name or value" in rerun.feedback
+    assert corpus.build_report.discarded_unlocated_quotes == 2
+    output = tmp_path / "t.arkive.db"
+    write_snapshot(corpus, output)
+    with TopicSnapshot.open(output) as snapshot:
+        (listed,) = snapshot.list_documents()
+    assert [(a.name, a.value) for a in listed.attributes] == [("datum", "LAT")]
+
+
 def test_a_batch_whose_quotes_are_never_located_raises(tmp_path: Path) -> None:
     gateway = FakeGateway(observe_script=[draft(UNLOCATED), draft(UNLOCATED)])
 

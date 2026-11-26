@@ -748,6 +748,15 @@ class Chunk(_Frozen):
     content: str
 
 
+class DocumentAttribute(_Frozen):
+    """An attribute the document states, verified by its quote in `section_id`
+    (`LocatedAttribute` bound to the corpus); the quote itself stays in the section text."""
+
+    name: str
+    value: str
+    section_id: str
+
+
 class CompiledDocument(_Frozen):
     doc_id: str
     rel_path: str
@@ -766,6 +775,8 @@ class CompiledDocument(_Frozen):
     is_curator_note: bool
     # A curator note's role is its card's type, no feedback and a family of its own.
     role: DocumentRole
+    # The card's verified attributes in card order.
+    attributes: tuple[DocumentAttribute, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -812,17 +823,21 @@ def corpus_fingerprint(documents: Iterable[tuple[str, str]]) -> str:
 
 class FacetSummary(_Frozen):
     """A facet and its first values; `omitted_values` counts the rest, which
-    `get_topic_guide` and an unknown-value error also name."""
+    `get_topic_guide` and an unknown-value error also name. `document_count` counts the
+    citable documents holding at least one value of the facet, out of the topic's
+    `citable_document_count`, so a facet few documents hold reads as partial."""
 
     name: str
     binding: FacetBinding
     values: list[str]
     omitted_values: int
+    document_count: int
 
 
 class TopicSummary(_Frozen):
     """One served topic as `list_topics` shows it. Facet values and deliverable types are
-    listed up to `snapshot.SUMMARY_MAX_NAMES` each, the rest counted."""
+    listed up to `snapshot.SUMMARY_MAX_NAMES` each, the rest counted. `document_count` counts
+    every document, curator notes included; `citable_document_count` leaves them out."""
 
     topic: str
     title: str
@@ -830,6 +845,7 @@ class TopicSummary(_Frozen):
     corpus_fingerprint: str
     arkive_version: str
     document_count: int
+    citable_document_count: int
     facets: list[FacetSummary]
     deliverable_types: list[str]
     omitted_deliverable_types: int
@@ -856,6 +872,13 @@ class DeliverableTypeSummary(_Frozen):
     feedback_count: int
 
 
+class FacetGuide(Facet):
+    """A facet as the topic guide shows it, with the count of citable documents holding at
+    least one of its values (`FacetSummary.document_count`)."""
+
+    document_count: int
+
+
 class TopicGuide(_Frozen):
     """The orientation view of a topic, within one tool result. Facet and deliverable type
     descriptions are cut to `snapshot.GUIDE_DESCRIPTION_CHARS`; deliverable types that do not
@@ -863,14 +886,16 @@ class TopicGuide(_Frozen):
     and counted in `omitted_curator_notes` (each note's sections stay readable with
     `read_section`); each facet lists at most as many values as fit, the rest counted in
     `omitted_facet_values`; glossary terms that do not fit are counted in
-    `omitted_glossary_terms` (`lookup_glossary` pages them)."""
+    `omitted_glossary_terms` (`lookup_glossary` pages them). Each facet's `document_count` is
+    out of `citable_document_count`."""
 
     topic: str
     title: str
     guide_markdown: str
+    citable_document_count: int
     curator_notes: list[CuratorNote]
     omitted_curator_notes: int
-    facets: list[Facet]
+    facets: list[FacetGuide]
     omitted_facet_values: int
     deliverable_types: list[DeliverableTypeSummary]
     omitted_deliverable_types: int
@@ -878,29 +903,47 @@ class TopicGuide(_Frozen):
     omitted_glossary_terms: int
 
 
-class DocumentListItem(_Frozen):
-    """One document as `list_documents` pages it. `doc_date` is as printed (or the metadata
-    date); `date` is its calendar form and where it came from, None when the printed date is
-    ambiguous or no date is known. The version fields follow `DocumentRole`. A title longer
-    than `snapshot.TITLE_CHARS` or a summary longer than `snapshot.LIST_SUMMARY_CHARS` ends with an
-    ellipsis where it was cut."""
+# Which documents a read covers: `current` leaves out every document superseded by another
+# document in scope; `all` keeps every version.
+VersionScope = Literal["current", "all"]
+
+
+class DocumentProvenance(_Frozen):
+    """What every read result says about the document it comes from: its deliverable type,
+    date as printed, and version standing (`DocumentRole`). `superseded_doc_ids` names the
+    members of its version family it supersedes, at most `snapshot.MAX_FAMILY_DOC_IDS`, the
+    rest counted in `omitted_superseded_doc_ids`."""
 
     doc_id: str
+    deliverable_type: str
+    doc_date: str | None
+    family_id: str
+    version_status: VersionStatus
+    superseded_by: str | None
+    superseded_doc_ids: list[str]
+    omitted_superseded_doc_ids: int = 0
+
+
+class DocumentListItem(DocumentProvenance):
+    """One document as `list_documents` pages it. `doc_date` is as printed (or the metadata
+    date); `date` is its calendar form and where it came from, None when the printed date is
+    ambiguous or no date is known. A title longer than `snapshot.TITLE_CHARS` or a summary
+    longer than `snapshot.LIST_SUMMARY_CHARS` ends with an ellipsis where it was cut.
+    `attributes` are the verified attributes the document states, in card order; a view that
+    shows only some counts the rest in `omitted_attributes`."""
+
     rel_path: str
     format: str
     title: str
-    doc_date: str | None
     date: DocumentDate | None
-    deliverable_type: str
     summary: str
     page_count: int
     is_curator_note: bool
     is_feedback: bool
     feedback_for_types: list[str]
-    family_id: str
-    version_status: VersionStatus
-    superseded_by: str | None
     facets: dict[str, list[str]]
+    attributes: list[DocumentAttribute]
+    omitted_attributes: int = 0
 
 
 class DocumentInfo(DocumentListItem):
@@ -910,13 +953,16 @@ class DocumentInfo(DocumentListItem):
 
 
 class DocumentPage(_Frozen):
-    """One page of `list_documents`. `next_offset` is None on the last page."""
+    """One page of `list_documents`. `next_offset` is None on the last page.
+    `excluded_superseded_count` counts documents of the scope left out because a document
+    in scope supersedes them (`VersionScope` `current`)."""
 
     documents: list[DocumentListItem]
     total: int
     offset: int
     limit: int
     next_offset: int | None
+    excluded_superseded_count: int = 0
 
 
 class SectionOutlineItem(_Frozen):
@@ -939,9 +985,8 @@ class DocumentOutline(_Frozen):
     next_offset: int | None
 
 
-class SearchHit(_Frozen):
+class SearchHit(DocumentProvenance):
     chunk_id: str
-    doc_id: str
     section_id: str
     kind: str
     doc_title: str
@@ -957,8 +1002,17 @@ class SearchHit(_Frozen):
     content: str
 
 
-class GrepMatch(_Frozen):
-    doc_id: str
+class SearchResult(_Frozen):
+    """Search hits in fused-rank order; `excluded_superseded_count` as in `DocumentPage`."""
+
+    hits: list[SearchHit]
+    excluded_superseded_count: int
+
+
+class GrepMatch(DocumentProvenance):
+    """One matching line. When the line is a body row of a Markdown table, `snippet` starts
+    with the table's header row on a line of its own."""
+
     section_id: str
     doc_title: str
     heading_path: str
@@ -967,6 +1021,58 @@ class GrepMatch(_Frozen):
     facets: dict[str, list[str]]
     line_number: int
     snippet: str
+
+
+class GrepResult(_Frozen):
+    """Matching lines in path order. `truncated` is true when further lines match than the
+    result shows; `excluded_superseded_count` as in `DocumentPage`."""
+
+    matches: list[GrepMatch]
+    excluded_superseded_count: int
+    truncated: bool
+
+
+class TableRowView(_Frozen):
+    """One body row of a table, numbered from 1, its cells cut to `snapshot.TABLE_CELL_CHARS`."""
+
+    row_ordinal: int
+    cells: list[str]
+
+
+class TableQueryItem(DocumentProvenance):
+    """One Markdown table of a section. `headers` and each row's cells are the columns shown:
+    the columns the request matched plus column 0 (the row labels), in table order, at most
+    `snapshot.MAX_TABLE_QUERY_COLUMNS`, the rest counted in `omitted_columns`. With a query,
+    `matched_rows` counts the rows whose cells match it and `rows` shows them; a table whose
+    header alone matches shows its leading rows with `matched_rows` 0. `omitted_rows` counts
+    selected rows not shown."""
+
+    table_id: str
+    section_id: str
+    doc_title: str
+    heading_path: str
+    page_start: int
+    page_end: int
+    facets: dict[str, list[str]]
+    caption: str | None
+    column_count: int
+    row_count: int
+    headers: list[str]
+    omitted_columns: int
+    matched_rows: int
+    rows: list[TableRowView]
+    omitted_rows: int
+
+
+class TableQueryResult(_Frozen):
+    """One page of `query_tables`: matching tables in path order from the request's offset,
+    out of `total_tables`; `next_offset` is None on the last page. `excluded_superseded_count`
+    as in `DocumentPage`."""
+
+    tables: list[TableQueryItem]
+    total_tables: int
+    next_offset: int | None
+    excluded_superseded_count: int
 
 
 class SectionReadView(_Frozen):

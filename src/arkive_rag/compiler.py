@@ -54,6 +54,7 @@ from arkive_rag.models import (
     ConversionError,
     CorpusDocument,
     CuratorNote,
+    DocumentAttribute,
     DocumentDate,
     DocumentReading,
     DocumentRole,
@@ -1764,9 +1765,10 @@ def locate_batch(
     an attribute's only outside its asides, since a comment, tracked change, speaker note or
     figure description does not state what the document says about itself.
 
-    Unlocated quotes are rejections. Keeping the located observations and discarding the rest
-    is an accepted reduction, except when the batch quoted something and nothing could be
-    located: that is a broken reading. With `rerun_of_unlocated` (the earlier answer quoted
+    Unlocated quotes and attributes with a blank name or value are rejections; a kept
+    attribute's name and value are stripped. Keeping the located observations and discarding
+    the rest is an accepted reduction, except when the batch quoted something and nothing could
+    be located: that is a broken reading. With `rerun_of_unlocated` (the earlier answer quoted
     and located nothing), a rerun without any observation is that same broken reading.
     """
     if rerun_of_unlocated and not (draft.terms or draft.attributes):
@@ -1779,14 +1781,17 @@ def locate_batch(
     attributes: list[LocatedAttribute] = []
     terms: list[TermObservation] = []
     unlocated: list[str] = []
+    blank: list[str] = []
     for attribute in draft.attributes:
+        name, value = attribute.name.strip(), attribute.value.strip()
+        if not (name and value):
+            blank.append(attribute.quote)
+            continue
         ordinal = locate_quote(attribute.quote, sections, outside_asides=True)
         if ordinal is None:
             unlocated.append(attribute.quote)
             continue
-        attributes.append(
-            LocatedAttribute(name=attribute.name, value=attribute.value, section_ordinal=ordinal)
-        )
+        attributes.append(LocatedAttribute(name=name, value=value, section_ordinal=ordinal))
     for term in draft.terms:
         ordinal = locate_quote(term.quote, sections)
         if ordinal is None:
@@ -1802,10 +1807,13 @@ def locate_batch(
                 section_ordinal=ordinal,
             )
         )
-    located = LocatedBatch(draft, tuple(attributes), tuple(terms), len(unlocated))
-    if not unlocated:
+    located = LocatedBatch(draft, tuple(attributes), tuple(terms), len(unlocated) + len(blank))
+    if not (unlocated or blank):
         return Checked.accept(located)
-    rejections = tuple(f"quote not found verbatim in the sections: {q!r}" for q in unlocated)
+    rejections = tuple(
+        [f"attribute with a blank name or value: {q!r}" for q in blank]
+        + [f"quote not found verbatim in the sections: {q!r}" for q in unlocated]
+    )
     if terms or attributes:
         return Checked.reduce(rejections, located)
     return Checked.reject(rejections)
@@ -2239,6 +2247,12 @@ def bind_document(
         pages=reading.pages,
         is_curator_note=reading.is_curator_note,
         role=role,
+        attributes=tuple(
+            DocumentAttribute(
+                name=a.name, value=a.value, section_id=document.section_id(a.section_ordinal)
+            )
+            for a in card.attributes
+        ),
     )
 
 

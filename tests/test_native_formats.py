@@ -507,7 +507,7 @@ def test_an_html_page_reads_in_order_without_fetching_anything(tmp_path: Path) -
     assert (table.caption, table.headers, table.rows) == (
         "Gauge readings",
         ("Gauge", "Level (m)"),
-        (("North \\| quay", "3.2"),),
+        (("North | quay", "3.2"),),
     )
     assert "## Tide gauges" in markdown and "```\ndepth = 12.4\n```" in markdown
     assert "tracking" not in markdown
