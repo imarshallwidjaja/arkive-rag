@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 960 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="benchmark-highlights-title benchmark-highlights-desc" id="benchmark-highlights-root">
-        <title id="benchmark-highlights-title">Arkive RAG Benchmark Highlights</title>
-        <desc id="benchmark-highlights-desc">On the public 126-file structural monitoring archive, Arkive MCP used 77,215 input tokens for grounded Q&amp;A against 134,043 for raw file tools, and 179,051 for a 52-page report holdout against 287,143 for raw files and 540,990 for full-context examples; on the acoustic noise report holdout it scored a median 10 of 10 for discipline against 4 of 10 for full-context examples, which copied an unrelated six-year policy.</desc>
+        <title id="benchmark-highlights-title">Arkive RAG Schema 6.0 Baseline Benchmark Highlights</title>
+        <desc id="benchmark-highlights-desc">Historical schema 6.0 baseline, superseded by the schema 7.0 results in the documentation. On the public 126-file structural monitoring archive, Arkive MCP used 77,215 input tokens for grounded Q&amp;A against 134,043 for raw file tools, and 179,051 for a 52-page report holdout against 287,143 for raw files and 540,990 for full-context examples; on the acoustic noise report holdout it scored a median 10 of 10 for discipline against 4 of 10 for full-context examples, which copied an unrelated six-year policy.</desc>
   <defs>
       <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
       #benchmark-highlights-root { --color-paper:       #F4F1EA;
@@ -24,6 +24,7 @@
 
         <!-- ===== SECTION A: input tokens, one shared scale (x = 200 + tokens / 1000) ===== -->
         <text x="24" y="36" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">A · INPUT TOKENS ON THE 126-FILE ARCHIVE · LOWER IS BETTER</text>
+        <text x="936" y="36" fill="#B03F1B" font-size="8" font-weight="600" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end" letter-spacing="0.14em">SCHEMA 6.0 BASELINE</text>
 
         <!-- zero line and axis -->
         <line x1="200" y1="52" x2="200" y2="256" stroke="#1d232a" stroke-opacity="0.25" stroke-width="1"/>

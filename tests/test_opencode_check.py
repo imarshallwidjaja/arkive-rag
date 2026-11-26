@@ -20,7 +20,6 @@ from arkive_rag import passages
 from evals.opencode_check import runner
 from evals.opencode_check.scenarios import (
     EqualArgument,
-    NonEmptyArgument,
     Scenario,
     ScenarioFile,
     Transcript,
@@ -111,8 +110,12 @@ def test_uplift_scenarios_extend_the_shipped_ones_with_structural_monitoring_sce
     rollup = added["table-rollup"]
     assert rollup.required_tools == ("query_tables",)
     (table_call,) = rollup.argument_expectations
-    assert isinstance(table_call, NonEmptyArgument)
-    assert (table_call.tools, table_call.topic) == (("query_tables",), topic)
+    assert isinstance(table_call, EqualArgument)
+    assert (table_call.tools, table_call.argument, table_call.value) == (
+        ("query_tables",),
+        "topic",
+        topic,
+    )
     # The table-rollup values are table cells, each serial in the row of its calibration month,
     # so only a table read can supply them together.
     rows = [
@@ -361,9 +364,10 @@ def test_scenario_file_refuses_duplicates_unknown_tools_and_undeclared_topics() 
             | {
                 "argument_expectations": [
                     {
-                        "condition": "non_empty",
+                        "condition": "equals",
                         "tools": ["query_tables"],
                         "argument": "query",
+                        "value": "Fail",
                         "topic": "campaigns",
                     }
                 ]

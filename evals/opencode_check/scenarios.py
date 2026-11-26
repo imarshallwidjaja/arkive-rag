@@ -49,25 +49,17 @@ class _ScenarioModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-def _on_topic(topic: str | None) -> str:
-    return f" on {topic}" if topic else ""
-
-
 class NonEmptyArgument(_ScenarioModel):
-    """Some completed call to one of `tools` passed a non-empty `argument`, and, when `topic`
-    is set, targeted that topic."""
+    """Some completed call to one of `tools` passed a non-empty `argument`."""
 
     condition: Literal["non_empty"]
     tools: Annotated[tuple[ArkiveTool, ...], Field(min_length=1)]
     argument: NonBlank
-    topic: NonBlank | None = None
 
     def label(self) -> str:
-        return f"arguments: {'/'.join(self.tools)}.{self.argument} non_empty{_on_topic(self.topic)}"
+        return f"arguments: {'/'.join(self.tools)}.{self.argument} non_empty"
 
     def matches(self, call: ToolCall) -> bool:
-        if self.topic is not None and call.arguments.get("topic") != self.topic:
-            return False
         return _non_empty(call.arguments.get(self.argument))
 
 
@@ -82,10 +74,8 @@ class EqualArgument(_ScenarioModel):
     topic: NonBlank | None = None
 
     def label(self) -> str:
-        return (
-            f"arguments: {'/'.join(self.tools)}.{self.argument} == {self.value!r}"
-            f"{_on_topic(self.topic)}"
-        )
+        on_topic = f" on {self.topic}" if self.topic else ""
+        return f"arguments: {'/'.join(self.tools)}.{self.argument} == {self.value!r}{on_topic}"
 
     def matches(self, call: ToolCall) -> bool:
         if self.topic is not None and call.arguments.get("topic") != self.topic:
@@ -161,9 +151,7 @@ class ScenarioFile(_ScenarioModel):
             if s.answer_reproduces_recurring_passage_of:
                 named.add(s.answer_reproduces_recurring_passage_of)
             named.update(
-                e.topic
-                for e in s.argument_expectations
-                if isinstance(e, NonEmptyArgument | EqualArgument) and e.topic
+                e.topic for e in s.argument_expectations if isinstance(e, EqualArgument) and e.topic
             )
             unknown = sorted(named - set(self.topics))
             if unknown:

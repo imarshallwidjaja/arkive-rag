@@ -2,11 +2,11 @@
 
 ![A folder of team documents compiled into one portable knowledge file that AI assistants query](docs/assets/arkive-concept-hero.png)
 
-Arkive RAG turns a curated folder of team reference documents (`.pdf`, `.docx`, `.pptx`, `.md`) into one portable, read-only knowledge file (`*.arkive.db`). AI assistants query that file to answer questions with citations and to draft new deliverables that follow the team's past work.
+Arkive RAG turns a curated folder of team reference documents (`.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html`/`.htm`, `.md`) into one portable, read-only knowledge file (`*.arkive.db`). AI assistants query that file to answer questions with citations and to draft new deliverables that follow the team's past work.
 
 A team uses one snapshot for two jobs:
 
-- **Grounded Q&A with citations.** The assistant finds exact numbers, filenames, table rows, and chart values, and cites the document, section, and page they came from.
+- **Grounded Q&A with citations.** The assistant finds exact numbers, filenames, table rows, and chart values, and cites the document, section, and page they came from. Answers use the current version of each document by default, and the assistant can ask for earlier drafts when a question is about history.
 - **Grounded drafting from past work.** The assistant receives the closest past examples of the same kind of deliverable, the reviewer lessons that apply to it, and a marker on each passage showing whether it is standard company wording or a clause from one project.
 
 ## At a glance
@@ -18,7 +18,7 @@ A team uses one snapshot for two jobs:
 
 ## Quickstart
 
-You need Python `3.14`, [uv](https://docs.astral.sh/uv/), LibreOffice (`soffice`, to read `.docx` and `.pptx` files), and an `OPENAI_API_KEY`. Arkive loads the key from `.env` in the working directory when it is not set.
+You need Python `3.14`, [uv](https://docs.astral.sh/uv/), LibreOffice (`soffice`, to render `.docx` and `.pptx` files), and an `OPENAI_API_KEY`. Excel and HTML files need no extra install. Arkive loads the key from `.env` in the working directory when it is not set.
 
 The commands below build the tracked fictional collection `evals/example_corpora/coastal-survey-projects` (nine files from three survey projects). Keep build outputs outside the corpus folder.
 
@@ -46,7 +46,7 @@ uv run --locked arkive-rag search /tmp/arkive-examples/coastal-survey-projects.a
 uv run --locked arkive-rag serve /tmp/arkive-examples/coastal-survey-projects.arkive.db
 ```
 
-`search` and `grep` also take `--filter FACET=VALUE`. Arkive infers the facet names from each collection, so read them from the `inspect` output first.
+`search` and `grep` also take `--filter FACET=VALUE`, `--type` for a deliverable type, and `--versions all` to include superseded drafts. Arkive infers the facet names and types from each collection, so read them from the `inspect` output first.
 
 ## Documentation
 

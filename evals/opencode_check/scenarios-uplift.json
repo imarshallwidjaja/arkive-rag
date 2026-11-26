@@ -335,12 +335,12 @@
       ],
       "argument_expectations": [
         {
-          "condition": "non_empty",
+          "condition": "equals",
           "tools": [
             "query_tables"
           ],
           "argument": "topic",
-          "topic": "structural-monitoring-consultancy"
+          "value": "structural-monitoring-consultancy"
         }
       ],
       "topics_queried": [

@@ -26,6 +26,19 @@
 
 `convert_office_to_pdf` converts `.docx` and `.pptx` files to PDF in an isolated headless LibreOffice (`soffice`) temporary directory. Checkboxes, floating text boxes, embedded charts, and slide layouts then follow the same page pipeline as native PDFs.
 
+Before any part of an Office archive (`.docx`, `.pptx`, `.xlsx`) reaches LibreOffice, Docling, or openpyxl, `open_office_archive` in `native_formats.py` inflates every member in 64 KiB steps and refuses an archive that is not a readable zip file, declares more than 5,000 entries (`MAX_OFFICE_ARCHIVE_ENTRIES`), holds an encrypted member or one whose inflated size or CRC differs from its directory entry, or inflates to more than 100,000,000 bytes (`MAX_OFFICE_ARCHIVE_BYTES`).
+
+A Word file is converted from an accepted-revision copy (`accepted_revision_copy`): deleted and moved-away runs are removed and inserted runs kept, because LibreOffice otherwise draws a deletion and its replacement into one PDF text run. The original bytes stay the document's SHA-256 and metadata source. `page_supplements` in `compiler.py` then adds what the file's own XML holds as quoted `[Annotation — ...]` blocks on the page that holds the marked text: each Word tracked insertion and deletion (with author and date) and each comment, and each shown PowerPoint slide's speaker notes and comments. A PowerPoint slide's native chart series become a Markdown table under a `Chart: <title>` line. Hidden slides are skipped, as LibreOffice skips them. Annotations are their own `annotation` chunks, and an observed document attribute never counts a quote found only inside an annotation or visual transcript.
+
+### Excel workbooks and HTML pages
+
+`.xlsx`, `.html`, and `.htm` files have no pages. `xlsx_markdown` and `html_markdown` read them from an in-memory stream through Docling's spreadsheet and HTML backends. The dependency is `docling-slim` with only its `format-xlsx` and `format-html` extras, so no PyTorch is installed and serving never loads Docling.
+
+- **Workbooks.** Each worksheet becomes a level-1 heading, and each data region a `Range A2:D5` line and a GFM table. A merged multi-row header is flattened into one row (`Group — Column (Unit)`). A formula saved without a computed value shows its formula (`=B4+C4`). Cell notes and Excel 365 threaded comments with their replies follow the sheet's tables as annotations. A workbook with more than 250,000 populated cells (`MAX_WORKBOOK_CELLS`, counted while streaming each sheet) is refused with `ConversionError` instead of being cut. A legacy `.xls` file stops the build as an unsupported format.
+- **HTML pages.** Every image fetch, remote or local, is off, as are page rendering and furniture inference, so text before the first heading stays body text. Headings, paragraphs, lists, code blocks, and tables follow in document order. Images and their alt text are left out.
+
+Their Markdown is split into sections by `parse_markdown_blocks` like a `.md` file, and each section spans page 1. They have no page images for `view_page`.
+
 `render_pdf` uses `pypdfium2` to extract each page's Unicode native text layer and render a 2x WebP image (`webp_bytes`, longest side clamped to `MAX_RENDER_SIDE_PX = 4096`). With `--cache`, `BuildCache` stores rendered pages and metadata dates in SQLite (`page_render_cache` and `page_render_meta`) keyed by source SHA-256, and checks the cache before invoking LibreOffice or `pypdfium2`. Rebuilding an unchanged corpus renders zero pages.
 
 ### Vision transcription, fidelity checks, and section stitching
@@ -37,11 +50,11 @@ Two mechanical checks guard transcription:
 1. **Numeric and filename fidelity.** The compiler extracts anchor tokens (numbers, measurements, filenames) from the native text layer and checks that they survive transcription. When a page drops anchors or shows ligature corruption, Arkive retries it once at high reasoning effort. When the retry changes the page's trailing 1,200-character tail, page `N + 1` is transcribed again. Propagation stops as soon as a tail is unchanged.
 2. **Cross-page section and table stitching.** `assemble_sections` builds Markdown sections with hierarchical `heading_path` strings and `page_start..page_end` spans. A paragraph or table that continues across a page break (`continues_from_previous_page=True`) is joined onto the previous part. A table row split mid-cell (`merges_into_previous_row=True`) has its cells joined column by column, and each row keeps the pages it came from.
 
-Sections longer than `MAX_SECTION_CHARS = 32_000` split at paragraph or table boundaries, never inside fenced code blocks or visual transcripts. `section_pieces` then splits each section into `prose`, `table`, `visual`, or `guidance` chunk pieces of at most `MAX_CHUNK_CHARS = 6_000`. The section itself stays whole for reading.
+Sections longer than `MAX_SECTION_CHARS = 32_000` split at paragraph or table boundaries, never inside fenced code blocks or visual transcripts. `section_pieces` then splits each section into `prose`, `table`, `visual`, `annotation`, or `guidance` chunk pieces of at most `MAX_CHUNK_CHARS = 6_000`. The section itself stays whole for reading.
 
 ### Per-document observation cards
 
-`ObserveSections` asks `gpt-6.1-sol` (low effort; batched over long documents with one consolidation request) for an observation card per citable document: title, printed date, proposed deliverable type, whether the document is reviewer feedback and which types it reviews, summary, observed attributes, domain terms, and craft notes. Every quoted term or craft observation is matched back to a section through `fold_for_quote`. Unlocated quotes are discarded and counted in `build_report.discarded_unlocated_quotes`.
+`ObserveSections` asks `gpt-6.1-sol` (low effort; batched over long documents with one consolidation request) for an observation card per citable document: title, printed date, proposed deliverable type, summary, the attributes the document states about itself, and the terms it uses. Every quoted term or attribute is matched back to a section through `fold_for_quote`. Unlocated quotes get one rerun that names them, then are discarded and counted in `build_report.discarded_unlocated_quotes`. Each located attribute (such as `reference`, `client`, `site`, `status`, `author`, or `instruments`) is stored in `document_attributes` with the section that states it; a quote found only inside an annotation or visual transcript does not count.
 
 ## Pass 2: bounded corpus induction (`induction.py`)
 
@@ -63,7 +76,7 @@ Sections longer than `MAX_SECTION_CHARS = 32_000` split at paragraph or table bo
 
 ### Snapshot contents
 
-The snapshot holds the corpus metadata and topic guide, the verbatim curator notes, one row per source document with its facets, type, date, and version family, the glossary and reviewer lessons, the recurring text clusters, every stitched section and rendered page, and the chunks with their embeddings and FTS5 index. [Snapshot file](../architecture.md#snapshot-file) in the architecture reference gives every table and column.
+The snapshot holds the corpus metadata and topic guide, the verbatim curator notes, one row per source document with its facets, type, date, and version family, its verified attributes (`document_attributes`), every Markdown table of its sections stored row by row with an FTS5 index (`document_tables`, `table_rows`, `table_rows_fts`), the glossary and reviewer lessons, the recurring text clusters, every stitched section and rendered page, and the chunks with their embeddings and FTS5 index. [Snapshot file](../architecture.md#snapshot-file) in the architecture reference gives every table and column.
 
 ### Model calls during a build
 
@@ -82,29 +95,34 @@ With `--cache`, provider responses are stored under a hash of their inputs. An u
 
 ## Worked example from a public corpus
 
-The file `archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline-report.docx` in the 126-file fictional `structural-monitoring-consultancy` collection shows what the three passes produce:
+The file `archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline-report.docx` in the 126-file fictional `structural-monitoring-consultancy` collection shows what the three passes produce. The figures come from the metered schema `7.0` cold build of the collection.
 
 1. **Discovery and identity.** `document_id` hashes the path to `doc_4957546a24`. LibreOffice converts the Word file to PDF, and `pypdfium2` renders all 52 pages.
 2. **Transcription and assembly.** Transcription and stitching produce 86 sections (`doc_4957546a24_sec_001` to `doc_4957546a24_sec_086`), keeping the document-control tables and multi-page instrument schedules.
-3. **Induction.** Across the collection, induction creates 28 canonical deliverable types, 29 verified reviewer lessons, and a 9,724-character cited topic guide. For `doc_4957546a24` it assigns:
+3. **Induction.** Across the collection, induction creates 28 canonical deliverable types, 30 verified reviewer lessons, and a 10,395-character cited topic guide. For `doc_4957546a24` it assigns:
    - `deliverable_type`: `Installation and baseline report`
    - `doc_date`: `14 October 2024`
    - `version_status`: `sole`
-   - bound facets: `job_status: archived`, `project: M2409 — Askern Viaduct`, `sensing_technology: fibre_bragg_grating`, `monitoring_technology: Fibre Bragg grating`
+   - bound facets: `issue_status: issued`, `job_cohort: archive`, `project: M2409 Askern Viaduct`, `sensing_technology: fibre_bragg_grating`
+   - 17 verified attributes, including `reference: MI-IR-2409`, `status: Issue 1, final`, and `instruments: Prisma FI-4 interrogator, serial PF4-1876`
+   - 61 stored tables in `document_tables`
+
+   Facet names come from induction and can differ between independent builds of the same collection (see [Appendix C](evaluation-benchmarks.md#version-families-and-facet-coverage)).
 
    In the same folder, the calibration sheet `prisma-fi-4-calibration-pf4-1876.md` (`doc_a971f575a6`) is byte-identical to a copy in the `m2505-halverton-greyscar-spillway` folder (`doc_fed78f012b`). Induction groups them as one family and marks `doc_a971f575a6` `superseded` by `doc_fed78f012b`.
 4. **Stored chunk breadcrumb.** Chunk `doc_4957546a24_chk_0001` (`kind="table"`, page 1) is indexed and embedded as:
 
 ```text
-[job_status: archived | sensing_technology: fibre_bragg_grating | project: M2409 — Askern Viaduct | monitoring_technology: Fibre Bragg grating | Doc: Askern Viaduct: fibre Bragg grating installation and baseline report (pp. 1-1) | Section: Askern Viaduct: fibre Bragg grating installation and baseline report]
+[job_cohort: archive | sensing_technology: fibre_bragg_grating | issue_status: issued | project: M2409 Askern Viaduct | Doc: Askern Viaduct: fibre Bragg grating installation and baseline report (pp. 1-1) | Section: Askern Viaduct: fibre Bragg grating installation and baseline report]
 | Item | Detail |
 | --- | --- |
 | Our ref | MI-IR-2409 |
 | Client | Northbray Rail Infrastructure |
 | Client contact | Mr Jarrow Keld |
 | Author | Maren Lisk |
+...
 ```
 
-5. **Linked reviewer lesson.** From the unlabelled QA register `active/m2505-halverton-greyscar-spillway/qa-disposition-register.docx` (`doc_4329fae0a3`), Pass 2 extracts and verifies a lesson that targets `Installation and baseline report`: *"Explain that strain is calculated only after subtracting the strain-free reference grating response for temperature compensation."*
+5. **Linked reviewer lesson.** From the unlabelled QA register `active/m2505-halverton-greyscar-spillway/qa-disposition-register.docx` (`doc_4329fae0a3`), Pass 2 extracts and verifies seven lessons that target `Installation and baseline report`, including: *"Apply strain-free reference grating temperature compensation before reporting wavelength shifts as strain, and state this step in the method."*
 
-Rebuilding the same collection with `--cache` and no changes made 0 provider calls ($0.0000). Inserting a 127th file, `a00-new-intake/a00-scoping-note.md`, at the start of the directory tree left all 126 existing `doc_id` values unchanged.
+Rebuilding the same collection with `--cache` and no changes made 0 provider calls ($0.0000). On the earlier schema `6.0` build, inserting a 127th file, `a00-new-intake/a00-scoping-note.md`, at the start of the directory tree left all 126 existing `doc_id` values unchanged.

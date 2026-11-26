@@ -83,7 +83,8 @@
         <rect x="52" y="68" width="38" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
         <text x="71" y="77" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">FILES</text>
         <text x="126" y="100" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Source Documents</text>
-        <text x="126" y="116" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">PDF · Word · Slides · MD</text>
+        <text x="126" y="114" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">PDF · Word · Slides</text>
+        <text x="126" y="126" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Excel · HTML · MD</text>
 
         <!-- 2. Curator Notes -->
         <rect x="44" y="160" width="164" height="72" rx="6" fill="#F4F1EA"/>

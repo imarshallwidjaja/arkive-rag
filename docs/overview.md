@@ -17,7 +17,7 @@ A shared drive of past reports is hard for an AI assistant to use well:
 
 ## Curation with folders and optional notes
 
-A team lead collects the documents that show good work on one topic, typically 10 to 200 `.pdf`, `.docx`, `.pptx`, and `.md` files. Any folder layout works: one folder per project, per client, per author, or one flat folder. Nobody has to tag, rename, or reformat a file.
+A team lead collects the documents that show good work on one topic, typically 10 to 200 files. Arkive reads PDF files, Word documents (`.docx`), PowerPoint decks (`.pptx`), Excel workbooks (`.xlsx`), saved web pages (`.html` or `.htm`), and Markdown (`.md`). From Word files it keeps the accepted text of tracked changes and the reviewers' comments. From PowerPoint files it keeps speaker notes, comments, and the numbers behind native charts. Any folder layout works: one folder per project, per client, per author, or one flat folder. Nobody has to tag, rename, or reformat a file.
 
 The lead can add plain-English notes in files named `AGENTS.md` anywhere in the folder. A note can say how the collection is organised, which documents are missing, or how to use the examples. Arkive reads these notes as guidance and passes them to the assistant.
 
@@ -27,7 +27,9 @@ An engineer then runs one build command. The result is a single snapshot file (`
 
 ![Two workflows from one snapshot: pinpoint answers and grounded drafting](assets/mcp-workflows-concept.png)
 
-**1. Pinpoint questions with citations.** Someone asks a factual question, such as the calibration certificate of an instrument or the minimum depth of a survey. The assistant searches the snapshot, narrows by project or client when the question names one, and answers with the document, section, and page numbers. When a value sits in a chart, the assistant can open the rendered page image and read it.
+**1. Pinpoint questions with citations.** Someone asks a factual question, such as the calibration certificate of an instrument or the minimum depth of a survey. The assistant searches the snapshot, narrows by project, client, or kind of deliverable when the question names one, and answers with the document, section, and page numbers. When a value sits in a chart, the assistant can open the rendered page image and read it. When the answer is spread over table rows in many documents, such as every alarm level in every installation report, the assistant reads the matching rows directly instead of opening each document.
+
+The assistant sees the current version of each document unless it asks for more. A question about the current fee gets the issued figure. A question about how the fee changed between drafts makes the assistant ask for every version and compare them.
 
 **2. Drafting from past work.** Someone asks for a new deliverable, such as a proposal or an installation report, and supplies the new project's facts. Arkive returns a drafting packet:
 
@@ -42,11 +44,11 @@ The assistant takes every fact of the new work from the supplied inputs. It foll
 
 The tracked fictional collection `structural-monitoring-consultancy` holds 126 files from an instrumentation consultancy: proposals, installation reports, drafts, QA checklists, calibration sheets, and rate cards for five clients from 2023 to 2026.
 
-One file is the 52-page Word installation and baseline report for the Askern Viaduct job. Arkive reads all 52 pages, splits the report into 86 sections, and labels it an installation and baseline report dated 14 October 2024 for the archived Askern Viaduct project.
+One file is the 52-page Word installation and baseline report for the Askern Viaduct job. Arkive reads all 52 pages, splits the report into 86 sections, and labels it an installation and baseline report dated 14 October 2024 for the archived Askern Viaduct project. It also records 17 facts the report states about itself, such as its reference `MI-IR-2409` and the interrogator serial `PF4-1876`, each linked to the section that states it, and stores its 61 tables so their rows can be read directly.
 
 The same build finds that a calibration sheet for one interrogator was copied into two job folders. Arkive groups the two copies as one document family and marks one copy as superseded, so search shows the other.
 
-From an unlabelled QA register in another job folder, Arkive extracts a reviewer lesson for installation reports: explain that strain is calculated only after subtracting the strain-free reference grating response, for temperature compensation. When an assistant later drafts an installation report, that lesson arrives in its drafting packet.
+From an unlabelled QA register in another job folder, Arkive extracts a reviewer lesson for installation reports: apply temperature compensation with the strain-free reference gratings before reporting wavelength shifts as strain, and state this step in the method. When an assistant later drafts an installation report, that lesson arrives in its drafting packet.
 
 ## Further reading
 

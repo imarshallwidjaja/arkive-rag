@@ -42,9 +42,9 @@ During the MCP initialisation handshake, `INSTRUCTIONS` tells the client to call
 | `view_page` | Return the rendered `image/webp` page with its visual summary and native text, so a multimodal model can inspect charts, maps, and layouts. | Text fields cut, with counts of what was left out, to fit 45 KB. |
 | `prepare_draft` | Assemble one drafting packet for a new deliverable from the user's inputs. | 45,000-byte budget; up to 3 exemplars with outlines, inline sections, lessons, notes, and provenance. |
 
-`list_documents`, `search`, `grep`, `query_tables`, and `prepare_draft` accept `filters`, for example `{"job_status": "archived", "sensing_technology": "fibre_bragg_grating"}` on the `structural-monitoring-consultancy` snapshot. Each key is a facet and each value a canonical value or alias. Keys combine with AND. An unknown facet or value returns a structured error that lists the valid options, so the agent can recover in one turn. The CLI `search` and `grep` take the same filters as repeated `--filter FACET=VALUE`.
+`list_documents`, `search`, `grep`, `query_tables`, and `prepare_draft` accept `filters`, for example `{"job_cohort": "archive", "sensing_technology": "fibre_bragg_grating"}` on the measured `structural-monitoring-consultancy` build (facet names are induced per build, so another build may name them differently). Each key is a facet and each value a canonical value or alias. Keys combine with AND. An unknown facet or value returns a structured error that lists the valid options, so the agent can recover in one turn. The CLI `search` and `grep` take the same filters as repeated `--filter FACET=VALUE`.
 
-`list_documents`, `search`, `grep`, and `query_tables` also accept `deliverable_type` (a canonical type, matched ignoring case) and `versions`. With `versions="current"`, the default, a document superseded by another document in scope is left out and counted in the result's `excluded_superseded_count`; `versions="all"` keeps every version. Every document, hit, match, and table carries the same version fields: `deliverable_type`, `doc_date`, `family_id`, `version_status`, `superseded_by`, and `superseded_doc_ids`. `prepare_draft` always drafts from current versions. The CLI takes `--type` and `--versions`.
+`list_documents`, `search`, `grep`, and `query_tables` also accept `deliverable_type` (a canonical type, matched ignoring case) and `versions`. With `versions="current"`, the default, a document superseded by another document in scope is left out and counted in the result's `excluded_superseded_count`; `versions="all"` keeps every version. Every document, hit, match, and table carries the same version fields: `deliverable_type`, `doc_date`, `family_id`, `version_status`, `superseded_by`, and `superseded_doc_ids`. `prepare_draft` always drafts from current versions. The CLI `search` and `grep` commands take `--type` and `--versions`.
 
 ### Hybrid search
 
@@ -71,11 +71,10 @@ During the MCP initialisation handshake, `INSTRUCTIONS` tells the client to call
 | `gpt-6-luna` | $0.10 / $0.01 / $0.00 | Decisions API: content-bound facets, glossary and lesson support checks | Never called |
 | `text-embedding-3-large` | $0.13 input | Batched chunk embeddings (1,536 dimensions) | One query embedding per `search` or `prepare_draft` call |
 
-Measured on the public fictional corpora:
+Cost scales with these drivers, measured on the public fictional corpora with schema `7.0` snapshots:
 
-- **Cold build.** The 126-file `structural-monitoring-consultancy` archive (110 Markdown, 10 `.docx`, and 6 `.pdf` files; 110 rendered pages including a 52-page report; 1,086 chunks; 28 deliverable types; 29 lessons) cost about $1.22 across the build and guide pass. Cold build cost grows mainly with rendered pages.
-- **Unchanged cached rebuild.** 0 provider calls and 0 rendered pages: $0.0000.
-- **Incremental file.** Adding a 127th Markdown file kept 126 of 126 document IDs, reused every cached render and page transcription, and cost $0.28 for reading the new file and rerunning induction.
-- **Runtime tokens.** Because every result is capped and `prepare_draft` returns one packet, the agent's token use grows slowly with archive size. On the 126-file archive, the Arkive arm used 42% fewer input tokens than raw-file tools on Q&A (77,215 against 134,043). On the 52-page installation report holdout it used 179,051 input tokens, 38% fewer than raw files (287,143) and 67% fewer than pasted full exemplars (540,990).
+- **Cold build.** Page transcription and per-document observation make up most of the cost, so it grows mainly with rendered pages and document text. The 126-file `structural-monitoring-consultancy` archive cost $4.67 and each 9-file collection $0.18 to $0.37. [Metered build cost](evaluation-benchmarks.md#metered-build-cost) has the per-operation ledger.
+- **Cached rebuild.** An unchanged rebuild with `--cache` makes no provider call. An added file is read alone, and the collection-level induction reruns.
+- **Runtime tokens.** Every result is capped, so a single answer's tokens grow slowly with archive size. Long drafting is the exception: an agent matching a long report's house wording reads many sections. [Holdout drafting](evaluation-benchmarks.md#holdout-drafting-layer-3) gives the token counts.
 
 `arkive-rag build` and `python -m evals.run` accept `--max-cost <USD>`. No new provider call starts once the estimated spend reaches the limit. Calls already in flight can finish past it, and the estimate excludes the long-context surcharge.

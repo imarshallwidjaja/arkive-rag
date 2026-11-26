@@ -125,7 +125,7 @@
         <rect x="304" y="352" width="46" height="12" rx="2" fill="none" stroke="#1b5e63" stroke-opacity="0.45" stroke-width="0.8"/>
         <text x="327" y="361" fill="#1B5E63" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">DOCKER</text>
         <text x="480" y="378" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">OpenCode Live Acceptance Check</text>
-        <text x="480" y="396" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">OpenCode 2.3.0 · 10 scenarios · zero truncation gate</text>
+        <text x="480" y="396" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">OpenCode 2.3.0 · 10–13 scenarios · zero truncation gate</text>
 
         <!-- 8. Atomic Reports -->
         <rect x="736" y="188" width="200" height="96" rx="6" fill="#F4F1EA"/>

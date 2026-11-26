@@ -1,6 +1,6 @@
 # Arkive RAG documentation
 
-Arkive RAG turns a curated folder of `.pdf`, `.docx`, `.pptx`, and `.md` reference documents into one portable, read-only knowledge file (`*.arkive.db`). AI assistants read that file over MCP to answer questions with citations and to draft new work from past examples.
+Arkive RAG turns a curated folder of `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html`/`.htm`, and `.md` reference documents into one portable, read-only knowledge file (`*.arkive.db`). AI assistants read that file over MCP to answer questions with citations and to draft new work from past examples.
 
 ![Arkive RAG system overview](assets/system-overview.svg)
 
@@ -23,9 +23,9 @@ Engineering detail, full benchmark tables, and the contributor specification.
 
 | Document | Covers |
 | --- | --- |
-| [Appendix A: Parsing, induction, and build pipeline](appendices/build-and-parsing.md) | The three build passes, limits, caching, snapshot contents, build model calls, and a worked example. |
+| [Appendix A: Parsing, induction, and build pipeline](appendices/build-and-parsing.md) | How each file format is read, the three build passes, limits, caching, snapshot contents, build model calls, and a worked example. |
 | [Appendix B: MCP tools, drafting packet, and cost scaling](appendices/mcp-tools-and-drafting.md) | All eleven tools and their bounds, hybrid search, `prepare_draft` packing, model prices, and scaling. |
-| [Appendix C: Evaluation harness and full benchmark tables](appendices/evaluation-benchmarks.md) | The evaluation layers, the four collections, every result table, and the commands to run it. |
+| [Appendix C: Evaluation harness and full benchmark tables](appendices/evaluation-benchmarks.md) | The evaluation layers, the four collections, the schema `7.0` uplift benchmarks beside the schema `6.0` baseline, and the commands to run it. |
 | [Architecture and verification reference](architecture.md) | Modules, schema invariants, validation, error handling, and repository verification gates. |
 
 ## Visual assets
@@ -44,4 +44,4 @@ Three illustrations show the concepts: [the folder-to-snapshot model](assets/ark
 
 ## Privacy boundary
 
-Every example, document ID, excerpt, and result table in these docs comes from the four fictional collections in `evals/example_corpora/`. No client documents, personal data, or private benchmark results appear in this repository.
+Every example, document ID, excerpt, and result table in these docs comes from fictional documents: the four collections tracked in `evals/example_corpora/`, and three synthetic stress collections that [Appendix C](appendices/evaluation-benchmarks.md#schema-70-uplift-benchmarks) describes and that are kept outside Git. No client documents, personal data, or private benchmark results appear in this repository.
