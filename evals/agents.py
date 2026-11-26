@@ -47,6 +47,7 @@ from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
 from evals.schema import (
     QACase,
+    passes_qa_phrases,
     satisfies_groups,
 )
 
@@ -442,6 +443,21 @@ when the reference facts contradict it, or the evidence does where the reference
 silent; "unverifiable" when neither supports nor contradicts it. An unverifiable claim is
 not a contradiction."""
 
+# Added to the judge's prompt for the kinds whose answers turn on version standing.
+QA_KIND_NOTES = {
+    "current_value": (
+        "The question asks for the current value: the value of the latest issued version."
+        " An answer that states a superseded draft's value as the current or issued value"
+        " contradicts the reference facts."
+    ),
+    "version_history": (
+        "The question asks how a value changed across versions. The answer must give the final"
+        " value and the earlier draft or review values, and keep them apart: a draft value"
+        " presented as final, or a final value presented as a draft's, contradicts the"
+        " reference facts."
+    ),
+}
+
 QA_EVIDENCE_MAX_CHARS = 48_000
 
 
@@ -523,8 +539,12 @@ class QAJudgement:
             )
             or "(none listed)"
         )
+        note = QA_KIND_NOTES.get(self.case.kind)
+        question = f"QUESTION:\n{self.case.question}\n\n"
+        if note is not None:
+            question += f"QUESTION KIND: {self.case.kind}. {note}\n\n"
         return (
-            f"QUESTION:\n{self.case.question}\n\nREFERENCE FACTS:\n{facts}\n\n"
+            f"{question}REFERENCE FACTS:\n{facts}\n\n"
             f"SOURCE ANCHORS:\n{anchors}\n\nEVIDENCE:\n{self.evidence}\n\nANSWER:\n{self.answer}"
         )
 
@@ -535,15 +555,22 @@ async def run_layer2_qa(
     corpus_dir: Path,
     embedder: CountingEmbedder,
     cases: Sequence[QACase],
+    repeats: int = 1,
 ) -> dict[str, object]:
     """Only completed runs are judged and can cover phrases; other runs keep their status.
 
-    Each case runs once per arm. A judged row carries the judge's claims and `claim_counts`;
-    a row that was not judged has `judge` and `claim_counts` None and says why in
-    `judge_missing`: the run did not complete, or the judge call failed with a `ProviderError`
-    (invalid or refused output, output still truncated after the retry, a provider failure),
-    which keeps the row's phrase coverage. The spend limit stops the evaluation.
+    Each case runs `repeats` times per arm, each row numbered by its `repeat` from 1. A
+    completed run covers the case's phrases when it satisfies every required group and states
+    no `forbid_any` phrase; `forbidden_hits` lists the ones it stated. A judged row carries
+    the judge's claims and `claim_counts`; a row that was not judged has `judge` and
+    `claim_counts` None and says why in `judge_missing`: the run did not complete, or the
+    judge call failed with a `ProviderError` (invalid or refused output, output still
+    truncated after the retry, a provider failure), which keeps the row's phrase coverage.
+    `case_summaries` aggregates each case and arm over its repeats. The spend limit stops the
+    evaluation.
     """
+    if repeats < 1:
+        raise ValueError(f"repeats must be at least 1, got {repeats}")
     # Extracted once before any timed query, so the baseline is not charged LibreOffice
     # start-up on each question.
     started = time.monotonic()
@@ -558,47 +585,109 @@ async def run_layer2_qa(
             "arkive_mcp": (mcp_tools, with_server_instructions(QA_INSTRUCTIONS, mcp_notes)),
         }
         for case in cases:
-            for arm, (tools, instructions) in arms.items():
-                run = await run_agent(
-                    gateway,
-                    operation=f"qa_{arm}",
-                    instructions=instructions,
-                    prompt=case.question,
-                    tools=tools,
-                    max_turns=QA_MAX_TURNS,
-                    embedder=embedder,
-                )
-                completed = run.status == "completed"
-                judge: QAJudgeScore | None = None
-                judge_missing: str | None = "the run did not complete, so it was not judged"
-                if completed:
-                    try:
-                        judge = await anyio.to_thread.run_sync(
-                            gateway.run, QAJudgement(case, evidence[case.case_id], run.answer)
+            for repeat in range(1, repeats + 1):
+                for arm, (tools, instructions) in arms.items():
+                    rows.append(
+                        await _qa_row(
+                            gateway,
+                            embedder,
+                            case,
+                            evidence[case.case_id],
+                            arm,
+                            tools,
+                            instructions,
+                            repeat,
                         )
-                    except BudgetExceededError:
-                        raise
-                    except ProviderError as exc:
-                        judge_missing = f"the judge call failed: {exc}"
-                    else:
-                        judge_missing = None
-                rows.append(
-                    {
-                        "case_id": case.case_id,
-                        "kind": case.kind,
-                        "arm": arm,
-                        "status": run.status,
-                        "phrase_coverage": completed
-                        and satisfies_groups(run.answer, case.required_groups),
-                        "groups_matched": sum(
-                            completed and satisfies_groups(run.answer, (g,))
-                            for g in case.required_groups
-                        ),
-                        "groups_total": len(case.required_groups),
-                        "run": run,
-                        "judge": judge,
-                        "judge_missing": judge_missing,
-                        "claim_counts": None if judge is None else judge.claim_counts(),
-                    }
-                )
-    return {"raw_prep_seconds": raw_prep_seconds, "rows": rows}
+                    )
+    return {
+        "raw_prep_seconds": raw_prep_seconds,
+        "qa_repeats": repeats,
+        "rows": rows,
+        "case_summaries": qa_case_summaries(rows),
+    }
+
+
+async def _qa_row(
+    gateway: OpenAIGateway,
+    embedder: CountingEmbedder,
+    case: QACase,
+    evidence: str,
+    arm: str,
+    tools: Sequence[Tool],
+    instructions: str,
+    repeat: int,
+) -> dict[str, object]:
+    run = await run_agent(
+        gateway,
+        operation=f"qa_{arm}",
+        instructions=instructions,
+        prompt=case.question,
+        tools=tools,
+        max_turns=QA_MAX_TURNS,
+        embedder=embedder,
+    )
+    completed = run.status == "completed"
+    judge: QAJudgeScore | None = None
+    judge_missing: str | None = "the run did not complete, so it was not judged"
+    if completed:
+        try:
+            judge = await anyio.to_thread.run_sync(
+                gateway.run, QAJudgement(case, evidence, run.answer)
+            )
+        except BudgetExceededError:
+            raise
+        except ProviderError as exc:
+            judge_missing = f"the judge call failed: {exc}"
+        else:
+            judge_missing = None
+    passed, forbidden_hits = passes_qa_phrases(run.answer, case) if completed else (False, ())
+    return {
+        "case_id": case.case_id,
+        "kind": case.kind,
+        "arm": arm,
+        "repeat": repeat,
+        "status": run.status,
+        "phrase_coverage": passed,
+        "groups_matched": sum(
+            completed and satisfies_groups(run.answer, (g,)) for g in case.required_groups
+        ),
+        "groups_total": len(case.required_groups),
+        "forbidden_hits": list(forbidden_hits),
+        "run": run,
+        "judge": judge,
+        "judge_missing": judge_missing,
+        "claim_counts": None if judge is None else judge.claim_counts(),
+    }
+
+
+JUDGE_FIELDS = ("factual_accuracy_1_to_5", "citation_quality_1_to_5", "completeness_1_to_5")
+
+
+def qa_case_summaries(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, object]]:
+    """Per case and arm, in row order, over its repeats: runs, completed runs, the phrase
+    coverage pass rate over all runs (a run that did not complete is a miss), the judged runs
+    and each judge score's mean over them (None when none was judged), and the runs that
+    stated a forbidden phrase."""
+    groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault((row["case_id"], row["arm"]), []).append(row)
+    summaries: list[dict[str, object]] = []
+    for (case_id, arm), group in groups.items():
+        judged = [r["judge"] for r in group if r["judge"] is not None]
+        summaries.append(
+            {
+                "case_id": case_id,
+                "kind": group[0]["kind"],
+                "arm": arm,
+                "runs": len(group),
+                "completed": sum(r["status"] == "completed" for r in group),
+                "phrase_pass_rate": sum(bool(r["phrase_coverage"]) for r in group) / len(group),
+                "judged": len(judged),
+                "judge_means": {
+                    f: (sum(getattr(j, f) for j in judged) / len(judged) if judged else None)
+                    for f in JUDGE_FIELDS
+                },
+                "forbidden_hit_runs": sum(bool(r["forbidden_hits"]) for r in group),
+            }
+        )
+    return summaries

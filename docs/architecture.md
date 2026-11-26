@@ -1182,7 +1182,9 @@ anything), that the pack is a valid `arkive-eval-pack/3` file (a pack of
 another format is refused with a message naming format 3; no older format is
 read), that it defines the requested layers, that `--holdout` names one of
 its holdouts and comes with layer 3, that `--drafts` (a positive number of
-draft rounds, default 1) comes with layer 3, that layers 2 and 3 have `--corpus`,
+draft rounds, default 1) comes with layer 3, that `--qa-repeats` (a positive
+number of runs of each Q&A case per arm, default 1) comes with layer 2, that
+layers 2 and 3 have `--corpus`,
 that `--out` and `--cache` overlap none of the pack, snapshot and corpus
 paths nor each other, that an existing `--out` is a directory, not a symlink,
 that the runner can write and search, with no directory named `results.json`
@@ -1194,7 +1196,8 @@ with layer 3 is either absent and creatable by the same test as `--out` or a
 regular file, not a symlink, that the runner can read and write in a directory
 it can write and search (SQLite writes `-wal` and `-shm` files beside it),
 that the snapshot opens, that its `corpus_fingerprint` matches the
-pack's when the pack sets one, that every retrieval case's `filters` resolve
+pack's when the pack sets one, that every member of the pack's
+`expected_families` is a document path of the snapshot, that every retrieval case's `filters` resolve
 against it and its `expected_docs` name documents of it, that every Q&A source anchor names a document of the snapshot
 and pages within it, that each anchor of a case other than `abstention`
 overlaps some section, and that each case's evidence (below) is at most 48,000
@@ -1245,7 +1248,11 @@ from facet name to value or alias that layer 1 passes to `rank_channels` and
 `search`;
 facets are induced per snapshot, so `arkive-rag inspect` lists the names and
 values a pack can use. A Q&A case has a `kind`, one of `lookup`,
-`multi_document`, `aggregation`, `abstention`, `conflict` and `vocabulary`,
+`multi_document`, `aggregation`, `abstention`, `conflict`, `vocabulary`,
+`current_value` (the value the latest issued version states, where earlier
+drafts state another) and `version_history` (the final value together with
+the draft or review values before it), an optional `forbid_any` list of
+phrases a correct answer never states, such as a superseded draft's value,
 and `source_anchors`, each `{"doc_id": ..., "pages": [first, last]}` or
 `"pages": null` for the whole document (Markdown sources have no pages, so
 their anchors use null; an anchor with page numbers on a Markdown document
@@ -1263,7 +1270,11 @@ which must be one of the holdout's included files and a delivered document,
 not a curator note. The list is the same in
 every run: it does not depend on what induction makes of the corpus. An empty
 list means the exemplars-in-context arm does not run for that holdout. The
-rubric may be empty, because the lexical-overlap measures below need none.
+rubric may be empty, because the lexical-overlap measures below need none. A
+pack may also list `expected_families`, the non-singleton version families
+the snapshot should induce: each has at least two `members`, plain
+corpus-relative paths, and an optional `latest` that must be one of them; no
+path may appear in two families.
 Expected facts are
 *groups* of alternative substrings, matched NFKC-, case-, dash-, whitespace-
 and thousands-separator-insensitively and with Markdown emphasis ignored, so
@@ -1272,7 +1283,7 @@ that touch a non-space character (a spaced `2 * 3` keeps its sign) and `_`
 runs with a letter or digit on one side only: `_italic_` and `__bold__` lose
 their underscores, while `harbour_dry` and `survey__v2.tif` keep every one.
 Table pipes stay, so a group such as `| values` can test a table row. Pack
-validation refuses a phrase in `required_groups`, `require_groups` or
+validation refuses a phrase in `required_groups`, `require_groups` or either
 `forbid_any` that is empty once normalized, such as ```` ``` ```` or `**`,
 because an empty phrase would match every text. A `RubricCheck` passes when the draft
 satisfies every `require_groups` group and contains no `forbid_any` phrase.
@@ -1287,7 +1298,7 @@ of that collection (see Example corpora). Real packs stay in the private store.
 | Layer | Module | Measures |
 | --- | --- | --- |
 | 1 | `ablation.py` | Completion@1/3/5 and CompletionMRR@5 of four rankings over the pack's retrieval cases, per category. A case completes at rank r when the top-r chunks jointly cover every required group and expected document. `TopicSnapshot.rank_channels` ranks three arms over raw chunk channels: `bm25_only`, `dense_only` and `hybrid_rrf`. The fourth, `served_search`, is `TopicSnapshot.search` with the same top-k, the ranking agents get: it leaves out a superseded document whose replacement passes the case's filters and takes at most `SEARCH_FAMILY_CAP` (3) chunks of one version family before held-back chunks fill the list; it shows whether that collapse and cap keep or improve completion. All four use one query embedding per case, made only after the first ranking has validated the query, filters and top-k, so an invalid case fails with no embedding call. |
-| 2 | `agents.py` | An agent conversation answers each QA case once with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and once with the eleven Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`required_groups`) and a blinded judge score with evidence, below. Raw-file extraction runs once before timing. The report groups results by `kind`. |
+| 2 | `agents.py` | An agent conversation answers each QA case `--qa-repeats` times (default once) with raw-file tools (text grep, page text, page images over the files `discover_corpus` accepts) and as many times with the eleven Arkive MCP tools. Each completed answer gets deterministic phrase coverage (`passes_qa_phrases`: every `required_groups` group and no `forbid_any` phrase, whose matches are recorded as `forbidden_hits`) and a blinded judge score with evidence, below. Raw-file extraction runs once before timing. Each row records its `repeat`; `case_summaries` gives per case and arm the phrase pass rate over all runs and the judge means over judged runs, which the report shows as a by-case table when repeats exceed one. The report groups results by `kind` and lists every answer that stated a forbidden phrase. |
 | 3 | `drafting.py` | For each holdout, or the one `--holdout` names, builds a holdout snapshot, records which documents `prepare_draft` selects, and runs `--drafts` rounds of four draft arms, and a fifth when the holdout's `exemplar_paths` is not empty, measured against a reference deliverable; the procedure, guards and measures are below. |
 
 The Q&A judge sees the question, the reference facts, the anchors and their
@@ -1312,7 +1323,26 @@ truncated after the retry, a provider failure) leaves that row with `judge`
 null and the reason in `judge_missing`; the row keeps its phrase coverage.
 `report.md` counts the judged rows per arm and kind, averages judge scores over
 judged rows only, and lists each completed run that was not judged with the
-reason. The spend limit still stops the evaluation.
+reason. The spend limit still stops the evaluation. For a `current_value`
+case the judge is also told that a superseded draft's value stated as the
+current or issued value contradicts the reference facts; for a
+`version_history` case, that the answer must give the final value and the
+earlier draft or review values and keep them apart.
+
+Every run also records `snapshot_diagnostics` in `results.json` and a
+Snapshot diagnostics section in `report.md`, read from the snapshot with no
+model call. When the pack lists `expected_families`,
+`version_families` compares them with the snapshot's non-singleton version
+families by member paths: `exact_families` (expected families induced with
+exactly their members) of `expected_count`, `actual_count` induced families,
+`missed_families`, `false_positive_families` (induced families that match no
+expected one), and `latest_correct` of `latest_checked`, the exactly matched
+families that name a `latest`, with each `wrong_latest` listed; it is null
+when the pack lists none. `facets` gives each facet's coverage of the citable
+documents (curator notes excluded) and the Jaccard overlap of the document
+sets of every facet pair; a pair at or above 0.85 is listed as a candidate
+redundant pair, a measure of which documents the facets sort, not of what
+their values mean.
 
 For layer 3:
 
@@ -1458,6 +1488,19 @@ draft sentence that happens to span two adjacent holdout list items can count
 as copied. The zero-shot arm never sees the collection, so its contamination
 shows the observed rate of such false matches. Repeated drafts from one
 holdout build measure drafting variation, not build variation.
+
+Evidence delivery records, for every completed draft of every arm, whether
+the holdout evidence reached the agent and the draft (`evidence_delivery` in
+`results.json`). The delivered text is the arm's instructions and prompt plus
+every tool result returned to the agent, captured whole as the tool returned
+it (a JSON result is read as its string values); the tool-call record keeps
+its 200-character head. The items are the rubric required groups labelled
+`holdout` below, matched as rubric checks match, and the house units, which
+count as present when the text holds at least
+`STANDING_RECURRENCE_CONTAINMENT` of their shingles. Each item is
+`delivered_and_used`, `delivered_not_used` (a guidance or generation gap),
+`not_delivered_not_used` (a delivery gap) or `not_delivered_but_used`, and
+`report.md` sums the four outcomes per arm.
 
 Rubric diagnostics label each required group of each rubric check by where one
 of its alternatives first occurs: `run_notes`, `instructions`, `holdout` (any
@@ -1640,7 +1683,9 @@ non-interactively, on several topics at once. It needs Docker and
   validated by `ScenarioFile` in `scenarios.py`) is tied to the example
   corpora. A scenario has a prompt, the Arkive tools that must complete at
   least once, argument expectations (`non_empty`: some completed call passed
-  a non-empty argument such as `filters`; `invalid_filter_recovery`: a call
+  a non-empty argument such as `filters`; `equals`: some completed call to one
+  of the named tools passed the argument with exactly the given value, of the
+  same JSON type, such as `versions` `"all"`; `invalid_filter_recovery`: a call
   whose `filters` set a facet to the scenario's invalid value ended in a tool
   error, and a later call to the same tool on the same topic, setting that
   facet to another value, completed), the topics its calls must query, answer
@@ -1669,7 +1714,12 @@ non-interactively, on several topics at once. It needs Docker and
   an exact number found with `grep`, a chart value read through `view_page`,
   a draft that must fetch the drafting packet with `prepare_draft` and
   reproduce one of its recurring passages, and a question that needs both
-  topics.
+  topics. `scenarios-uplift.json` (`--scenarios`) holds every scenario of
+  `scenarios.json` unchanged and adds `structural-monitoring-consultancy` with
+  three more: a listing filtered by a deliverable type the agent finds through
+  `list_topics`, the Greyscar spillway alarm levels and how they changed from
+  earlier drafts (which needs `versions` `"all"`), and table rows read through
+  `query_tables`.
 - **Results.** The runner parses the newline-delimited JSON events
   (`tool_use`, `text`, `step_finish`, `error`); the final answer is the text
   written after the last tool call. It writes `results.json` (per scenario:

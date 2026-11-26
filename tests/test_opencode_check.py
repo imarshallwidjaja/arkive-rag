@@ -16,14 +16,18 @@ import pytest
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
+from arkive_rag import passages
 from evals.opencode_check import runner
 from evals.opencode_check.scenarios import (
+    EqualArgument,
+    NonEmptyArgument,
     Scenario,
     ScenarioFile,
     Transcript,
     evaluate,
     parse_events,
 )
+from evals.schema import normalize_for_match
 from tests.support import BATHYMETRY_CORPUS, compile_snapshot
 
 
@@ -75,6 +79,142 @@ def test_shipped_scenario_topics_are_shipped_example_corpora_and_prompts_name_no
     every_prompt = " ".join(s.prompt for s in scenario_file.scenarios)
     assert "document_role" not in every_prompt and "creator=" not in every_prompt
     assert len(scenario_file.scenarios) == 10
+
+
+def test_uplift_scenarios_extend_the_shipped_ones_with_structural_monitoring_scenarios() -> None:
+    shipped = ScenarioFile.load(runner.DEFAULT_SCENARIOS)
+    uplift = ScenarioFile.load(runner.CHECK_DIR / "scenarios-uplift.json")
+    topic = "structural-monitoring-consultancy"
+    assert uplift.topics == (*shipped.topics, topic)
+    corpora = Path(__file__).resolve().parents[1] / "evals" / "example_corpora"
+    assert set(uplift.topics) <= {p.name for p in corpora.iterdir() if p.is_dir()}
+    # Every shipped scenario, unchanged, then the three Schema 7.0 scenarios.
+    assert uplift.scenarios[:10] == shipped.scenarios
+    added = {s.scenario_id: s for s in uplift.scenarios[10:]}
+    assert list(added) == ["type-filtered-list", "version-history-discovery", "table-rollup"]
+    assert all(s.topics_queried == (topic,) for s in added.values())
+    corpus = corpora / topic
+    # Answer values are values the corpus states, so a faithful answer can meet them.
+    corpus_text = normalize_for_match(
+        " ".join(p.read_text(encoding="utf-8") for p in corpus.rglob("*.md"))
+    )
+    for scenario_id in ("version-history-discovery", "table-rollup"):
+        for group in added[scenario_id].answer_groups:
+            assert any(normalize_for_match(a) in corpus_text for a in group), group
+    # Deliverable types and facets are induced per build, so no prompt names a type label.
+    with_type = added["type-filtered-list"]
+    assert with_type.required_tools == ("list_topics", "list_documents")
+    assert "deliverable_type=" not in with_type.prompt
+    (history,) = added["version-history-discovery"].argument_expectations
+    assert isinstance(history, EqualArgument)
+    assert (history.argument, history.value, history.topic) == ("versions", "all", topic)
+    rollup = added["table-rollup"]
+    assert rollup.required_tools == ("query_tables",)
+    (table_call,) = rollup.argument_expectations
+    assert isinstance(table_call, NonEmptyArgument)
+    assert (table_call.tools, table_call.topic) == (("query_tables",), topic)
+    # The table-rollup values are table cells, each serial in the row of its calibration month,
+    # so only a table read can supply them together.
+    rows = [
+        row
+        for p in corpus.rglob("*.md")
+        for table in passages.tables(p.read_text(encoding="utf-8"))
+        for row in table.rows
+    ]
+    assert ("PF4-1876", "2022", "August each year") in rows
+    assert ("PF4-2043", "2025", "March each year") in rows
+    assert ("Strain sensitivity", "1.21 pm/\u00b5\u03b5") in rows
+    cells = " ".join(cell for row in rows for cell in row)
+    for group in rollup.answer_groups:
+        assert any(a in cells for a in group), group
+
+
+def test_partial_uplift_answers_fail_their_answer_groups() -> None:
+    uplift = ScenarioFile.load(runner.CHECK_DIR / "scenarios-uplift.json")
+    by_id = {s.scenario_id: s for s in uplift.scenarios}
+    topic = "structural-monitoring-consultancy"
+
+    def failed(scenario_id: str, call: str, answer: str) -> list[str]:
+        transcript = parse_events([call, _event("text", type="text", text=answer)])
+        return _failed(by_id[scenario_id], transcript)
+
+    history = _tool("arkive_search", {"topic": topic, "query": "alarm", "versions": "all"})
+    full_history = (
+        "v1.0 (issued): amber 60% (120), red 85% (170). The v0.8 and v0.9 drafts set amber"
+        " 75% (150) and red 100% (200)."
+    )
+    assert failed("version-history-discovery", history, full_history) == []
+    # The draft values alone, without the issued percentages or the drafts' levels, fail.
+    assert failed("version-history-discovery", history, "120, 170, v0.8") == [
+        "answer: 60% | 60 %",
+        "answer: 85% | 85 %",
+        "answer: 75% | 75 % | 150",
+        "answer: 100% | 100 % | 200",
+    ]
+    other_topic = _tool("arkive_search", {"topic": "survey", "query": "a", "versions": "all"})
+    assert f"arguments: search/grep/list_documents/query_tables.versions == 'all' on {topic}" in (
+        failed("version-history-discovery", other_topic, full_history)
+    )
+    tables = _tool("arkive_query_tables", {"topic": topic, "query": "PF4"})
+    full_rollup = "PF4-1876: due August; PF4-2043: due March; LS-8 strain sensitivity 1.21."
+    assert failed("table-rollup", tables, full_rollup) == []
+    # The serials and the sensitivity without the calibration months fail.
+    assert failed("table-rollup", tables, "PF4-1876, PF4-2043, 1.21") == [
+        "answer: August",
+        "answer: March",
+    ]
+
+
+def test_an_equal_argument_needs_a_completed_call_with_that_value_of_the_same_type() -> None:
+    scenario = _scenario(
+        argument_expectations=[
+            {
+                "condition": "equals",
+                "tools": ["search", "grep"],
+                "argument": "versions",
+                "value": "all",
+            }
+        ]
+    )
+    label = "arguments: search/grep.versions == 'all'"
+    answered = _event("text", type="text", text="ok")
+
+    def failed(*calls: str) -> list[str]:
+        return _failed(scenario, parse_events([*calls, answered]))
+
+    assert failed(_tool("arkive_grep", {"topic": "survey", "versions": "all"})) == []
+    assert failed(_tool("arkive_search", {"topic": "survey", "versions": "current"})) == [label]
+    assert failed(_tool("arkive_search", {"topic": "survey"})) == [label]
+    assert failed(_tool("arkive_search", {"topic": "survey", "versions": "all"}, "error")) == [
+        label
+    ]
+    assert failed(_tool("arkive_list_documents", {"topic": "survey", "versions": "all"})) == [label]
+    flagged = _scenario(
+        argument_expectations=[
+            {"condition": "equals", "tools": ["search"], "argument": "flag", "value": True}
+        ]
+    )
+    one = _tool("arkive_search", {"topic": "survey", "flag": 1})
+    assert _failed(flagged, parse_events([one, answered])) == ["arguments: search.flag == True"]
+    true = _tool("arkive_search", {"topic": "survey", "flag": True})
+    assert _failed(flagged, parse_events([true, answered])) == []
+    on_survey = _scenario(
+        argument_expectations=[
+            {
+                "condition": "equals",
+                "tools": ["search"],
+                "argument": "versions",
+                "value": "all",
+                "topic": "survey",
+            }
+        ]
+    )
+    elsewhere = _tool("arkive_search", {"topic": "campaigns", "versions": "all"})
+    assert _failed(on_survey, parse_events([elsewhere, answered])) == [
+        "arguments: search.versions == 'all' on survey"
+    ]
+    here = _tool("arkive_search", {"topic": "survey", "versions": "all"})
+    assert _failed(on_survey, parse_events([elsewhere, here, answered])) == []
 
 
 DISCLOSURE = (
@@ -215,6 +355,20 @@ def test_scenario_file_refuses_duplicates_unknown_tools_and_undeclared_topics() 
         load(case | {"topics_queried": ["campaigns"]})
     with pytest.raises(ValidationError, match="undeclared topics"):
         load(case | {"answer_reproduces_recurring_passage_of": "campaigns"})
+    with pytest.raises(ValidationError, match="undeclared topics"):
+        load(
+            case
+            | {
+                "argument_expectations": [
+                    {
+                        "condition": "non_empty",
+                        "tools": ["query_tables"],
+                        "argument": "query",
+                        "topic": "campaigns",
+                    }
+                ]
+            }
+        )
     with pytest.raises(ValidationError, match="required_tools"):
         load(case | {"required_tools": ["read"]})
     with pytest.raises(ValidationError, match="condition"):

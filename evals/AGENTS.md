@@ -13,7 +13,7 @@ Refines root `AGENTS.md` for the evaluation harness (`evals/*.py`), public examp
 | `run.py` | CLI entrypoint (`python -m evals.run`), full preflight validation, spend limit (`--max-cost`), and atomic owner-only (`0600`) output publication. |
 | `example_corpora/` | Four strictly fictional tracked corpora (`coastal-survey-projects`, `creator-campaigns`, `acoustic-consultancy-files`, `structural-monitoring-consultancy`). |
 | `example_packs/` | Matching `arkive-eval-pack/3` files for the four public corpora (`example_pack.eval.json` is the smaller offline test fixture). |
-| `opencode_check/` | Live Docker OpenCode `2.3.0` runner (`python -m evals.opencode_check`) executing `scenarios.json` with only Arkive MCP tools enabled. |
+| `opencode_check/` | Live Docker OpenCode `2.3.0` runner (`python -m evals.opencode_check`) executing `scenarios.json` (default) or `scenarios-uplift.json` (every shipped scenario plus deliverable-type, version-history, and table-query scenarios over `structural-monitoring-consultancy`) with only Arkive MCP tools enabled. |
 
 ## Hard rules for `evals/`
 

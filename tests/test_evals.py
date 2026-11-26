@@ -48,6 +48,7 @@ from evals.agents import (
     AgentRun,
     CountingEmbedder,
     JudgedClaim,
+    QAJudgement,
     QAJudgeScore,
     RawCorpus,
     arkive_mcp_tools,
@@ -81,11 +82,13 @@ from evals.run import _layer2_report, _layer3_report, make_private_directory, wr
 from evals.run import app as eval_app
 from evals.schema import (
     EvalPack,
+    ExpectedFamily,
     Holdout,
     QACase,
     RetrievalCase,
     RubricCheck,
     normalize_for_match,
+    passes_qa_phrases,
     satisfies_groups,
 )
 from tests.support import (
@@ -243,6 +246,24 @@ def pack_with(**overrides: Any) -> dict[str, Any]:
             "exemplar path 'p102-estuary-multibeam/estuary-proposal.md' is not under any",
         ),
         ({"holdouts__0__exemplar_paths": ["p101-harbour-lidar/"]}, "plain corpus-relative"),
+        ({"qa_cases__0__forbid_any": ["**"]}, r"qa case .* phrase '\*\*' is empty"),
+        ({"qa_cases__0__forbid_any": [" "]}, "pattern"),
+        ({"expected_families": [{"members": ["a/r-v1.md"]}]}, "at least 2 items"),
+        (
+            {"expected_families": [{"members": ["a/r-v1.md", "a/r-v2.md"], "latest": "a/r.md"}]},
+            "latest 'a/r.md' is not one of its members",
+        ),
+        ({"expected_families": [{"members": ["./a/r-v1.md", "a/r.md"]}]}, "plain corpus-relative"),
+        ({"expected_families": [{"members": ["a/r.md", "a/r.md"]}]}, "duplicate expected family"),
+        (
+            {
+                "expected_families": [
+                    {"members": ["a/r-v1.md", "a/r-v2.md"]},
+                    {"members": ["a/r-v2.md", "a/r-v3.md"]},
+                ]
+            },
+            r"duplicate expected family member across families: \['a/r-v2.md'\]",
+        ),
     ],
 )
 def test_eval_pack_rejects_malformed_packs(overrides: dict[str, Any], message: str) -> None:
@@ -269,6 +290,36 @@ def test_eval_pack_accepts_an_abstention_case_without_anchors_and_a_holdout_with
     assert holdout_task(pack).rubric == () and holdout_task(pack).exemplar_paths == ()
     (abstention,) = [c for c in pack.qa_cases if c.kind == "abstention"]
     assert abstention.source_anchors == ()
+
+
+def test_a_qa_answer_covers_its_phrases_only_without_a_forbidden_phrase() -> None:
+    pack = EvalPack.model_validate(
+        pack_with(
+            qa_cases__0__kind="current_value",
+            qa_cases__0__forbid_any=["307.7", "**75%**"],
+            qa_cases__1__kind="version_history",
+            expected_families=[
+                {"members": ["a/r-v1.md", "a/r-v2.md"], "latest": "a/r-v2.md"},
+                {"members": ["b/m-v1.md", "b/m-v2.md"]},
+            ],
+        )
+    )
+    case = pack.qa_cases[0]
+    assert (case.kind, pack.qa_cases[1].kind) == ("current_value", "version_history")
+    assert [f.latest for f in pack.expected_families] == ["a/r-v2.md", None]
+    assert passes_qa_phrases("The median is 330.9 mm.", case) == (True, ())
+    # A forbidden phrase fails an answer that covers every group, matched as groups match.
+    assert passes_qa_phrases("Median 330.9 mm; the draft said 307.7 and 75 %.", case) == (
+        False,
+        ("307.7",),
+    )
+    assert passes_qa_phrases("Median 330.9, amber `75%`, was 307.7", case) == (
+        False,
+        ("307.7", "**75%**"),
+    )
+    assert passes_qa_phrases("The value is 330.9 mm.", case) == (False, ())
+    # Without forbid_any, coverage is the required groups alone.
+    assert passes_qa_phrases("median 330.9 and 307.7", pack.qa_cases[1]) == (False, ())
 
 
 def test_group_matching_folds_case_dashes_whitespace_and_thousands_separators() -> None:
@@ -824,6 +875,99 @@ def test_rubric_diagnostics_label_where_each_required_group_occurs_in_the_inputs
     ]
 
 
+def test_evidence_delivery_separates_delivery_gaps_from_generation_gaps() -> None:
+    check = RubricCheck.model_validate(
+        {
+            "check_id": "method",
+            "category": "c",
+            "description": "d",
+            "require_groups": [["812 km2"], ["ground truth", "check line"], ["S-44 Order 1a"]],
+        }
+    )
+    diagnostics = rubric_diagnostics(
+        [check],
+        run_notes="Area: 812 km2.",
+        instructions="Write it.",
+        holdout_sections=["Ground truthing confirmed the depths.", "Soundings meet S-44 Order 1a."],
+    )
+    sources = OverlapSources.from_texts(
+        reference_sections=[f"# Proposal\n\n{HOUSE}"],
+        holdout_documents=[[f"# About us\n\n{HOUSE}"]],
+        run_notes="Area: 812 km2.",
+        instructions="Write it.",
+    )
+    # The tool result reaches the agent whole, past the 200-character head a call records;
+    # its JSON escapes are read as the text the agent saw.
+    padding = "Survey log line. " * 20
+    found = json.dumps({"matches": [{"text": f"{padding}\nGround truthing done.\n{HOUSE}"}]})
+    delivered: list[str] = ["Write it.", "RUN NOTES:\nArea: 812 km2."]
+
+    async def search(args: dict[str, Any]) -> str:
+        return found
+
+    (recorded_search, recorded_view) = drafting.recording_tools(
+        [
+            Tool("search", "s", {}, search),
+            Tool("view", "v", {}, lambda args: ToolReply("page 1", ())),
+        ],
+        delivered,
+    )
+
+    async def call_both() -> None:
+        assert await cast(Any, recorded_search.invoke({})) == found
+        assert await cast(Any, recorded_view.invoke({})) == ToolReply("page 1", ())
+
+    anyio.run(call_both)
+    assert delivered[2:] == [found, "page 1"]
+    context = drafting.delivered_blocks(delivered)
+    assert context[2] == f"{padding}\nGround truthing done.\n{HOUSE}"
+
+    def outcomes(context: Sequence[str], draft: str) -> list[tuple[str, str]]:
+        measured = drafting.evidence_delivery(
+            context=context, draft=draft, rubric=diagnostics, sources=sources
+        )
+        return [(i.kind, i.outcome) for i in measured.items]
+
+    # Only the holdout-sourced groups are items; the run notes group is not.
+    assert outcomes(context, f"Ground truth checks done. {HOUSE}") == [
+        ("rubric_group", "delivered_and_used"),
+        ("rubric_group", "not_delivered_not_used"),
+        ("house_unit", "delivered_and_used"),
+    ]
+    assert outcomes(context, "Nothing.") == [
+        ("rubric_group", "delivered_not_used"),
+        ("rubric_group", "not_delivered_not_used"),
+        ("house_unit", "delivered_not_used"),
+    ]
+    # Evidence split across adjacent JSON fields or tool results was never seen whole: the
+    # rubric phrase and every 4-gram of the house unit straddle a block boundary.
+    words = HOUSE.split()
+    split = [
+        json.dumps({"head": "Ground", "tail": "truth checks were done."}),
+        *(json.dumps({"text": " ".join(words[i : i + 3])}) for i in range(0, len(words), 3)),
+    ]
+    split_context = drafting.delivered_blocks([*delivered[:2], *split])
+    assert outcomes(split_context, f"Ground truth checks done. {HOUSE}") == [
+        ("rubric_group", "not_delivered_but_used"),
+        ("rubric_group", "not_delivered_not_used"),
+        ("house_unit", "not_delivered_but_used"),
+    ]
+    measured = drafting.evidence_delivery(
+        context=drafting.delivered_blocks(delivered[:2]),
+        draft=f"Meets S-44 Order 1a. {HOUSE}",
+        rubric=diagnostics,
+        sources=sources,
+    )
+    assert measured.rubric_groups == {
+        "delivered_and_used": 0,
+        "delivered_not_used": 0,
+        "not_delivered_not_used": 1,
+        "not_delivered_but_used": 1,
+    }
+    assert measured.house_units["not_delivered_but_used"] == 1
+    assert measured.items[0].label == "method: ['ground truth', 'check line']"
+
+
 def test_exemplars_prompt_labels_documents_by_path_without_visuals_and_ends_with_run_notes() -> (
     None
 ):
@@ -1258,6 +1402,18 @@ def test_eval_cli_refuses_mismatched_inputs_before_outputs_or_model_calls(
     assert "layer 3 is not run" in run(EXAMPLE_PACK_PATH, "--layer", "1", "--holdout", "x")
     assert "--drafts sets layer 3" in run(EXAMPLE_PACK_PATH, "--layer", "1", "--drafts", "2")
     assert "--drafts" in run(EXAMPLE_PACK_PATH, *everything, "--drafts", "0")
+    assert "--qa-repeats sets layer 2 runs per case; layer 2 is not run" in run(
+        EXAMPLE_PACK_PATH, "--layer", "1", "--qa-repeats", "3"
+    )
+    assert "--qa-repeats" in run(EXAMPLE_PACK_PATH, *layer2, "--qa-repeats", "0")
+    # Expected version families are checked against the snapshot whichever layer runs.
+    memo = "p101-harbour-lidar/harbour-memo.md"
+    unknown_member = pack_file(
+        "family", expected_families=[{"members": [memo, "p101-harbour-lidar/memo-v2.md"]}]
+    )
+    assert "holds no document ['p101-harbour-lidar/memo-v2.md']" in run(
+        unknown_member, "--layer", "1"
+    )
     unknown_doc = pack_file(
         "doc", qa_cases__0__source_anchors=[{"doc_id": "doc_009", "pages": None}]
     )
@@ -1276,6 +1432,98 @@ def test_eval_cli_refuses_mismatched_inputs_before_outputs_or_model_calls(
     (corpus / "link.md").symlink_to(corpus / "p102-estuary-multibeam" / "estuary-proposal.md")
     assert "symlinks are not allowed" in run(EXAMPLE_PACK_PATH, *layer2)
     assert not out.exists() and not (corpus / "results").exists()
+
+
+VERSIONED_CORPUS = {
+    "AGENTS.md": "# Notes\n\nFolders: project\n\nThe p2 site note has no later version.\n",
+    "p1/alarm-report-v0.8.md": (
+        "# Alarm report v0.8\n\nDeliverable: installation report\nClient: Halverton Water\n"
+        "Channel: Email\n\nAmber 75%.\n"
+    ),
+    "p1/alarm-report-v1.0.md": (
+        "# Alarm report v1.0\n\nDeliverable: installation report\nClient: Halverton Water\n"
+        "Channel: Email\n\nAmber 60%.\n"
+    ),
+    "p2/site-note.md": "# Site note\n\nDeliverable: site note\nClient: Ostrand Grid\n\nNote.\n",
+    "p2/survey-memo-v1.md": (
+        "# Survey memo v1\n\nDeliverable: survey memo\nClient: Ostrand Grid\nChannel: Print\n\n"
+        "First.\n"
+    ),
+    "p2/survey-memo-v2.md": (
+        "# Survey memo v2\n\nDeliverable: survey memo\nClient: Ostrand Grid\n\nSecond.\n"
+    ),
+}
+
+
+def test_snapshot_diagnostics_score_version_families_and_facet_overlap(tmp_path: Path) -> None:
+    snapshot_path = compile_snapshot(tmp_path, VERSIONED_CORPUS)
+    alarm = ("p1/alarm-report-v0.8.md", "p1/alarm-report-v1.0.md")
+    memo = ("p2/survey-memo-v1.md", "p2/survey-memo-v2.md")
+    with TopicSnapshot.open(snapshot_path) as snapshot:
+        # The fake build orders each family by its version token.
+        assert {d.rel_path: d.version_status for d in snapshot.list_documents()} == {
+            "AGENTS.md": "sole",
+            alarm[0]: "superseded",
+            alarm[1]: "latest",
+            "p2/site-note.md": "sole",
+            memo[0]: "superseded",
+            memo[1]: "latest",
+        }
+        matched = eval_run.version_family_accuracy(
+            snapshot,
+            (
+                ExpectedFamily(members=alarm, latest=alarm[1]),
+                ExpectedFamily(members=memo, latest=memo[0]),
+            ),
+        )
+        split = eval_run.version_family_accuracy(
+            snapshot, (ExpectedFamily(members=("p2/site-note.md", memo[0])),)
+        )
+        facets = eval_run.facet_overlap(snapshot)
+    assert matched == {
+        "expected_count": 2,
+        "actual_count": 2,
+        "exact_families": 2,
+        "latest_checked": 2,
+        "latest_correct": 1,
+        "missed_families": [],
+        "false_positive_families": [],
+        "wrong_latest": [
+            {"members": list(memo), "expected_latest": memo[0], "induced_latest": memo[1]}
+        ],
+    }
+    # A family the build did not induce is missed, and every induced family it matches none
+    # of is a false positive.
+    assert (split["exact_families"], split["latest_checked"]) == (0, 0)
+    assert split["missed_families"] == [["p2/site-note.md", memo[0]]]
+    assert split["false_positive_families"] == [list(alarm), list(memo)]
+    # Five citable documents; the curator note is not one.
+    assert facets["coverage"] == [
+        {"facet": name, "document_count": n, "citable_document_count": 5, "coverage": n / 5}
+        for name, n in (("project", 5), ("channel", 3), ("client", 5))
+    ]
+    jaccard = {tuple(p["facets"]): p["jaccard"] for p in facets["pairs"]}
+    assert jaccard == {
+        ("project", "channel"): 0.6,
+        ("project", "client"): 1.0,
+        ("channel", "client"): 0.6,
+    }
+    assert facets["redundant_pairs"] == [{"facets": ["project", "client"], "jaccard": 1.0}]
+    report = "\n".join(
+        eval_run._snapshot_diagnostics_report({"version_families": matched, "facets": facets})
+    )
+    assert (
+        "Version families: 2/2 expected families induced exactly; 2 induced non-singleton"
+        " families; latest member correct in 1/2 matched families that name one." in report
+    )
+    assert f"- wrong latest in {list(memo)}: expected {memo[0]}, induced {memo[1]}" in report
+    assert "| channel | 3/5 | 60% |" in report
+    assert "- project / client: 1.00" in report
+    unexpected = "\n".join(
+        eval_run._snapshot_diagnostics_report({"version_families": split, "facets": facets})
+    )
+    assert f"- false positive: {list(alarm)}" in unexpected
+    assert f"- missed: {['p2/site-note.md', memo[0]]}" in unexpected
 
 
 def test_eval_outputs_are_private_files(tmp_path: Path) -> None:
@@ -1940,6 +2188,119 @@ def test_layer2_report_shows_no_claim_counts_for_an_arm_with_no_judged_row(
         assert f"| lookup | {arm} | 1/1 | 0/1 | 1/1 | n/a | n/a | n/a | n/a | n/a |" in report
 
 
+def qa_verdict(accuracy: int) -> QAJudgeScore:
+    return QAJudgeScore(
+        factual_accuracy_1_to_5=accuracy,
+        citation_quality_1_to_5=3,
+        completeness_1_to_5=5,
+        claims=[JudgedClaim(claim="The median is 330.9 mm.", status="supported")],
+        rationale="r",
+    )
+
+
+def test_layer2_repeats_each_case_and_fails_answers_that_state_a_forbidden_phrase(
+    tmp_path: Path, example_pack: EvalPack
+) -> None:
+    snapshot_path = compile_snapshot(tmp_path, BATHYMETRY_CORPUS)
+    case = example_pack.qa_cases[0].model_copy(
+        update={"kind": "current_value", "forbid_any": ("307.7",)}
+    )
+    right = response_body([message("The median is 330.9 mm.")])
+    api = ScriptedOpenAI()
+    api.script(
+        "/responses",
+        # Repeat 1: raw_files, then arkive_mcp, which also states the superseded value.
+        right,
+        structured_body(qa_verdict(4)),
+        response_body([message("The median is 330.9 mm; the draft said 307.7 mm.")]),
+        structured_body(qa_verdict(4)),
+        # Repeat 2: raw_files, then an arkive_mcp run that does not complete.
+        right,
+        structured_body(qa_verdict(2)),
+        response_body([message("330.9")], "incomplete"),
+    )
+
+    result = anyio.run(
+        run_layer2_qa,
+        api.gateway(),
+        snapshot_path,
+        tmp_path / "bathymetry-corpus",
+        CountingEmbedder(FakeGateway().embed_query),
+        [case],
+        2,
+    )
+
+    assert not api.scripts["/responses"]
+    rows = cast(list[dict[str, Any]], result["rows"])
+    assert [(r["repeat"], r["arm"]) for r in rows] == [
+        (1, "raw_files"),
+        (1, "arkive_mcp"),
+        (2, "raw_files"),
+        (2, "arkive_mcp"),
+    ]
+    assert [r["forbidden_hits"] for r in rows] == [[], ["307.7"], [], []]
+    # The forbidden phrase fails a run that covers every required group.
+    assert [r["phrase_coverage"] for r in rows] == [True, False, True, False]
+    assert rows[1]["groups_matched"] == 2
+    assert result["qa_repeats"] == 2
+    raw, mcp = cast(list[dict[str, Any]], result["case_summaries"])
+    assert raw == {
+        "case_id": case.case_id,
+        "kind": "current_value",
+        "arm": "raw_files",
+        "runs": 2,
+        "completed": 2,
+        "phrase_pass_rate": 1.0,
+        "judged": 2,
+        "judge_means": {
+            "factual_accuracy_1_to_5": 3.0,
+            "citation_quality_1_to_5": 3.0,
+            "completeness_1_to_5": 5.0,
+        },
+        "forbidden_hit_runs": 0,
+    }
+    assert (mcp["completed"], mcp["phrase_pass_rate"], mcp["judged"]) == (1, 0.0, 1)
+    assert (mcp["judge_means"]["factual_accuracy_1_to_5"], mcp["forbidden_hit_runs"]) == (4.0, 1)
+    # The judge learns that a superseded value stated as current is a contradiction.
+    judged = [
+        prompt_text(r)
+        for r in api.requests("/responses")
+        if r.get("text", {}).get("format", {}).get("name")
+    ]
+    assert len(judged) == 3
+    assert all(
+        f"QUESTION:\n{case.question}\n\nQUESTION KIND: current_value. The question asks for the"
+        " current value" in text
+        for text in judged
+    )
+    report = "\n".join(_layer2_report(result))
+    assert "Each case runs 2 times per arm." in report
+    assert "| raw_files | 2/2 | 2/2 | 2/2 | 3.00 | 3.00 | 5.00 | 0 | 0 |" in report
+    assert (
+        f"| {case.case_id} | current_value | raw_files | 2/2 | 100% | 2/2 | 3.00 | 3.00 | 5.00"
+        " | 0/2 |" in report
+    )
+    assert (
+        f"| {case.case_id} | current_value | arkive_mcp | 1/2 | 0% | 1/2 | 4.00 | 3.00 | 5.00"
+        " | 1/2 |" in report
+    )
+    assert f"- {case.case_id} / arkive_mcp / repeat 1: ['307.7']" in report
+    assert f"- {case.case_id} / arkive_mcp / repeat 2: incomplete" in report
+
+
+def test_the_qa_judge_hears_the_version_rule_of_version_kinds_only(example_pack: EvalPack) -> None:
+    case = example_pack.qa_cases[0]
+
+    def judge_text(kind: str) -> str:
+        return QAJudgement(case.model_copy(update={"kind": kind}), "evidence", "answer").text()
+
+    history = judge_text("version_history")
+    assert "QUESTION KIND: version_history. The question asks how a value changed" in history
+    assert "a draft value presented as final" in " ".join(history.split())
+    assert judge_text("lookup").startswith(f"QUESTION:\n{case.question}\n\nREFERENCE FACTS:\n")
+    assert "QUESTION KIND" not in judge_text("conflict")
+
+
 # The reference and the holdout share HOUSE; NOTE sits in the holdout only in a curator note.
 NOTE = "Every reef sonar report names the tide gauge used for each sounding line of the survey."
 DRAFTING_FILES = {
@@ -2132,6 +2493,20 @@ def test_layer3_runs_every_arm_in_every_round_and_judges_each_round_once(
         " and other candidates 1/1; named feedback documents with a packet lesson n/a." in report
     )
     assert "- round 1 / arkive_mcp: incomplete" in report
+    # Evidence delivery of the house unit: the exemplars prompt delivers it, the other
+    # contexts do not, and the first zero-shot draft holds it without having received it.
+    house = {arm: cell["evidence_delivery"] for arm, cell in first.items()}
+    assert house["arkive_mcp"] is None
+    assert [i.outcome for i in house["exemplars_in_context"].items if i.kind == "house_unit"] == [
+        "delivered_not_used"
+    ]
+    assert house["zero_shot"].house_units["not_delivered_but_used"] == 1
+    assert house["raw_files"].house_units["not_delivered_not_used"] == 1
+    assert "Evidence delivery over completed drafts" in report
+    assert any(
+        line.startswith("| exemplars_in_context |") and line.endswith("| 0 / 3 / 0 / 0 |")
+        for line in report.splitlines()
+    )
     assert (
         "- `no_borrowed_masking_claim`: required phrase found in no supplied input:"
         " ['no masking applied']" in report
@@ -2514,7 +2889,15 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
     assert result.exit_code == 0, result.output
     assert not api.scripts["/responses"]
     results = json.loads((out / "results.json").read_text())
+    # The model-free snapshot diagnostics run with every evaluation; the pack expects no
+    # version family.
+    diagnostics = results["snapshot_diagnostics"]
+    assert diagnostics["version_families"] is None
+    with TopicSnapshot.open(snapshot_path) as snapshot:
+        facet_names = [f.name for f in snapshot.facets]
+    assert facet_names and [c["facet"] for c in diagnostics["facets"]["coverage"]] == facet_names
     qa_rows = results["layer2"]["rows"]
+    assert results["layer2"]["qa_repeats"] == 1 and {r["repeat"] for r in qa_rows} == {1}
     assert [r["kind"] for r in qa_rows[::2]] == ["lookup", "lookup", "abstention"]
     raw_call, mcp_call = qa_rows[0]["run"]["tool_calls"], qa_rows[1]["run"]["tool_calls"]
     assert [(c["name"], c["arguments"], c["images"]) for c in raw_call + mcp_call] == [
@@ -2570,7 +2953,12 @@ def test_eval_runner_writes_tool_calls_claims_and_per_holdout_outputs_for_the_ex
         "Candidate_5.md",
         "blind_key.json",
     ]
+    zero_shot = rounds[0]["arms"]["zero_shot"]["evidence_delivery"]
+    assert zero_shot["house_units"] == dict.fromkeys(drafting.DELIVERY_OUTCOMES, 0)
     report = (out / "report.md").read_text()
+    assert "## Snapshot diagnostics" in report
+    assert "Version families: the pack lists no expected families." in report
+    assert "Each case runs once per arm." in report
     assert "## Layer 3: holdout `estuary-proposal`" in report
     assert "2 draft rounds" in report
     assert "| raw_files | list_corpus_files | 3 |" in report

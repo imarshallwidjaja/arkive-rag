@@ -20,12 +20,13 @@ common 4-grams scattered over several unrelated documents never add up to a held
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import random
 import tempfile
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -35,7 +36,14 @@ from pydantic import BaseModel
 
 from arkive_rag import passages as _passages
 from arkive_rag.compiler import RenderCache, compile_corpus, discover_corpus, read_source
-from arkive_rag.llm import BudgetExceededError, Effort, LanguageGateway, OpenAIGateway, Tool
+from arkive_rag.llm import (
+    BudgetExceededError,
+    Effort,
+    LanguageGateway,
+    OpenAIGateway,
+    Tool,
+    ToolResult,
+)
 from arkive_rag.models import DocumentInfo, ProviderError, fold_facet_label, fold_for_quote
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
 from evals.agents import (
@@ -449,6 +457,136 @@ def rubric_diagnostics(
     )
 
 
+# Evidence delivery.
+
+DeliveryOutcome = Literal[
+    "delivered_and_used", "delivered_not_used", "not_delivered_not_used", "not_delivered_but_used"
+]
+DELIVERY_OUTCOMES: tuple[DeliveryOutcome, ...] = (
+    "delivered_and_used",
+    "delivered_not_used",
+    "not_delivered_not_used",
+    "not_delivered_but_used",
+)
+
+
+def recording_tools(tools: Sequence[Tool], delivered: list[str]) -> list[Tool]:
+    """`tools` whose every returned text is appended, whole, to `delivered`: the tool output
+    an agent run actually received. A tool error keeps its own path to the model (the
+    gateway turns invalid input into text), so it is not recorded."""
+
+    def recording(tool: Tool) -> Tool:
+        async def invoke(args: dict[str, Any]) -> ToolResult:
+            result = tool.invoke(args)
+            if inspect.isawaitable(result):
+                result = await result
+            delivered.append(result if isinstance(result, str) else result.text)
+            return result
+
+        return Tool(tool.name, tool.description, tool.parameters, invoke)
+
+    return [recording(t) for t in tools]
+
+
+def _string_leaves(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_leaves(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_leaves(item)
+
+
+def delivered_blocks(texts: Iterable[str]) -> list[str]:
+    """The delivered texts as separate readable blocks: a JSON text (most tool results)
+    contributes each string value as its own block, so escaped newlines and quotes match as
+    written; other text is one block. Blocks stay separate so that evidence is matched only
+    where the agent saw it whole, never across a field or result boundary."""
+    blocks: list[str] = []
+    for text in texts:
+        try:
+            blocks.extend(_string_leaves(json.loads(text)))
+        except json.JSONDecodeError:
+            blocks.append(text)
+    return blocks
+
+
+@dataclass(frozen=True)
+class DeliveredItem:
+    """One piece of holdout evidence: a required group of a rubric check that only the holdout
+    holds (`kind` "rubric_group", labelled `<check_id>: [alternatives]`) or a house unit
+    (`kind` "house_unit", labelled by its first `UNIT_HEAD_CHARS` characters). `delivered`:
+    the agent's context held it; `used`: the draft holds it."""
+
+    kind: Literal["rubric_group", "house_unit"]
+    label: str
+    delivered: bool
+    used: bool
+
+    @property
+    def outcome(self) -> DeliveryOutcome:
+        if self.delivered:
+            return "delivered_and_used" if self.used else "delivered_not_used"
+        return "not_delivered_but_used" if self.used else "not_delivered_not_used"
+
+
+@dataclass(frozen=True)
+class EvidenceDelivery:
+    """Whether each holdout evidence item reached one completed draft run's context and its
+    draft: a draft that misses evidence its context held is a guidance or generation gap, one
+    that misses evidence its context never held is a delivery gap. `rubric_groups` and
+    `house_units` count the items per outcome."""
+
+    items: tuple[DeliveredItem, ...]
+    rubric_groups: dict[str, int]
+    house_units: dict[str, int]
+
+
+def evidence_delivery(
+    *,
+    context: Sequence[str],
+    draft: str,
+    rubric: Sequence[RubricDiagnostic],
+    sources: OverlapSources,
+) -> EvidenceDelivery:
+    """Deterministic delivery of one run. `context` is every block of text the agent received
+    (its instructions, prompt and each tool result's string values, `delivered_blocks`). The
+    rubric items are the required groups whose phrases occur only in the holdout (`found_in`
+    "holdout"), matched as rubric checks match within one block. A house unit is delivered or
+    used when the context's per-block shingles or the draft hold at least
+    `STANDING_RECURRENCE_CONTAINMENT` of its shingles."""
+    context_grams = frozenset().union(*map(_text_shingles, context))
+    draft_grams = _text_shingles(draft)
+    need = _passages.STANDING_RECURRENCE_CONTAINMENT
+    items = [
+        DeliveredItem(
+            "rubric_group",
+            f"{d.check_id}: {list(g.alternatives)}",
+            any(satisfies_groups(block, (g.alternatives,)) for block in context),
+            satisfies_groups(draft, (g.alternatives,)),
+        )
+        for d in rubric
+        for g in d.groups
+        if g.found_in == "holdout"
+    ]
+    items += [
+        DeliveredItem(
+            "house_unit",
+            unit.text[:UNIT_HEAD_CHARS],
+            _passages.containment(unit.grams, context_grams) >= need,
+            _passages.containment(unit.grams, draft_grams) >= need,
+        )
+        for unit in sources.house_units
+    ]
+
+    def counts(kind: str) -> dict[str, int]:
+        return {o: sum(i.kind == kind and i.outcome == o for i in items) for o in DELIVERY_OUTCOMES}
+
+    return EvidenceDelivery(tuple(items), counts("rubric_group"), counts("house_unit"))
+
+
 # Exemplars in context.
 
 # The rules of the exemplars-in-context arm: the control that drafts from the documents the pack
@@ -792,18 +930,30 @@ async def run_layer3_holdout(
             rounds = []
             for number in range(1, drafts + 1):
                 runs: dict[str, AgentRun] = {}
+                contexts: dict[str, list[str]] = {}
                 for arm, (tools, instructions, prompt) in arms.items():
+                    delivered = [instructions, prompt]
                     runs[arm] = await run_agent(
                         gateway,
                         operation=f"draft_{arm}",
                         instructions=instructions,
                         prompt=prompt,
-                        tools=tools,
+                        tools=recording_tools(tools, delivered),
                         max_turns=DRAFT_MAX_TURNS,
                         embedder=embedder,
                     )
+                    contexts[arm] = delivered_blocks(delivered)
                 rounds.append(
-                    await _finish_round(gateway, holdout, reference_markdown, sources, number, runs)
+                    await _finish_round(
+                        gateway,
+                        holdout,
+                        reference_markdown,
+                        sources,
+                        diagnostics,
+                        number,
+                        runs,
+                        contexts,
+                    )
                 )
     return {
         "holdout_id": holdout.holdout_id,
@@ -824,11 +974,14 @@ async def _finish_round(
     holdout: Holdout,
     reference_markdown: str,
     sources: OverlapSources,
+    diagnostics: Sequence[RubricDiagnostic],
     number: int,
     runs: dict[str, AgentRun],
+    contexts: Mapping[str, Sequence[str]],
 ) -> dict[str, object]:
     """Score one round's completed drafts and judge them in one blind call; the blind order
-    is seeded by the round number.
+    is seeded by the round number. `contexts` holds each arm's delivered blocks
+    (`delivered_blocks`), from which a completed draft's `evidence_delivery` is measured.
 
     `blind_comparison` is the judge's output only when it covers the round; otherwise it is
     None and `blind_comparison_missing` says why: no draft completed, the judge call failed
@@ -868,6 +1021,16 @@ async def _finish_round(
                 "run": run,
                 "rubric": score_rubric(run.answer, holdout.rubric) if arm in completed else None,
                 "overlap": sources.measure(run.answer) if arm in completed else None,
+                "evidence_delivery": (
+                    evidence_delivery(
+                        context=contexts[arm],
+                        draft=run.answer,
+                        rubric=diagnostics,
+                        sources=sources,
+                    )
+                    if arm in completed
+                    else None
+                ),
             }
             for arm, run in runs.items()
         },

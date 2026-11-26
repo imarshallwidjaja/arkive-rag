@@ -1,0 +1,368 @@
+{
+  "format": "arkive-opencode-scenarios/1",
+  "description": "OpenCode answers questions over three example corpora in evals/example_corpora with only the Arkive MCP tools: every scenario of scenarios.json, plus deliverable-type filtering, version history and table queries over structural-monitoring-consultancy. Facet names and deliverable types are induced per build, so no scenario names one.",
+  "topics": [
+    "coastal-survey-projects",
+    "creator-campaigns",
+    "structural-monitoring-consultancy"
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "topic-and-facet-discovery",
+      "description": "Discovers both topics and every facet of each without being told their names.",
+      "prompt": "List the Arkive topics. For each topic, name every facet I can filter by, exactly as the tools spell it, with its allowed values.",
+      "required_tools": [
+        "list_topics"
+      ],
+      "answer_groups": [
+        [
+          "coastal-survey-projects"
+        ],
+        [
+          "creator-campaigns"
+        ]
+      ],
+      "answer_names_facets": true
+    },
+    {
+      "scenario_id": "glossary-defined-term",
+      "description": "Looks up an acronym the corpus defines.",
+      "prompt": "In the coastal-survey-projects topic, what does MBES stand for? Use the glossary and cite the section.",
+      "required_tools": [
+        "lookup_glossary"
+      ],
+      "topics_queried": [
+        "coastal-survey-projects"
+      ],
+      "answer_groups": [
+        [
+          "multibeam echosounder",
+          "multibeam echo sounder",
+          "multi-beam echosounder"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "glossary-undefined-term",
+      "description": "Looks up an acronym the corpus uses but never defines, and says so instead of guessing.",
+      "prompt": "In the creator-campaigns topic, what does FQV mean? Use the glossary. If the documents never define it, say so plainly rather than guessing.",
+      "required_tools": [
+        "lookup_glossary"
+      ],
+      "topics_queried": [
+        "creator-campaigns"
+      ],
+      "answer_groups": [
+        [
+          "FQV"
+        ],
+        [
+          "not defined",
+          "never defined",
+          "does not define",
+          "doesn't define",
+          "do not define",
+          "don't define",
+          "no definition",
+          "isn't defined",
+          "is undefined",
+          "not spelled out",
+          "never spelled out",
+          "never expanded",
+          "not expanded",
+          "does not explain",
+          "doesn't explain"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "glossary-two-senses",
+      "description": "Looks up an acronym with two meanings and reports both.",
+      "prompt": "In the coastal-survey-projects topic, what does PCR mean? Use the glossary and give every meaning the documents use it for.",
+      "required_tools": [
+        "lookup_glossary"
+      ],
+      "topics_queried": [
+        "coastal-survey-projects"
+      ],
+      "answer_groups": [
+        [
+          "point cloud registration"
+        ],
+        [
+          "project change request"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "filtered-listing-discovered-facet",
+      "description": "Finds the facet and value for a creator through list_topics and filters by it.",
+      "prompt": "In the creator-campaigns topic, which campaigns did the creator Teodor Vasquez-Lund work on? Find the facet and value for him with list_topics, then filter list_documents with it.",
+      "required_tools": [
+        "list_topics",
+        "list_documents"
+      ],
+      "argument_expectations": [
+        {
+          "condition": "non_empty",
+          "tools": [
+            "list_documents",
+            "search",
+            "grep"
+          ],
+          "argument": "filters"
+        }
+      ],
+      "topics_queried": [
+        "creator-campaigns"
+      ],
+      "answer_groups": [
+        [
+          "Corriemoor"
+        ],
+        [
+          "Kettlecraft"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "invalid-filter-recovery",
+      "description": "Sends a filter value that does not exist, reads the tool error, and retries with a valid value.",
+      "prompt": "In the coastal-survey-projects topic: call list_topics and pick one facet of that topic. Call list_documents with that facet set to the value \"zz-no-such-value\". Read the error, then call list_documents again with a valid value of the same facet and list the doc_ids it returns.",
+      "required_tools": [
+        "list_topics"
+      ],
+      "argument_expectations": [
+        {
+          "condition": "invalid_filter_recovery",
+          "tools": [
+            "list_documents"
+          ],
+          "invalid_value": "zz-no-such-value"
+        }
+      ],
+      "topics_queried": [
+        "coastal-survey-projects"
+      ],
+      "answer_groups": [
+        [
+          "doc_"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "grep-exact-number",
+      "description": "Finds an exact count by its filename with grep and cites document and section.",
+      "prompt": "In the coastal-survey-projects topic, how many cleaned soundings does brenlow_soundings.csv hold? Find it with grep and cite the doc_id and section_id.",
+      "required_tools": [
+        "grep"
+      ],
+      "topics_queried": [
+        "coastal-survey-projects"
+      ],
+      "answer_groups": [
+        [
+          "1,284,330"
+        ],
+        [
+          "doc_b0d99a3c39"
+        ],
+        [
+          "doc_b0d99a3c39_sec_006"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "chart-value-view-page",
+      "description": "Reads a value printed only in a chart of a rendered PDF page through view_page, which returns the page image.",
+      "prompt": "In the coastal-survey-projects topic, the Q102 technical memorandum (doc_cc01ac49e1) has a bar chart of rock removed per bench. Look at page 1 with view_page and tell me the volume for Bench 3, citing the doc_id and page.",
+      "page_image": {
+        "topic": "coastal-survey-projects",
+        "doc_id": "doc_cc01ac49e1",
+        "page_number": 1
+      },
+      "topics_queried": [
+        "coastal-survey-projects"
+      ],
+      "answer_groups": [
+        [
+          "41,700"
+        ],
+        [
+          "doc_cc01ac49e1"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "draft-from-packet",
+      "description": "Drafts a campaign brief from the drafting packet, which only prepare_draft returns, reproducing one of its recurring passages and using only the project facts given.",
+      "prompt": "In the creator-campaigns topic, draft a short campaign brief for a new client, Pellow Bakery: spring 2027, budget GBP 9,000, channel email newsletter. Follow how the topic's prior campaign briefs are written, and use no project facts other than mine.",
+      "required_tools": [
+        "prepare_draft"
+      ],
+      "topics_queried": [
+        "creator-campaigns"
+      ],
+      "answer_groups": [
+        [
+          "Pellow"
+        ],
+        [
+          "9,000"
+        ],
+        [
+          "objective"
+        ],
+        [
+          "call to action",
+          "CTA"
+        ],
+        [
+          "measure",
+          "KPI"
+        ],
+        [
+          "mandator"
+        ]
+      ],
+      "answer_reproduces_recurring_passage_of": "creator-campaigns"
+    },
+    {
+      "scenario_id": "cross-topic-question",
+      "description": "Answers one question that needs a fact from each topic.",
+      "prompt": "Using both Arkive topics: what is the fixed fee in the Q101 Brenlow Estuary proposal, and what is the budget of the Glowmilk Spring 2026 campaign? Cite the doc_id and section_id of each.",
+      "topics_queried": [
+        "coastal-survey-projects",
+        "creator-campaigns"
+      ],
+      "answer_groups": [
+        [
+          "38,400"
+        ],
+        [
+          "18,500"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "type-filtered-list",
+      "description": "Discovers the deliverable types of a topic through list_topics and filters list_documents by one of them, without being told the type names.",
+      "prompt": "In the structural-monitoring-consultancy topic, call list_topics to find the deliverable types the topic uses, exactly as the tools spell them. Pick the type that holds installation reports, call list_documents with that deliverable_type, and list the doc_id and title of every document it returns.",
+      "required_tools": [
+        "list_topics",
+        "list_documents"
+      ],
+      "argument_expectations": [
+        {
+          "condition": "non_empty",
+          "tools": [
+            "list_documents"
+          ],
+          "argument": "deliverable_type"
+        }
+      ],
+      "topics_queried": [
+        "structural-monitoring-consultancy"
+      ],
+      "answer_groups": [
+        [
+          "doc_"
+        ],
+        [
+          "installation"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "version-history-discovery",
+      "description": "Answers with the issued alarm levels and how they changed from earlier drafts, which needs a search over every version, not only the current ones.",
+      "prompt": "In the structural-monitoring-consultancy topic, what amber and red alarm levels does the issued installation report for the Halverton Greyscar spillway set, and how did they change from the earlier drafts of that report? Give the percentages and microstrain values of each version and cite the doc_id of each version.",
+      "argument_expectations": [
+        {
+          "condition": "equals",
+          "tools": [
+            "search",
+            "grep",
+            "list_documents",
+            "query_tables"
+          ],
+          "argument": "versions",
+          "value": "all",
+          "topic": "structural-monitoring-consultancy"
+        }
+      ],
+      "topics_queried": [
+        "structural-monitoring-consultancy"
+      ],
+      "answer_groups": [
+        [
+          "60%",
+          "60 %"
+        ],
+        [
+          "85%",
+          "85 %"
+        ],
+        [
+          "120"
+        ],
+        [
+          "170"
+        ],
+        [
+          "75%",
+          "75 %",
+          "150"
+        ],
+        [
+          "100%",
+          "100 %",
+          "200"
+        ],
+        [
+          "v0.8",
+          "v0.9",
+          "draft"
+        ]
+      ]
+    },
+    {
+      "scenario_id": "table-rollup",
+      "description": "Reads table rows through query_tables: the Prisma FI-4 interrogator units and the Lumenstrand LS-8 array figures.",
+      "prompt": "In the structural-monitoring-consultancy topic, use query_tables to find the table rows that list the Prisma FI-4 interrogator units in the fleet and the key figures of the Lumenstrand LS-8 fibre Bragg grating array. Give each FI-4 serial with its calibration due month, and the LS-8 strain sensitivity, citing the doc_id of each table.",
+      "required_tools": [
+        "query_tables"
+      ],
+      "argument_expectations": [
+        {
+          "condition": "non_empty",
+          "tools": [
+            "query_tables"
+          ],
+          "argument": "topic",
+          "topic": "structural-monitoring-consultancy"
+        }
+      ],
+      "topics_queried": [
+        "structural-monitoring-consultancy"
+      ],
+      "answer_groups": [
+        [
+          "PF4-1876"
+        ],
+        [
+          "August"
+        ],
+        [
+          "PF4-2043"
+        ],
+        [
+          "March"
+        ],
+        [
+          "1.21"
+        ]
+      ]
+    }
+  ]
+}

@@ -49,15 +49,49 @@ class _ScenarioModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+def _on_topic(topic: str | None) -> str:
+    return f" on {topic}" if topic else ""
+
+
 class NonEmptyArgument(_ScenarioModel):
-    """Some completed call to one of `tools` passed a non-empty `argument`."""
+    """Some completed call to one of `tools` passed a non-empty `argument`, and, when `topic`
+    is set, targeted that topic."""
 
     condition: Literal["non_empty"]
     tools: Annotated[tuple[ArkiveTool, ...], Field(min_length=1)]
     argument: NonBlank
+    topic: NonBlank | None = None
 
     def label(self) -> str:
-        return f"arguments: {'/'.join(self.tools)}.{self.argument} non_empty"
+        return f"arguments: {'/'.join(self.tools)}.{self.argument} non_empty{_on_topic(self.topic)}"
+
+    def matches(self, call: ToolCall) -> bool:
+        if self.topic is not None and call.arguments.get("topic") != self.topic:
+            return False
+        return _non_empty(call.arguments.get(self.argument))
+
+
+class EqualArgument(_ScenarioModel):
+    """Some completed call to one of `tools` passed `argument` equal to `value`, of the same
+    JSON type (`true` does not equal `1`), and, when `topic` is set, targeted that topic."""
+
+    condition: Literal["equals"]
+    tools: Annotated[tuple[ArkiveTool, ...], Field(min_length=1)]
+    argument: NonBlank
+    value: str | int | bool
+    topic: NonBlank | None = None
+
+    def label(self) -> str:
+        return (
+            f"arguments: {'/'.join(self.tools)}.{self.argument} == {self.value!r}"
+            f"{_on_topic(self.topic)}"
+        )
+
+    def matches(self, call: ToolCall) -> bool:
+        if self.topic is not None and call.arguments.get("topic") != self.topic:
+            return False
+        given = call.arguments.get(self.argument)
+        return type(given) is type(self.value) and given == self.value
 
 
 class InvalidFilterRecovery(_ScenarioModel):
@@ -74,7 +108,7 @@ class InvalidFilterRecovery(_ScenarioModel):
 
 
 ArgumentExpectation = Annotated[
-    NonEmptyArgument | InvalidFilterRecovery, Field(discriminator="condition")
+    NonEmptyArgument | EqualArgument | InvalidFilterRecovery, Field(discriminator="condition")
 ]
 
 
@@ -126,6 +160,11 @@ class ScenarioFile(_ScenarioModel):
                 named.add(s.page_image.topic)
             if s.answer_reproduces_recurring_passage_of:
                 named.add(s.answer_reproduces_recurring_passage_of)
+            named.update(
+                e.topic
+                for e in s.argument_expectations
+                if isinstance(e, NonEmptyArgument | EqualArgument) and e.topic
+            )
             unknown = sorted(named - set(self.topics))
             if unknown:
                 raise ValueError(f"scenario {s.scenario_id!r} queries undeclared topics {unknown}")
@@ -465,9 +504,7 @@ def _argument_outcome(expectation: ArgumentExpectation, calls: Sequence[ToolCall
     if isinstance(expectation, InvalidFilterRecovery):
         return _recovery_outcome(expectation, calls)
     n = sum(
-        c.arkive_tool in expectation.tools
-        and c.status == "completed"
-        and _non_empty(c.arguments.get(expectation.argument))
+        c.arkive_tool in expectation.tools and c.status == "completed" and expectation.matches(c)
         for c in calls
     )
     return CheckOutcome(expectation.label(), n > 0, f"{n} completed call(s) with it")

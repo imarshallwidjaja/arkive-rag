@@ -98,7 +98,18 @@ class RetrievalCase(_PackModel):
         return self
 
 
-QAKind = Literal["lookup", "multi_document", "aggregation", "abstention", "conflict", "vocabulary"]
+QAKind = Literal[
+    "lookup",
+    "multi_document",
+    "aggregation",
+    "abstention",
+    "conflict",
+    "vocabulary",
+    # The value the latest issued version states, where earlier drafts state another.
+    "current_value",
+    # The final value together with the draft or review history that preceded it.
+    "version_history",
+]
 
 
 # A JSON integer: no boolean, numeric string or float such as 3.0.
@@ -122,9 +133,14 @@ class SourceAnchor(_PackModel):
 
 
 class QACase(_PackModel):
-    """Layer 2: `required_groups` scores phrase coverage; the judge sees `ground_truth_facts`,
-    the snapshot's text of the `source_anchors`, and grades citations against the anchors.
-    Every `kind` but `abstention` (the corpus does not hold the answer) needs an anchor."""
+    """Layer 2: `required_groups` and `forbid_any` score phrase coverage (`passes_qa_phrases`);
+    the judge sees `ground_truth_facts`, the snapshot's text of the `source_anchors`, and
+    grades citations against the anchors. Every `kind` but `abstention` (the corpus does not
+    hold the answer) needs an anchor.
+
+    `forbid_any` lists phrases a correct answer never states, such as a superseded draft
+    value for a `current_value` case. As for a rubric check, a value a correct answer may
+    mention in contrast belongs in a required group, not here."""
 
     case_id: NonBlank
     kind: QAKind
@@ -132,6 +148,7 @@ class QACase(_PackModel):
     ground_truth_facts: Annotated[tuple[NonBlank, ...], Field(min_length=1)]
     required_groups: Annotated[Groups, Field(min_length=1)]
     source_anchors: tuple[SourceAnchor, ...] = ()
+    forbid_any: tuple[NonBlank, ...] = ()
 
     @model_validator(mode="after")
     def _anchored_unless_abstention(self) -> Self:
@@ -139,8 +156,19 @@ class QACase(_PackModel):
             raise ValueError(
                 f"qa case {self.case_id!r} of kind {self.kind!r} has no source_anchors"
             )
-        _require_matchable(f"qa case {self.case_id!r}", _flat(self.required_groups))
+        _require_matchable(
+            f"qa case {self.case_id!r}", [*_flat(self.required_groups), *self.forbid_any]
+        )
         return self
+
+
+def passes_qa_phrases(answer: str, case: QACase) -> tuple[bool, tuple[str, ...]]:
+    """Whether `answer` covers the case's phrases, and the `forbid_any` phrases it states.
+
+    It passes when it satisfies every required group and states no forbidden phrase."""
+    text = normalize_for_match(answer)
+    hits = tuple(p for p in case.forbid_any if normalize_for_match(p) in text)
+    return satisfies_groups(answer, case.required_groups) and not hits, hits
 
 
 class RubricCheck(_PackModel):
@@ -229,6 +257,23 @@ class Holdout(_PackModel):
         return self
 
 
+class ExpectedFamily(_PackModel):
+    """One version family the snapshot should induce: its `members` as plain corpus-relative
+    paths, and optionally the member that should be its latest version."""
+
+    members: Annotated[tuple[NonBlank, ...], Field(min_length=2)]
+    latest: NonBlank | None = None
+
+    @model_validator(mode="after")
+    def _members_are_plain_and_hold_latest(self) -> Self:
+        for rel in self.members:
+            _check_plain_relative_path("expected family member", rel)
+        _require_unique("expected family member", list(self.members))
+        if self.latest is not None and self.latest not in self.members:
+            raise ValueError(f"expected family latest {self.latest!r} is not one of its members")
+        return self
+
+
 class EvalPack(_PackModel):
     format: Literal["arkive-eval-pack/3"]
     name: NonBlank
@@ -238,6 +283,9 @@ class EvalPack(_PackModel):
     retrieval_cases: tuple[RetrievalCase, ...] = ()
     qa_cases: tuple[QACase, ...] = ()
     holdouts: tuple[Holdout, ...] = ()
+    # The non-singleton version families the snapshot should induce; the runner compares
+    # them with the snapshot's families before any layer runs.
+    expected_families: tuple[ExpectedFamily, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -256,6 +304,10 @@ class EvalPack(_PackModel):
         _require_unique("retrieval case_id", [c.case_id for c in self.retrieval_cases])
         _require_unique("qa case_id", [c.case_id for c in self.qa_cases])
         _require_unique("holdout_id", [h.holdout_id for h in self.holdouts])
+        _require_unique(
+            "expected family member across families",
+            [m for f in self.expected_families for m in f.members],
+        )
         return self
 
     @classmethod

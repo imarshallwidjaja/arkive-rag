@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -31,6 +32,7 @@ import shutil
 import stat
 import statistics
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
@@ -47,18 +49,26 @@ from arkive_rag.llm import (
     UsageMeter,
     load_dotenv_if_present,
 )
-from arkive_rag.models import ArkiveError, corpus_fingerprint
+from arkive_rag.models import ArkiveError, DocumentInfo, corpus_fingerprint
 from arkive_rag.passages import STANDING_RECURRENCE_CONTAINMENT
 from arkive_rag.snapshot import SEARCH_FAMILY_CAP, TopicSnapshot
 from evals.ablation import ARMS, RankSummary, run_layer1
-from evals.agents import AgentRun, CountingEmbedder, qa_evidence, run_layer2_qa
+from evals.agents import (
+    JUDGE_FIELDS,
+    AgentRun,
+    CountingEmbedder,
+    qa_evidence,
+    run_layer2_qa,
+)
 from evals.drafting import (
+    DELIVERY_OUTCOMES,
+    EvidenceDelivery,
     ExemplarSelection,
     check_reference_held_out,
     run_layer3_holdout,
     select_holdout_sources,
 )
-from evals.schema import EvalPack, Holdout
+from evals.schema import EvalPack, ExpectedFamily, Holdout
 
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
 
@@ -213,13 +223,16 @@ def _qa_scores(rows: list[dict[str, Any]]) -> str:
 
 def _layer2_report(result: dict[str, Any]) -> list[str]:
     rows: list[dict[str, Any]] = result["rows"]
+    repeats: int = result["qa_repeats"]
     arms = list(dict.fromkeys(r["arm"] for r in rows))
+    runs_per_case = "once" if repeats == 1 else f"{repeats} times"
     lines = [
         "## Layer 2: grounded QA",
         "",
         f"Raw-file extraction ran once before timing: {result['raw_prep_seconds']:.1f} s.",
-        "Each case runs once per arm. Only completed runs are judged; phrase coverage counts"
-        " other runs as misses. A completed run whose judge call failed keeps its phrase"
+        f"Each case runs {runs_per_case} per arm. Only completed runs are judged; phrase"
+        " coverage counts other runs as misses, and a run that states a forbidden phrase of its"
+        " case fails it. A completed run whose judge call failed keeps its phrase"
         " coverage and is not judged. Judge averages and claim counts cover judged runs only."
         " The judge lists the answer's material claims as supported, contradicted (by the"
         " reference facts, or by the anchored evidence where the facts are silent) or"
@@ -252,20 +265,198 @@ def _layer2_report(result: dict[str, Any]) -> list[str]:
         for arm in arms:
             kind_rows = [r for r in rows if r["kind"] == kind and r["arm"] == arm]
             lines.append(f"| {kind} | {arm} | {_qa_scores(kind_rows)} |")
+    if repeats > 1:
+        lines += [
+            "",
+            f"By case over its {repeats} repeats (phrase pass rate over all runs, judge means"
+            " over judged runs):",
+            "",
+            "| Case | Kind | Arm | Completed | Phrase pass rate | Judged | Accuracy | Citations |"
+            " Completeness | Runs with a forbidden phrase |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for summary in result["case_summaries"]:
+            judge_means = summary["judge_means"]
+            means = " | ".join(
+                "n/a" if judge_means[f] is None else f"{judge_means[f]:.2f}" for f in JUDGE_FIELDS
+            )
+            runs = summary["runs"]
+            lines.append(
+                f"| {summary['case_id']} | {summary['kind']} | {summary['arm']}"
+                f" | {summary['completed']}/{runs} | {_pct(summary['phrase_pass_rate'])}"
+                f" | {summary['judged']}/{runs} | {means}"
+                f" | {summary['forbidden_hit_runs']}/{runs} |"
+            )
     lines += [
         "",
         *_tool_call_report({a: [r["run"] for r in rows if r["arm"] == a] for a in arms}),
     ]
+
+    def run_name(r: dict[str, Any]) -> str:
+        repeat = f" / repeat {r['repeat']}" if repeats > 1 else ""
+        return f"{r['case_id']} / {r['arm']}{repeat}"
+
+    forbidden = [r for r in rows if r["forbidden_hits"]]
+    if forbidden:
+        lines += ["Answers that state a forbidden phrase:", ""]
+        lines += [f"- {run_name(r)}: {r['forbidden_hits']}" for r in forbidden]
+        lines.append("")
     failed = [r for r in rows if r["status"] != "completed"]
     if failed:
         lines += ["Runs not completed:", ""]
-        lines += [f"- {r['case_id']} / {r['arm']}: {r['status']}" for r in failed]
+        lines += [f"- {run_name(r)}: {r['status']}" for r in failed]
         lines.append("")
     unjudged = [r for r in rows if r["status"] == "completed" and r["judge"] is None]
     if unjudged:
         lines += ["Completed runs not judged:", ""]
-        lines += [f"- {r['case_id']} / {r['arm']}: {r['judge_missing']}" for r in unjudged]
+        lines += [f"- {run_name(r)}: {r['judge_missing']}" for r in unjudged]
         lines.append("")
+    return lines
+
+
+# A facet pair whose document sets overlap at least this much (Jaccard) is reported as a
+# candidate redundant pair.
+REDUNDANT_FACET_JACCARD = 0.85
+
+
+def version_family_accuracy(
+    snapshot: TopicSnapshot, expected: Sequence[ExpectedFamily]
+) -> dict[str, Any]:
+    """The snapshot's non-singleton version families, by member paths, against `expected`.
+
+    An expected family is matched exactly when one induced family has exactly its members;
+    an unmatched one is missed, and an induced family that matches none is a false positive.
+    `latest_correct` counts the exactly matched families that name a `latest` whose induced
+    latest member (version status `latest`) is that path, out of `latest_checked`;
+    `wrong_latest` lists the others."""
+    by_family: dict[str, list[DocumentInfo]] = {}
+    for document in snapshot.list_documents():
+        by_family.setdefault(document.family_id, []).append(document)
+    induced = {
+        frozenset(d.rel_path for d in members): next(
+            (d.rel_path for d in members if d.version_status == "latest"), None
+        )
+        for members in by_family.values()
+        if len(members) > 1
+    }
+    matched: set[frozenset[str]] = set()
+    missed: list[list[str]] = []
+    wrong_latest: list[dict[str, Any]] = []
+    latest_checked = 0
+    for family in expected:
+        members = frozenset(family.members)
+        if members not in induced:
+            missed.append(sorted(members))
+            continue
+        matched.add(members)
+        if family.latest is not None:
+            latest_checked += 1
+            if induced[members] != family.latest:
+                wrong_latest.append(
+                    {
+                        "members": sorted(members),
+                        "expected_latest": family.latest,
+                        "induced_latest": induced[members],
+                    }
+                )
+    return {
+        "expected_count": len(expected),
+        "actual_count": len(induced),
+        "exact_families": len(matched),
+        "latest_checked": latest_checked,
+        "latest_correct": latest_checked - len(wrong_latest),
+        "missed_families": missed,
+        "false_positive_families": [sorted(m) for m in induced if m not in matched],
+        "wrong_latest": wrong_latest,
+    }
+
+
+def facet_overlap(snapshot: TopicSnapshot) -> dict[str, Any]:
+    """Each facet's coverage of the citable documents (curator notes are not citable), and
+    the Jaccard overlap of the document sets of every pair of facets. A pair at or over
+    `REDUNDANT_FACET_JACCARD` is a candidate redundant pair: the facets sort the same
+    documents, whether or not their values mean the same."""
+    citable = [d for d in snapshot.list_documents() if not d.is_curator_note]
+    holders = {f.name: {d.doc_id for d in citable if f.name in d.facets} for f in snapshot.facets}
+    coverage = [
+        {
+            "facet": name,
+            "document_count": len(docs),
+            "citable_document_count": len(citable),
+            "coverage": len(docs) / len(citable) if citable else None,
+        }
+        for name, docs in holders.items()
+    ]
+    pairs: list[dict[str, Any]] = []
+    redundant: list[dict[str, Any]] = []
+    for a, b in itertools.combinations(holders, 2):
+        union = holders[a] | holders[b]
+        jaccard = len(holders[a] & holders[b]) / len(union) if union else None
+        pairs.append({"facets": [a, b], "jaccard": jaccard})
+        if jaccard is not None and jaccard >= REDUNDANT_FACET_JACCARD:
+            redundant.append(pairs[-1])
+    return {
+        "coverage": coverage,
+        "pairs": pairs,
+        "redundant_pair_threshold": REDUNDANT_FACET_JACCARD,
+        "redundant_pairs": redundant,
+    }
+
+
+def snapshot_diagnostics(snapshot: TopicSnapshot, pack: EvalPack) -> dict[str, Any]:
+    """Model-free checks of the snapshot's structure: version families against the pack's
+    `expected_families` (None when it lists none) and facet coverage and overlap."""
+    return {
+        "version_families": (
+            version_family_accuracy(snapshot, pack.expected_families)
+            if pack.expected_families
+            else None
+        ),
+        "facets": facet_overlap(snapshot),
+    }
+
+
+def _snapshot_diagnostics_report(diagnostics: dict[str, Any]) -> list[str]:
+    lines = ["## Snapshot diagnostics", "", "Read from the snapshot without any model call.", ""]
+    families = diagnostics["version_families"]
+    if families is None:
+        lines += ["Version families: the pack lists no expected families.", ""]
+    else:
+        lines += [
+            f"Version families: {families['exact_families']}/{families['expected_count']}"
+            f" expected families induced exactly; {families['actual_count']} induced"
+            " non-singleton families; latest member correct in"
+            f" {families['latest_correct']}/{families['latest_checked']} matched families that"
+            " name one.",
+            "",
+        ]
+        problems = [f"- missed: {m}" for m in families["missed_families"]]
+        problems += [f"- false positive: {m}" for m in families["false_positive_families"]]
+        problems += [
+            f"- wrong latest in {w['members']}: expected {w['expected_latest']},"
+            f" induced {w['induced_latest']}"
+            for w in families["wrong_latest"]
+        ]
+        lines += [*problems, ""] if problems else []
+    facets = diagnostics["facets"]
+    lines += ["| Facet | Documents | Coverage of citable documents |", "| --- | --- | --- |"]
+    for c in facets["coverage"]:
+        share = "n/a" if c["coverage"] is None else _pct(c["coverage"])
+        lines.append(
+            f"| {c['facet']} | {c['document_count']}/{c['citable_document_count']} | {share} |"
+        )
+    lines.append("")
+    redundant = facets["redundant_pairs"]
+    threshold = facets["redundant_pair_threshold"]
+    if redundant:
+        lines += [
+            f"Candidate redundant facet pairs (document-set Jaccard >= {threshold:g}):",
+            "",
+            *(f"- {p['facets'][0]} / {p['facets'][1]}: {p['jaccard']:.2f}" for p in redundant),
+            "",
+        ]
+    else:
+        lines += [f"No facet pair has a document-set Jaccard >= {threshold:g}.", ""]
     return lines
 
 
@@ -391,6 +582,7 @@ def _layer3_report(result: dict[str, Any]) -> list[str]:
             lines.append("")
     else:
         lines += ["The holdout has no rubric checks.", ""]
+    lines += _evidence_delivery_report(rounds, arms)
     lines += _tool_call_report({arm: [r["arms"][arm]["run"] for r in rounds] for arm in arms})
     judged: dict[str, dict[str, list[float]]] = {a: {f: [] for _, f in JUDGE_SCORES} for a in arms}
     judged_rounds = dict.fromkeys(arms, 0)
@@ -432,6 +624,35 @@ def _layer3_report(result: dict[str, Any]) -> list[str]:
     return [*lines, f"Blind drafts: `{drafts}`", ""]
 
 
+def _evidence_delivery_report(rounds: list[dict[str, Any]], arms: list[str]) -> list[str]:
+    """Per arm, summed over its completed drafts: how many holdout-only rubric groups and
+    house units reached the agent's context (delivered) and the draft (used)."""
+    lines = [
+        "Evidence delivery over completed drafts: holdout-only rubric groups and house units,"
+        " delivered when the text the agent received held them and used when the draft does."
+        " Delivered but not used is a guidance or generation gap; not delivered is a delivery"
+        " gap. Each cell is delivered and used / delivered, not used / not delivered, not used"
+        " / not delivered but used.",
+        "",
+        "| Arm | Rubric groups | House units |",
+        "| --- | --- | --- |",
+    ]
+    for arm in arms:
+        measured = [
+            r["arms"][arm]["evidence_delivery"]
+            for r in rounds
+            if r["arms"][arm]["evidence_delivery"] is not None
+        ]
+
+        def cell(kind: str, measured: list[EvidenceDelivery] = measured) -> str:
+            return " / ".join(
+                str(sum(getattr(m, kind)[o] for m in measured)) for o in DELIVERY_OUTCOMES
+            )
+
+        lines.append(f"| {arm} | {cell('rubric_groups')} | {cell('house_units')} |")
+    return [*lines, ""]
+
+
 @app.command()
 def main(
     pack: Annotated[Path, typer.Option(help="Eval pack JSON (*.eval.json)")],
@@ -447,6 +668,10 @@ def main(
     drafts: Annotated[
         int | None,
         typer.Option(min=1, help="Draft rounds per holdout in layer 3; default: 1"),
+    ] = None,
+    qa_repeats: Annotated[
+        int | None,
+        typer.Option(min=1, help="Runs of each Q&A case per arm in layer 2; default: 1"),
     ] = None,
     cache: Annotated[Path | None, typer.Option(help="Build cache reused by the holdout")] = None,
     max_cost: Annotated[
@@ -470,14 +695,18 @@ def main(
     layers, holdouts = _check_inputs(eval_pack, layer, holdout, pack, snapshot, corpus, out, cache)
     if drafts is not None and "3" not in layers:
         raise typer.BadParameter("--drafts sets layer 3 draft rounds; layer 3 is not run")
+    if qa_repeats is not None and "2" not in layers:
+        raise typer.BadParameter("--qa-repeats sets layer 2 runs per case; layer 2 is not run")
     load_dotenv_if_present(Path.cwd() / ".env")
     # One meter: the spend limit and the usage report cover every model call of the run.
     meter = UsageMeter(max_cost)
     with TopicSnapshot.open(snapshot) as snap:
         embedding_model, embedding_dimensions = snap.embedding_model, snap.embedding_dimensions
-    results: dict[str, Any] = {}
+        diagnostics = snapshot_diagnostics(snap, eval_pack)
+    results: dict[str, Any] = {"snapshot_diagnostics": diagnostics}
     report = ["# Arkive evaluation report", "", f"Pack: `{eval_pack.name}`", ""]
     report += [f"Snapshot: `{snapshot}`", ""]
+    report += _snapshot_diagnostics_report(diagnostics)
     build_cache: BuildCache | None = None
     try:
         # The gateways check the credential, tracing and prices, and the cache is opened,
@@ -501,7 +730,13 @@ def main(
         if "2" in layers:
             assert corpus is not None
             results["layer2"] = anyio.run(
-                run_layer2_qa, gateway, snapshot, corpus, embed, eval_pack.qa_cases
+                run_layer2_qa,
+                gateway,
+                snapshot,
+                corpus,
+                embed,
+                eval_pack.qa_cases,
+                qa_repeats or 1,
             )
             report += _layer2_report(results["layer2"])
         if "3" in layers:
@@ -709,6 +944,14 @@ def _check_inputs(
                     raise typer.BadParameter(f"qa case {qa_case.case_id!r}: {exc}") from exc
                 except ValueError as exc:
                     raise typer.BadParameter(str(exc)) from exc
+            paths = {d.rel_path for d in snap.list_documents()}
+            for family in pack.expected_families:
+                unknown = [m for m in family.members if m not in paths]
+                if unknown:
+                    raise typer.BadParameter(
+                        f"expected family {list(family.members)}: --snapshot {snapshot} holds no"
+                        f" document {unknown}"
+                    )
             references = {h.holdout_id: snap.document(h.reference_doc_id) for h in holdouts}
             section_counts = {
                 d.rel_path: len(snap.full_outline(d.doc_id))
