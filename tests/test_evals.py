@@ -20,10 +20,12 @@ import numpy as np
 import pytest
 from mcp import Client
 from numpy.typing import NDArray
+from openpyxl import Workbook
 from pydantic import BaseModel, ValidationError
 from typer.testing import CliRunner
 
 from arkive_rag import compiler
+from arkive_rag.compiler import compile_corpus
 from arkive_rag.llm import BudgetExceededError, Tool, ToolReply, ToolResult, UsageMeter
 from arkive_rag.models import (
     DocumentInfo,
@@ -36,7 +38,7 @@ from arkive_rag.models import (
 )
 from arkive_rag.passages import shingles
 from arkive_rag.server import INSTRUCTIONS, TopicCatalog, create_mcp_server, server_instructions
-from arkive_rag.snapshot import DRAFTING_GUIDANCE, TopicSnapshot
+from arkive_rag.snapshot import DRAFTING_GUIDANCE, TopicSnapshot, write_snapshot
 from evals import agents as eval_agents
 from evals import drafting
 from evals import run as eval_run
@@ -1342,6 +1344,37 @@ def invoke(tools: list[Tool], name: str, **args: Any) -> ToolResult:
     return anyio.run(call)
 
 
+def test_raw_text_of_a_workbook_and_a_page_is_the_same_from_files_or_a_snapshot(
+    tmp_path: Path,
+) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    book = Workbook()
+    sheet = book.active
+    assert sheet is not None
+    sheet.append(["Reading", "Notes"])
+    for n in range(1, 1501):
+        sheet.append([f"R{n}", "logged at the quay after the evening tide"])
+    book.save(corpus_dir / "log.xlsx")
+    rows = "".join(f"<tr><td>G{n}</td><td>{n}</td></tr>" for n in range(1, 4001))
+    (corpus_dir / "gauges.html").write_text(
+        f"<h1>Gauges</h1><table><tr><th>Gauge</th><th>Level</th></tr>{rows}</table>",
+        encoding="utf-8",
+    )
+    output = tmp_path / "t.arkive.db"
+    write_snapshot(compile_corpus(corpus_dir, FakeGateway(), topic="t", title="T"), output)
+    files = {p.name: p.read_bytes() for p in corpus_dir.iterdir()}
+    digests = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+
+    extracted = RawCorpus.extract(corpus_dir).files
+    with TopicSnapshot.open(output) as snapshot:
+        assert all(len(snapshot.full_outline(d.doc_id)) > 1 for d in snapshot.list_documents())
+        stored = RawCorpus.from_snapshot(files, snapshot, digests=digests).files
+
+    assert stored == extracted
+    assert extracted["log.xlsx"][0].count("| Reading | Notes |") == 1
+
+
 def test_raw_corpus_tools_read_text_layers_and_page_images(tmp_path: Path) -> None:
     (tmp_path / "p1").mkdir()
     (tmp_path / "AGENTS.md").write_text("# Notes\nStill closing out.", encoding="utf-8")
@@ -2148,7 +2181,7 @@ def test_the_raw_files_arm_reads_included_files_from_stored_pages_and_refuses_he
     def never(*args: object) -> None:
         raise AssertionError("the raw-file arm rendered a file again")
 
-    monkeypatch.setattr(eval_agents, "convert_office_to_pdf", never)
+    monkeypatch.setattr(eval_agents, "office_to_pdf", never)
     monkeypatch.setattr(eval_agents, "render_pdf", never)
     with TopicSnapshot.open(output) as built:
         tools = holdout_raw_corpus(task, reference, included, built).tools

@@ -14,11 +14,16 @@ from arkive_rag.passages import (
     StandingUnit,
     TextDocument,
     TextSection,
+    abridge_tables,
+    annotation_markdown,
     containment,
     recurring_units,
+    render_table,
     shingles,
+    split_table_cells,
     standing_units,
-    without_visual_transcripts,
+    tables,
+    without_asides,
 )
 
 # One section covering every block the unit rules tell apart: a paragraph, Markdown and glyph
@@ -120,7 +125,7 @@ def test_text_units_shingles_containments_and_transcript_removal_are_pinned() ->
         1.0,
         8 / 9,
     ]
-    assert without_visual_transcripts(PIN_MARKDOWN) == (
+    assert without_asides(PIN_MARKDOWN) == (
         PIN_MARKDOWN.replace(
             "> **[Visual \u2014 Page 1: Chart]**\n"
             "> The chart compares the inner and outer approaches.\n",
@@ -144,8 +149,11 @@ MOVED_NAMES = (
     "fold_unit",
     "WORD",
     "LIST_MARKER",
-    "without_visual_transcripts",
+    "without_asides",
     "VISUAL_TRANSCRIPT_PREFIX",
+    "ANNOTATION_PREFIX",
+    "split_table_cells",
+    "tables",
     "STANDING_MIN_WORDS",
     "STANDING_MIN_TABLE_COLUMNS",
     "STANDING_SHINGLE_WORDS",
@@ -172,9 +180,83 @@ def test_visual_transcripts_are_block_quotes_whose_first_line_opens_with_the_pre
     )
     markdown = f"{ordinary}\n\n{transcript}\n\nAfter."
 
-    assert without_visual_transcripts(markdown) == f"{ordinary}\n\n\nAfter."
+    assert without_asides(markdown) == f"{ordinary}\n\n\nAfter."
     # `standing_units` reads the same block as the one transcript.
     assert [u.text for u in standing_units(markdown)] == [ordinary, "After."]
+
+
+def test_annotations_are_asides_like_visual_transcripts() -> None:
+    comment = annotation_markdown(
+        'Comment by Rowan Vale on "datum"',
+        "Every sounding must be reduced to the stated vertical datum before gridding.\n\nAgreed.",
+    )
+    markdown = f"Before the comment.\n\n{comment}\n\nAfter."
+
+    assert comment == (
+        '> **[Annotation \u2014 Comment by Rowan Vale on "datum"]**\n'
+        "> Every sounding must be reduced to the stated vertical datum before gridding.\n"
+        ">\n> Agreed."
+    )
+    assert without_asides(markdown) == "Before the comment.\n\n\nAfter."
+    assert [u.text for u in standing_units(markdown)] == ["Before the comment.", "After."]
+
+
+def test_one_table_parser_reads_cells_captions_and_abridges_long_tables() -> None:
+    rendered = render_table(("Gauge", "Level | datum"), [("North\nquay", "3.2"), ("South",)])
+    markdown = (
+        f"Gauge readings\n\n{rendered}\n\nText.\n\n```\n| a | b |\n| --- | --- |\n```\n\n"
+        "x | y\n--- | ---\n1 | 2 | 3"
+    )
+
+    assert rendered.splitlines()[0] == "| Gauge | Level \\| datum |"
+    assert split_table_cells("| a \\| b | c \\|") == ["a \\| b", "c \\|"]
+    assert [(t.caption, t.headers, t.rows) for t in tables(markdown)] == [
+        ("Gauge readings", ("Gauge", "Level \\| datum"), (("North quay", "3.2"), ("South", ""))),
+        (None, ("x", "y"), (("1", "2"),)),
+    ]
+    long = render_table(("n",), [(str(i),) for i in range(10)])
+    assert abridge_tables([long], [False], 2, 1)[0].splitlines() == [
+        "| n |",
+        "| --- |",
+        "| 0 |",
+        "| 1 |",
+        "[... 7 rows omitted for observation ...]",
+        "| 9 |",
+    ]
+    assert abridge_tables([long], [False], 5, 5) == [long]
+
+
+def test_a_table_split_over_fragments_is_abridged_as_one_table() -> None:
+    def rows(numbers: range) -> str:
+        return render_table(("n",), [(str(i),) for i in numbers])
+
+    fragments = [
+        f"Intro.\n\n{rows(range(5))}",
+        rows(range(5, 10)),
+        f"{rows(range(10, 15))}\n\nEnd.",
+    ]
+
+    first, middle, last = abridge_tables(fragments, [False, True, True], 2, 1)
+
+    assert first.splitlines() == [
+        "Intro.",
+        "",
+        "| n |",
+        "| --- |",
+        "| 0 |",
+        "| 1 |",
+        "[... 12 rows omitted for observation ...]",
+    ]
+    assert middle == ""
+    assert last.splitlines() == ["| n |", "| --- |", "| 14 |", "", "End."]
+    # A fragment that opens with another table starts a table of its own, as does a table
+    # that only repeats the header of the one before it.
+    other = render_table(("m",), [(str(i),) for i in range(3)])
+    assert abridge_tables([rows(range(5)), other], [False, True], 2, 1)[1] == other
+    assert abridge_tables([rows(range(3)), rows(range(3))], [False, False], 2, 1) == [
+        rows(range(3)),
+        rows(range(3)),
+    ]
 
 
 # Recurring units.

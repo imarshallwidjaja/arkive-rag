@@ -9,7 +9,7 @@ Agent runs go through `evals.agents.run_agent`; the judge goes through `OpenAIGa
 
 The two measures compare wording, not meaning. They share with induction's recurring units the
 unit, folding, shingle and containment functions of `arkive_rag.passages` (`standing_units`,
-`fold_unit`, word shingles, `containment`, `without_visual_transcripts`) and its thresholds
+`fold_unit`, word shingles, `containment`, `without_asides`) and its thresholds
 (`STANDING_MIN_WORDS`, `STANDING_RECURRENCE_CONTAINMENT`). They differ from recurrence
 discovery (`recurring_units`) in one way: a unit is held when one holdout document, all its
 sections together, contains enough of its shingles, where discovery tests each section of
@@ -237,7 +237,7 @@ def _text_shingles(text: str) -> Shingles:
     visual transcripts removed, together with its prose units' shingles. Folding the whole text
     joins a line-end hyphen or dash with the next unit's first word, and a unit keeps no list
     marker, so neither form alone holds every shingle the other does."""
-    whole = _passages.shingles(fold_for_quote(_passages.without_visual_transcripts(text)))
+    whole = _passages.shingles(fold_for_quote(_passages.without_asides(text)))
     return whole.union(*(u.grams for u in _prose_units(text)))
 
 
@@ -486,7 +486,7 @@ def exemplars_prompt(documents: Sequence[tuple[str, str]], run_notes: str) -> st
     """The exemplars-in-context prompt: each `(path, markdown)` document, labelled with its path
     and without visual transcripts, then the run notes."""
     blocks = [
-        f"===== DOCUMENT {path} =====\n{_passages.without_visual_transcripts(markdown).strip()}"
+        f"===== DOCUMENT {path} =====\n{_passages.without_asides(markdown).strip()}"
         for path, markdown in documents
     ]
     return "\n\n".join([*blocks, f"RUN NOTES:\n{run_notes}"])
@@ -706,7 +706,7 @@ async def run_layer3_holdout(
         reference_sections = section_markdowns(full, reference.doc_id)
     if not reference_sections:
         raise ValueError(f"reference document {reference.doc_id} has no sections")
-    reference_markdown = _passages.without_visual_transcripts("\n\n".join(reference_sections))
+    reference_markdown = _passages.without_asides("\n\n".join(reference_sections))
     holdout_path = output_dir / "holdout.arkive.db"
     # A worker thread: compiling may start its own event loop for agent runs, and this
     # coroutine's loop is already running.

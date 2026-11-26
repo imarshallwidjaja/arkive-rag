@@ -69,9 +69,9 @@ from arkive_rag.models import (
     heading_context,
     parse_printed_date,
 )
-from arkive_rag.passages import without_visual_transcripts
+from arkive_rag.passages import without_asides
 
-SCHEMA_VERSION = "6.0"
+SCHEMA_VERSION = "7.0"
 RRF_K = 60.0
 CHANNEL_DEPTH = 300
 MAX_TOP_K = 50
@@ -2078,7 +2078,7 @@ class TopicSnapshot:
             for doc in chosen:
                 for s in self._doc_sections[doc.doc_id]:
                     if s.section_id not in bodies:
-                        bodies[s.section_id] = without_visual_transcripts(s.markdown).strip()
+                        bodies[s.section_id] = without_asides(s.markdown).strip()
                         visuals[s.section_id] = _visual_count(s.markdown)
                     recurrence[s.section_id] = self._recurrence(s.section_id, ids, family_total)
                     entry_bytes[s.section_id] = _json_bytes(entry(s)) + 1
@@ -2329,7 +2329,7 @@ class TopicSnapshot:
                 date=self._documents[row.doc_id].date,
                 section_id=row.section_id,
                 heading_path=heading_context(row.heading_path),
-                markdown=without_visual_transcripts(row.markdown).strip(),
+                markdown=without_asides(row.markdown).strip(),
             )
             cost = _json_bytes(item) + 1
             if size + cost > budget:

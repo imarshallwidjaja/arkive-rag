@@ -2,7 +2,7 @@
 
 > Technical appendix. For the plain-language summary, read [How folders become searchable knowledge](../how-it-works.md). The authoritative specification is in [Reading](../architecture.md#reading), [Induction](../architecture.md#induction), and [Snapshot file](../architecture.md#snapshot-file).
 
-`arkive-rag build` turns a folder of `.pdf`, `.docx`, `.pptx`, and `.md` documents into one read-only SQLite snapshot (`*.arkive.db`, schema `6.0`). The compiler assumes no folder hierarchy, domain vocabulary, or heading convention: a flat folder of Word and PDF files goes through the same three passes as a 126-file multi-client archive.
+`arkive-rag build` turns a folder of `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html`, and `.md` documents into one read-only SQLite snapshot (`*.arkive.db`, schema `7.0`). The compiler assumes no folder hierarchy, domain vocabulary, or heading convention: a flat folder of Word and PDF files goes through the same three passes as a 126-file multi-client archive.
 
 `compile_corpus` in `src/arkive_rag/compiler.py` runs the passes in order: per-document reading, corpus induction, and binding with embeddings.
 

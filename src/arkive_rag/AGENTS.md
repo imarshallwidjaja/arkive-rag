@@ -11,13 +11,13 @@ Refines root `AGENTS.md` for the installable `arkive_rag` Python package (Python
 | `llm.py` | Fixed model IDs (`gpt-6.1-sol`, `gpt-6-luna`, `text-embedding-3-large`), `PRICES`, `LanguageGateway` protocol, `OpenAIGateway`, `BuildCache`, spend guard (`--max-cost`), and `.env` loading. |
 | `compiler.py` | Pass 1 reading: corpus discovery (no symlinks), LibreOffice `.docx`/`.pptx` conversion, `pypdfium2` 2x WebP rendering + render cache, vision transcription with fidelity retries, cross-page section/table stitching, `MAX_SECTION_CHARS = 32_000` splitting, and per-document observation cards. |
 | `induction.py` | Pass 2 corpus induction: batched organisation (`0-6` facets, uncapped canonical deliverable types), content-bound facet judging, version-family detection/ordering, per-feedback-doc verified lessons, cited glossary, recurring unit clusters with holder samples, and bounded topic guide (`<= 16_000` chars / `<= 24_000` JSON bytes). |
-| `snapshot.py` | Schema `6.0` SQLite writer (`write_snapshot`, atomic `0600` rename), read-only `TopicSnapshot.open` integrity verifier, FTS5 + L2 cosine RRF search with version-family cap, and `prepare_draft` packet builder. |
+| `snapshot.py` | Schema `7.0` SQLite writer (`write_snapshot`, atomic `0600` rename), read-only `TopicSnapshot.open` integrity verifier, FTS5 + L2 cosine RRF search with version-family cap, and `prepare_draft` packet builder. |
 | `server.py` | FastMCP server exposing the ten tools over `stdio` or `streamable-http` (`--allow-nonlocal` guard for non-loopback hosts) and `server_instructions` (including sole-topic summary). |
 | `cli.py` | Typer CLI (`arkive-rag build | inspect | grep | search | serve`). |
 
 ## Non-negotiable package invariants
 
-1. **Schema hard cuts:** Whenever a change alters SQLite tables, columns, or stored semantics, bump `SCHEMA_VERSION` in `snapshot.py` (currently `"6.0"`). Do not add read adapters for older schema versions; old snapshots are rebuilt from their corpus.
+1. **Schema hard cuts:** Whenever a change alters SQLite tables, columns, or stored semantics, bump `SCHEMA_VERSION` in `snapshot.py` (currently `"7.0"`). Do not add read adapters for older schema versions; old snapshots are rebuilt from their corpus.
 2. **Stable IDs and deterministic ordering:** Document IDs come strictly from `document_id(rel_path)` (`doc_<10hex>` over NFC-normalised POSIX relative path) so inserting or moving another file never renumbers existing IDs. Keep documents ordered by sorted relative path (`ordinal`) across compilation, induction, and SQLite queries.
 3. **Corpus generality:** Never hardcode domain nouns, client names, folder conventions, or heading keywords into `compiler.py`, `passages.py`, `induction.py`, `snapshot.py`, or `server.py`. Every rule must hold across flat folders, nested project trees, and mixed `.pdf`/`.docx`/`.pptx`/`.md` collections with or without `AGENTS.md`.
 4. **Prompt and tool-response ceilings:**

@@ -9,6 +9,7 @@ import stat
 import time
 from collections import Counter
 from collections.abc import Iterator, Sequence
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from typing import Any
 import numpy as np
 import pytest
 from numpy.typing import NDArray
+from openpyxl import Workbook
+from openpyxl.comments import Comment
 
 from arkive_rag import __version__
 from arkive_rag import snapshot as snapshot_module
@@ -512,7 +515,7 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     db.close()
     with pytest.raises(
         SnapshotIntegrityError,
-        match=r"schema version '5\.0'; Arkive \S+ reads schema 6\.0 only, so rebuild",
+        match=r"schema version '5\.0'; Arkive \S+ reads schema 7\.0 only, so rebuild",
     ):
         TopicSnapshot.open(stale)
     with pytest.raises(SnapshotIntegrityError, match="does not exist"):
@@ -521,6 +524,49 @@ def test_snapshot_opens_read_only_and_rejects_other_schema_versions(tmp_path: Pa
     garbage.write_bytes(os.urandom(4096))
     with pytest.raises(SnapshotIntegrityError, match="not a valid snapshot"):
         TopicSnapshot.open(garbage)
+
+
+def test_workbooks_pages_and_annotations_round_trip(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    book = Workbook()
+    sheet = book.active
+    assert sheet is not None
+    sheet.title = "Budget"
+    sheet.append(["Item", "Cost"])
+    sheet.append(["Survey", 4200])
+    sheet["B2"].comment = Comment("Day rate agreed with the harbour master", "Rowan Vale")
+    book.save(corpus_dir / "budget.xlsx")
+    (corpus_dir / "notes.html").write_text(
+        "<h1>Notes</h1><p>Soundings reached 12.4 m below chart datum.</p>", encoding="utf-8"
+    )
+    corpus = compile_corpus(corpus_dir, FakeGateway(), topic="t", title="T")
+    output = tmp_path / "t.arkive.db"
+
+    write_snapshot(corpus, output)
+
+    with TopicSnapshot.open(output) as snap:
+        documents = {d.rel_path: d for d in snap.list_documents()}
+        assert {p: d.format for p, d in documents.items()} == {
+            "budget.xlsx": "xlsx",
+            "notes.html": "html",
+        }
+        for compiled in corpus.documents:
+            outline = snap.full_outline(compiled.doc_id)
+            assert [snap.section_markdown(s.section_id) for s in outline] == [
+                s.markdown for s in compiled.sections
+            ]
+    with closing(sqlite3.connect(output)) as db:
+        kinds = set(
+            db.execute("SELECT d.rel_path, c.kind FROM chunks c JOIN documents d USING (doc_id)")
+        )
+        (annotation,) = db.execute("SELECT content FROM chunks WHERE kind = 'annotation'")
+    assert {
+        ("budget.xlsx", "table"),
+        ("budget.xlsx", "annotation"),
+        ("notes.html", "prose"),
+    } <= kinds
+    assert annotation[0].startswith("> **[Annotation \u2014 Sheet Budget: B2 note by Rowan Vale]**")
 
 
 def test_document_dates_round_trip_with_their_basis(tmp_path: Path) -> None:
@@ -566,7 +612,7 @@ def test_facets_glossary_roles_lessons_units_and_build_records_round_trip(tmp_pa
     write_snapshot(corpus, output)
 
     with TopicSnapshot.open(output) as snap:
-        assert SCHEMA_VERSION == "6.0"
+        assert SCHEMA_VERSION == "7.0"
         assert tuple(snap.facets) == corpus.facets
         assert tuple(snap.glossary) == corpus.glossary
         assert tuple(snap.deliverable_types) == corpus.deliverable_types

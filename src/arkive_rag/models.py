@@ -94,12 +94,12 @@ def choices(names: Iterable[str]) -> str:
     return f"{shown}, ... (+{rest} more)" if rest > 0 else shown
 
 
-SourceFormat = Literal["pdf", "docx", "pptx", "md"]
+SourceFormat = Literal["pdf", "docx", "pptx", "md", "xlsx", "html"]
+# Formats read page by page from rendered pages; every other format is read from its own text
+# and has no pages.
+PAGED_FORMATS: frozenset[SourceFormat] = frozenset({"pdf", "docx", "pptx"})
 BlockKind = Literal["heading", "paragraph", "table", "callout"]
-ChunkKind = Literal["prose", "table", "visual", "guidance"]
-CraftAspect = Literal[
-    "structure", "convention", "caveat", "disclaimer", "reviewer_feedback", "tone"
-]
+ChunkKind = Literal["prose", "table", "visual", "guidance", "annotation"]
 # A path-bound facet's values stand for corpus folders; a content-bound facet's values are
 # assigned by reading each document.
 FacetBinding = Literal["path", "content"]
@@ -202,10 +202,12 @@ class PageExtraction(_Frozen):
 
 
 class StatedAttribute(_Frozen):
-    """A name/value pair the document states about itself, such as client or audience."""
+    """A name/value pair the document states about itself, such as client or audience, with
+    `quote`, the verbatim source text that states it."""
 
     name: str
     value: str
+    quote: str
 
 
 class TermDraft(_Frozen):
@@ -214,12 +216,6 @@ class TermDraft(_Frozen):
     aliases: list[str]
     quote: str
     defines: bool
-
-
-class CraftDraft(_Frozen):
-    aspect: CraftAspect
-    statement: str
-    quote: str
 
 
 class ObservationDraft(_Frozen):
@@ -231,7 +227,6 @@ class ObservationDraft(_Frozen):
     summary: str
     attributes: list[StatedAttribute]
     terms: list[TermDraft]
-    craft: list[CraftDraft]
 
 
 class CardHeader(_Frozen):
@@ -326,10 +321,12 @@ class TermObservation(_Frozen):
     section_ordinal: int
 
 
-class CraftObservation(_Frozen):
-    aspect: CraftAspect
-    statement: str
-    quote: str
+class LocatedAttribute(_Frozen):
+    """A stated attribute whose quote was found in the document's text, outside its asides."""
+
+    name: str
+    value: str
+    # Document-local ordinal of the first section containing the quote.
     section_ordinal: int
 
 
@@ -338,12 +335,8 @@ class ObservationCard(_Frozen):
     doc_date: str | None
     deliverable_type: str
     summary: str
-    attributes: tuple[StatedAttribute, ...]
+    attributes: tuple[LocatedAttribute, ...]
     terms: tuple[TermObservation, ...]
-    # No induction step reads craft observations. They stay in the card and in the observation
-    # request, whose output schema is part of the build cache key, so cached observations of
-    # every page batch stay valid.
-    craft: tuple[CraftObservation, ...]
 
 
 class ChunkPiece(_Frozen):
@@ -354,6 +347,9 @@ class ChunkPiece(_Frozen):
 
 
 class ReadSection(_Frozen):
+    """One section of a read document. `continues_table`: its first table continues the
+    last table of the sections of its heading path before it, a table cut between rows."""
+
     ordinal: int
     heading_path: str
     level: int
@@ -361,6 +357,7 @@ class ReadSection(_Frozen):
     page_end: int
     markdown: str
     pieces: tuple[ChunkPiece, ...]
+    continues_table: bool = False
 
 
 class RenderedPage(_Frozen):

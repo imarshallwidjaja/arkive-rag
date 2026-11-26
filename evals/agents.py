@@ -24,8 +24,11 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, Field
 
 from arkive_rag.compiler import (
-    convert_office_to_pdf,
+    SUPPORTED_SUFFIXES,
+    SourceFile,
     discover_corpus,
+    office_to_pdf,
+    pageless_markdown,
     read_source,
     render_pdf,
 )
@@ -39,7 +42,7 @@ from arkive_rag.llm import (
     ToolReply,
     ToolResult,
 )
-from arkive_rag.models import ProviderError
+from arkive_rag.models import PAGED_FORMATS, ProviderError
 from arkive_rag.server import TopicCatalog, create_mcp_server
 from arkive_rag.snapshot import QueryEmbedder, TopicSnapshot
 from evals.schema import (
@@ -168,9 +171,11 @@ PageImage = Callable[[str, int], bytes | None]
 
 class RawCorpus:
     """The native text layer of every page of some corpus files, and their page images: what
-    the raw-file tools search and read. A Markdown file is one page of raw text without an
-    image. `page_image(rel_path, page_number)` returns one page's WebP, or None when the page
-    has none; `page_texts` and `page_image` must describe the same files and pages."""
+    the raw-file tools search and read. A file of a format without pages (Markdown, Excel,
+    HTML) is one page of text without an image: a Markdown file as written, a workbook or an
+    HTML page as the compiler reads it into Markdown. `page_image(rel_path, page_number)`
+    returns one page's WebP, or None when the page has none; `page_texts` and `page_image`
+    must describe the same files and pages."""
 
     def __init__(self, page_texts: Mapping[str, Sequence[str]], page_image: PageImage) -> None:
         self.files = dict(page_texts)
@@ -179,19 +184,16 @@ class RawCorpus:
     @classmethod
     def extract(cls, corpus_dir: Path) -> RawCorpus:
         """Render every file `discover_corpus` accepts, the set a snapshot is compiled from:
-        LibreOffice converts Word and PowerPoint files and pdfium renders each PDF page."""
+        LibreOffice converts Word and PowerPoint files and pdfium renders each PDF page; a
+        file without pages is read as `pageless_markdown` reads it."""
         texts: dict[str, list[str]] = {}
         images: dict[tuple[str, int], bytes] = {}
         for source in discover_corpus(corpus_dir):
             data = read_source(source)
-            if source.format == "md":
-                texts[source.rel_path] = [data.decode("utf-8")]
+            if source.format not in PAGED_FORMATS:
+                texts[source.rel_path] = [pageless_markdown(source, data)]
                 continue
-            pdf = (
-                data
-                if source.format == "pdf"
-                else convert_office_to_pdf(data, source.path.suffix.lower(), source.rel_path)
-            )
+            pdf = data if source.format == "pdf" else office_to_pdf(source, data)
             pages = render_pdf(pdf)
             texts[source.rel_path] = [text for text, _ in pages]
             for number, (_, webp) in enumerate(pages, start=1):
@@ -203,8 +205,10 @@ class RawCorpus:
         cls, files: Mapping[str, bytes], snapshot: TopicSnapshot, *, digests: Mapping[str, str]
     ) -> RawCorpus:
         """`files`, the corpus files `snapshot` was compiled from, read without rendering: a
-        Markdown file is its own bytes, and any other file is the native text and WebP of the
-        pages the build rendered and stored, the same pdfium output `extract` produces. Images
+        Markdown file is its own bytes, an Excel or HTML file is read by `pageless_markdown`
+        from its bytes as `extract` reads it, and any other file is the native text and WebP
+        of the pages the build rendered and stored, the same pdfium output `extract`
+        produces. Images
         are read from `snapshot` when a tool asks for one, so `snapshot` must stay open while
         the tools run. `digests` maps each file to the SHA-256 hex digest of its bytes, which
         the caller computed once for its own checks, so no file is hashed twice.
@@ -234,6 +238,11 @@ class RawCorpus:
                 )
             if document.format == "md":
                 texts[rel_path] = [files[rel_path].decode("utf-8")]
+                continue
+            if document.format not in PAGED_FORMATS:
+                path = Path(rel_path)
+                source = SourceFile(rel_path, path, SUPPORTED_SUFFIXES[path.suffix.lower()], 0)
+                texts[rel_path] = [pageless_markdown(source, files[rel_path])]
                 continue
             doc_ids[rel_path] = document.doc_id
             texts[rel_path] = [

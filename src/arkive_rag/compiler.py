@@ -25,15 +25,13 @@ import shutil
 import subprocess
 import tempfile
 import threading
-import zipfile
-import zlib
 from bisect import bisect_right
 from collections import Counter, deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from itertools import accumulate
+from itertools import accumulate, groupby
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol
 from xml.etree import ElementTree
@@ -45,6 +43,7 @@ from arkive_rag.induction import INDUCTION_EFFORTS, Checked, generate_checked, i
 from arkive_rag.llm import Effort, LanguageGateway
 from arkive_rag.models import (
     MAX_RENDER_SIDE_PX,
+    PAGED_FORMATS,
     ArkiveError,
     CardHeader,
     Chunk,
@@ -54,12 +53,12 @@ from arkive_rag.models import (
     CompiledDocument,
     ConversionError,
     CorpusDocument,
-    CraftObservation,
     CuratorNote,
     DocumentDate,
     DocumentReading,
     DocumentRole,
     Facet,
+    LocatedAttribute,
     MissingDependencyError,
     ObservationCard,
     ObservationDraft,
@@ -70,7 +69,6 @@ from arkive_rag.models import (
     RenderedSource,
     Section,
     SourceFormat,
-    StatedAttribute,
     TermObservation,
     TranscriptionFidelityError,
     UnsafePathError,
@@ -82,12 +80,25 @@ from arkive_rag.models import (
     iso_date,
     parse_printed_date,
 )
+from arkive_rag.passages import (
+    ANNOTATION_PREFIX,
+    abridge_tables,
+    has_table_pipe,
+    is_separator_row,
+    render_table,
+    render_table_row,
+    split_table_cells,
+    without_asides,
+)
 
 SUPPORTED_SUFFIXES: dict[str, SourceFormat] = {
     ".pdf": "pdf",
     ".docx": "docx",
     ".pptx": "pptx",
     ".md": "md",
+    ".xlsx": "xlsx",
+    ".html": "html",
+    ".htm": "html",
 }
 CURATOR_NOTE_NAME = "AGENTS.md"
 PROSE_CHUNK_CHARS = 1800
@@ -95,6 +106,8 @@ WHOLE_TABLE_CHARS = 2400
 TABLE_PIECE_CHARS = 2000
 # Hard ceiling for any chunk, well inside the embedding model's 8,192-token input limit.
 MAX_CHUNK_CHARS = 6000
+# How many folded characters of an annotation's anchor locate its rendered page.
+ANCHOR_MATCH_CHARS = 60
 # Hard ceiling for a section's Markdown, so one `read_section` result, observation batch or
 # support-check window never has to carry a whole unheaded transcript or a 20-page table.
 MAX_SECTION_CHARS = 32_000
@@ -109,21 +122,32 @@ PREV_CONTEXT_CHARS = 1200
 # Sections are packed in order into observation batches of about this many characters; a
 # larger section is a batch of its own.
 OBSERVE_BATCH_CHARS = 24_000
+# An observation batch shows a long table as its header, its first and its last rows, so a
+# sheet of thousands of rows is observed in one request; sections keep every row.
+OBSERVED_TABLE_HEAD_ROWS = 20
+OBSERVED_TABLE_TAIL_ROWS = 5
 # Page rendering. The page image is part of every `transcribe_page` cache key, so changing the
 # scale or quality re-transcribes every page of every cached corpus.
 PDF_RENDER_SCALE = 2.0
 WEBP_QUALITY = 85
 # Names the render path's output. It is part of every render cache key, so a change in what a
 # rendered page or its metadata date holds is never answered from an older render.
-RENDER_CACHE_REVISION = "arkive-page-render/2"
+# Revision 3 renders a Word file with its tracked changes accepted; revision 4 keeps a row of a
+# nested table from deleting its outer row and every namespace declaration where it stood.
+RENDER_CACHE_REVISION = "arkive-page-render/4"
 # Largest `docProps/core.xml` read for a metadata date; a real one is a few kilobytes, and a
-# larger entry (a decompression bomb) is refused before it is inflated.
+# larger entry is refused before it is parsed.
 MAX_CORE_PROPERTIES_BYTES = 1_000_000
 # On a two-page document an edge line repeated on both pages is furniture only when it is at
 # most this long, on pages of at least this many non-blank lines: a running header or footer
 # is short and sits beside a body, while a short slide or a body line need not be furniture.
 TWO_PAGE_FURNITURE_MAX_CHARS = 120
 TWO_PAGE_MIN_LINES = 5
+# How many non-blank lines at each edge of a page can be furniture: a running header or footer
+# of up to four lines (a title, a client, a reference, a date) repeated on three or more pages.
+# A two-page document confirms furniture on its two outer lines at each edge only.
+EDGE_LINES = 4
+TWO_PAGE_EDGE_LINES = 2
 
 # libpdfium and pypdfium2's object tracker are not thread-safe: every pdfium call
 # across all threads goes through this lock. It is reentrant so `_closing_pdf` can close a
@@ -149,8 +173,29 @@ _PAGE_LABEL = re.compile(
     r"\s*(?:page\s+\d{1,4}(?:\s+of\s+\d{1,4})?|\d{1,4}\s+of\s+\d{1,4})\s*", re.IGNORECASE
 )
 _EDGE_PAGE_NUMBER = re.compile(r"(\d{1,4})\s+(.+)|(.+?)\s+(\d{1,4})")
-_TABLE_CELL_SPLIT = re.compile(r"(?<!\\)\|")
-_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
+# A percentage, and a short integer followed by a unit of measure (`10 mm`, `5 kg/m3`): values
+# too short to be anchors alone, but never list markers or line numbers once a unit follows.
+_PERCENT = re.compile(rf"{_SIGN}(?<![\d.,])\b\d+(?:[.,]\d+)?[ \t]*%")
+# Spaces may stand inside a unit (`dB (A)`, `° C`); an anchor is written without them.
+_UNITS = (
+    "mm|cm|km|m|µm|μm|um|nm|pm|kg|mg|g|t|ha|ml|l|ms|min|hrs?|hz|khz|mhz|ghz|db[ \t]*\\(a\\)|dba|db"
+    "|°[ \t]*c|°[ \t]*f|°|kv|mv|v|ma|kw|mw|w|kwh|mwh|kpa|mpa|pa|bar|psi|kn|ft|yd|lbs?|oz|ppm|ppb"
+    "|mph|kph|kb|mb|gb|tb"
+)
+# A whole unit, compound ones included (`kg/m3`, `m/s`, `pm/°C`), so `5 kg` never stands for
+# `5 kg/m3`: a unit with an optional power, then any `/`, spaced or not, and a denominator
+# with an optional power: a unit or a unit of time or count, so `5 m / all` is `5m`. A unit
+# never ends inside a word (`10 M25`) or before an unspaced `/`. Every denominator follows its
+# own `/`, so repetitions never overlap and a run of slashes is matched in linear time.
+_DENOMINATORS = f"{_UNITS}|s|h|d|yr|k"
+_UNIT = rf"(?:{_UNITS})\d?(?:[ \t]*/[ \t]*(?:{_DENOMINATORS})\d?)*"
+_UNIT_NUMBER = re.compile(
+    rf"({_SIGN}(?<![\d.,])\b\d{{1,2}})(?![\d.,]\d)[ \t]*({_UNIT})(?![\w/])", re.IGNORECASE
+)
+# A unit's power written as a superscript (`m²`) is the same anchor as one written inline.
+_SUPERSCRIPT_DIGITS = str.maketrans(
+    "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079", "0123456789"
+)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 _MARKDOWN_HEADING = re.compile(r"(#{1,6})\s+(\S.*)")
 # A stripped code fence opener (CommonMark): three or more backticks and an info string with
@@ -200,16 +245,16 @@ text supports.
   "technical memorandum", "proposal", "review comments", "campaign brief" or
   "slide deck". Never a project or client name.
 - summary: two to four factual sentences on its subject, methods and results.
-- attributes: name/value pairs the document states about itself, such as client,
-  author, audience, project, region, sensor, product or channel. Use short
-  lowercase names. Only values the text states.
+- attributes: name/value pairs the document states about itself. Use these names
+  whenever the document states them: reference, status, client, site, author,
+  instruments; add other short lowercase names for what else it states about
+  itself, such as audience, project, region, product or channel. Only values the
+  text states, each with a quote of the document text that states it. Never take
+  an attribute from a quoted block that opens with **[Visual or **[Annotation:
+  those describe figures or carry comments, tracked changes and notes.
 - terms: domain terms, acronyms, named methods, datasets, tools and products the
   text uses. kind is a one-word category (acronym, method, dataset, tool, product,
   concept). defines is true only when the quote states what the term means.
-- craft: how the document is written: structure (sections it always has), convention
-  (house rules for tables, units, naming), caveat, disclaimer, reviewer_feedback
-  (what a reviewer asked to change) and tone. statement is a generic rule a writer
-  could follow, without this document's project-specific values.
 - quote: copy one sentence or phrase of at most 300 characters verbatim from the
   sections, as contiguous text. Never quote section headers you were not shown,
   never paraphrase, and never give section numbers instead of a quote.
@@ -250,13 +295,16 @@ class PageTranscription:
 
 @dataclass(frozen=True)
 class BatchSection:
-    """One section as an observation batch shows it, by document-local ordinal."""
+    """One section as an observation batch shows it, by document-local ordinal: `markdown` is
+    what the batch shows (abridged, or one piece of a long section) and `source` the whole
+    section as stored, which quotes are located in."""
 
     ordinal: int
     heading_path: str
     page_start: int
     page_end: int
     markdown: str
+    source: str
 
 
 @dataclass(frozen=True)
@@ -345,7 +393,7 @@ def discover_corpus(corpus_dir: Path) -> list[SourceFile]:
         fmt = SUPPORTED_SUFFIXES.get(path.suffix.lower())
         if fmt is None:
             raise UnsupportedFormatError(
-                f"{rel.as_posix()}: supported formats are .pdf .docx .pptx .md"
+                f"{rel.as_posix()}: supported formats are {' '.join(SUPPORTED_SUFFIXES)}"
             )
         sources.append(SourceFile(rel.as_posix(), path, fmt, path.lstat().st_size))
     return sources
@@ -528,6 +576,35 @@ def _closing_pdf(document: pdfium.PdfDocument) -> Iterator[None]:
             raise ConversionError(f"cannot close PDF: {exc}") from exc
 
 
+def _named[T](source: SourceFile, read: Callable[[bytes], T], data: bytes) -> T:
+    """`read(data)`, a ConversionError naming the source."""
+    try:
+        return read(data)
+    except ConversionError as exc:
+        raise ConversionError(f"{source.rel_path}: {exc}") from exc
+
+
+def office_to_pdf(source: SourceFile, data: bytes) -> bytes:
+    """The PDF LibreOffice renders from a Word or PowerPoint source's bytes, its archive
+    checked first; a Word file is rendered with its tracked changes accepted
+    (`native_formats.accepted_revision_copy`, which checks the archive as it opens it)."""
+    if source.format == "docx":
+        from arkive_rag.native_formats import accepted_revision_copy
+
+        data = _named(source, accepted_revision_copy, data)
+    else:
+        check_archive(source, data)
+    return convert_office_to_pdf(data, source.path.suffix.lower(), source.rel_path)
+
+
+def check_archive(source: SourceFile, data: bytes) -> None:
+    """Refuse an Office source whose archive is unreadable or too large to inflate, before
+    any member of it is parsed (`native_formats.check_office_archive`)."""
+    from arkive_rag.native_formats import check_office_archive
+
+    _named(source, check_office_archive, data)
+
+
 def render_cache_key(source_format: SourceFormat, sha256: str) -> str:
     """The render cache key of a source: its format, its bytes' SHA-256 and every setting that
     shapes a rendered page."""
@@ -554,12 +631,9 @@ def render_source(
     key = render_cache_key(source.format, sha256)
     if render_cache is not None and (cached := render_cache.load_render(key)) is not None:
         return cached
+    # An Office file's archive is checked as its metadata date is read.
     embedded = metadata_date(source, data)
-    pdf = (
-        data
-        if source.format == "pdf"
-        else convert_office_to_pdf(data, source.path.suffix.lower(), source.rel_path)
-    )
+    pdf = data if source.format == "pdf" else office_to_pdf(source, data)
     try:
         pages = render_pdf(pdf)
     except ConversionError as exc:
@@ -576,16 +650,14 @@ def render_source(
 EdgePosition = Literal["top", "bottom"]
 
 
-def _edge_positions(lines: Sequence[str]) -> dict[int, set[EdgePosition]]:
-    """Indexes of a page's edge lines and the edges they sit at: the first two non-blank
-    lines are top lines and the last two bottom lines; on a page of at most four non-blank
-    lines every line is both."""
+def _edge_positions(lines: Sequence[str], depth: int = EDGE_LINES) -> dict[int, set[EdgePosition]]:
+    """Indexes of a page's edge lines and the edge each sits at: the first `depth` non-blank
+    lines are top lines and the last `depth` bottom lines. On a page of fewer than
+    `2 * depth` non-blank lines each edge takes half of them, so no line is at both edges."""
     nonblank = [i for i, line in enumerate(lines) if line.strip()]
-    if len(nonblank) <= 4:
-        return {i: {"top", "bottom"} for i in nonblank}
-    edges: dict[int, set[EdgePosition]] = {i: {"top"} for i in nonblank[:2]}
-    for i in nonblank[-2:]:
-        edges.setdefault(i, set()).add("bottom")
+    edge = min(depth, len(nonblank) // 2)
+    edges: dict[int, set[EdgePosition]] = {i: {"top"} for i in nonblank[:edge]}
+    edges |= {i: {"bottom"} for i in nonblank[len(nonblank) - edge :]}
     return edges
 
 
@@ -621,7 +693,7 @@ def _two_page_furniture_keys(text: str, page_index: int) -> set[str]:
         return set()
     filename_lines = _filename_lines(text)
     keys: set[str] = set()
-    for i, positions in _edge_positions(lines).items():
+    for i, positions in _edge_positions(lines, TWO_PAGE_EDGE_LINES).items():
         line = lines[i]
         if len(line.strip()) > TWO_PAGE_FURNITURE_MAX_CHARS or i in filename_lines:
             continue
@@ -649,7 +721,7 @@ def _filename_lines(text: str) -> set[int]:
 
 def find_furniture(page_texts: Sequence[str]) -> frozenset[str]:
     """Keys of top lines repeated as top lines, and bottom lines repeated as bottom lines, on
-    at least three pages.
+    at least three pages, among the EDGE_LINES non-blank lines at each edge.
 
     A two-page document has no third page to confirm a running header, so there a line is
     furniture only when both pages repeat it at the same edge and pass
@@ -669,16 +741,17 @@ def strip_furniture(text: str, furniture: frozenset[str], page_index: int) -> st
     the page stays even when it repeats an edge line."""
     lines = text.splitlines()
     edges = _edge_positions(lines)
-    nonblank = sorted(edges)
+    nonblank = [i for i, line in enumerate(lines) if line.strip()]
+    outer = set(nonblank[:1] + nonblank[-1:])
     # A fragment of a filename wrapped over lines (`2026` above `-final.tif`) is never a page
     # number.
-    bounds = ({nonblank[0], nonblank[-1]} if nonblank else set()) - _filename_lines(text)
-    dropped = {
+    bounds = outer - _filename_lines(text)
+    dropped = {i for i in bounds if _BARE_PAGE_NUMBER.fullmatch(lines[i])}
+    dropped |= {i for i in outer | set(edges) if _PAGE_LABEL.fullmatch(lines[i])}
+    dropped |= {
         i
         for i, positions in edges.items()
-        if (i in bounds and _BARE_PAGE_NUMBER.fullmatch(lines[i]))
-        or _PAGE_LABEL.fullmatch(lines[i])
-        or any(_furniture_keys(lines[i], page_index, p) & furniture for p in positions)
+        if any(_furniture_keys(lines[i], page_index, p) & furniture for p in positions)
     }
     return "\n".join(line for i, line in enumerate(lines) if i not in dropped)
 
@@ -688,9 +761,18 @@ def _normalize_numbers(text: str) -> str:
 
 
 def _number_anchors(text: str) -> set[str]:
-    """Signed formatted numbers and long integers in number-normalized text."""
+    """Signed formatted numbers, long integers, percentages (`60%`) and short integers with a
+    unit (`10mm`, `5kg/m3`) in number-normalized text. A percentage or unit anchor is written
+    without any space, casefolded and with superscript digits inline, so `10 MM` and `10mm`,
+    `10 µm` and `10 μm`, `10 m²` and `10 m2`, or `55 dB (A)` and `55 dB(A)` are the same
+    anchor."""
     integers = _LONG_INTEGER.findall(_FORMATTED_NUMBER.sub(" ", text))
-    return {*_FORMATTED_NUMBER.findall(text), *integers}
+    percents = {"".join(match.split()) for match in _PERCENT.findall(text)}
+    units = {
+        "".join(match[0].split()).casefold()
+        for match in _UNIT_NUMBER.finditer(text.translate(_SUPERSCRIPT_DIGITS))
+    }
+    return {*_FORMATTED_NUMBER.findall(text), *integers, *percents, *units}
 
 
 @dataclass(frozen=True)
@@ -859,6 +941,9 @@ def missing_anchors(
     occurrences = _filename_occurrences(emitted)
     emitted_numbers = _numbers_outside(emitted, occurrences)
     emitted_numbers |= _number_anchors(_normalize_numbers(emitted))
+    # A value and its unit or percent sign in two table cells are read together, as the
+    # native text layer runs them together.
+    emitted_numbers |= _number_anchors(_normalize_numbers(emitted.replace("|", " ")))
     missing = sorted(a.display for a in _unmatched_filenames(filenames, occurrences))
     return missing + sorted(numbers - emitted_numbers)
 
@@ -925,20 +1010,28 @@ def transcribe_with_fidelity(
 
 # Section assembly.
 
-PartKind = Literal["heading", "paragraph", "table", "callout", "visual"]
+PartKind = Literal["heading", "paragraph", "table", "callout", "visual", "annotation"]
+# Parts that stand beside the text rather than in it: a transcribed continuation never joins
+# one, and a split keeps each piece under its title line.
+_ASIDE_KINDS = ("visual", "annotation")
 
 
 @dataclass
 class Part:
     """One block of a section. A table also has `row_spans`: the (first, last) page of each
     line of its Markdown, header and separator lines included, so a slice of the table
-    carries the pages of its own rows; every other kind has None."""
+    carries the pages of its own rows; every other kind has None. A `native` part comes from
+    the file's own structure (a chart's data, a comment), not from a transcription, so a
+    transcribed continuation on the next page never joins it. A `continued` table is a slice
+    after the first of one table cut between rows (`_table_slices`)."""
 
     kind: PartKind
     markdown: str
     page_start: int
     page_end: int
     row_spans: list[tuple[int, int]] | None = None
+    native: bool = False
+    continued: bool = False
 
 
 @dataclass
@@ -957,25 +1050,21 @@ class SectionDraft:
     def markdown(self) -> str:
         return "\n\n".join(part.markdown for part in self.parts)
 
-
-def _cells(line: str) -> list[str]:
-    body = line.strip().removeprefix("|")
-    if not body.endswith("\\|"):
-        body = body.removesuffix("|")
-    return [cell.strip() for cell in _TABLE_CELL_SPLIT.split(body)]
+    @property
+    def continues_table(self) -> bool:
+        """Whether the first table of the section continues the last table of an earlier
+        piece of its section, cut between rows by `split_oversized_section`."""
+        first = next((part for part in self.parts if part.kind == "table"), None)
+        return first is not None and first.continued
 
 
 def _table_rows(markdown: str) -> list[list[str]]:
     """Cells of every row of a normalized table (one row per line)."""
-    return [_cells(line) for line in markdown.strip().splitlines()]
-
-
-def _is_separator(row: list[str]) -> bool:
-    return bool(row) and all(_SEPARATOR_CELL.fullmatch(cell.replace(" ", "")) for cell in row)
+    return [split_table_cells(line) for line in markdown.strip().splitlines()]
 
 
 def _render_rows(rows: list[list[str]]) -> str:
-    return "\n".join("| " + " | ".join(row) + " |" for row in rows)
+    return "\n".join(render_table_row(row) for row in rows)
 
 
 def split_table_block(markdown: str) -> list[tuple[PartKind, str]]:
@@ -985,7 +1074,7 @@ def split_table_block(markdown: str) -> list[tuple[PartKind, str]]:
     lines carry outer pipes or its second line is a separator row (GFM without pipes).
     """
     lines = [line.rstrip() for line in markdown.strip().splitlines()]
-    has_pipe = [bool(_TABLE_CELL_SPLIT.search(line)) for line in lines]
+    has_pipe = [has_table_pipe(line) for line in lines]
     start = has_pipe.index(True) if True in has_pipe else len(lines)
     end = start
     while end < len(lines) and has_pipe[end]:
@@ -993,14 +1082,14 @@ def split_table_block(markdown: str) -> list[tuple[PartKind, str]]:
     run = lines[start:end]
     is_table = bool(run) and (
         all(line.lstrip().startswith("|") for line in run)
-        or (len(run) >= 2 and _is_separator(_cells(run[1])))
+        or (len(run) >= 2 and is_separator_row(split_table_cells(run[1])))
     )
     if not is_table:
         return [("paragraph", markdown.strip())] if markdown.strip() else []
     parts: list[tuple[PartKind, str]] = []
     if before := "\n".join(lines[:start]).strip():
         parts.append(("paragraph", before))
-    parts.append(("table", _render_rows([_cells(line) for line in run])))
+    parts.append(("table", _render_rows([split_table_cells(line) for line in run])))
     if after := "\n".join(lines[end:]).strip():
         parts.append(("paragraph", after))
     return parts
@@ -1009,7 +1098,7 @@ def split_table_block(markdown: str) -> list[tuple[PartKind, str]]:
 def _header_count(rows: list[list[str]]) -> int:
     """How many leading rows of a table are its header: the header and separator rows, or
     none when the second row is not a separator."""
-    return 2 if len(rows) >= 2 and _is_separator(rows[1]) else 0
+    return 2 if len(rows) >= 2 and is_separator_row(rows[1]) else 0
 
 
 def _table_part(markdown: str, page: int) -> Part:
@@ -1024,7 +1113,7 @@ def _extend_table(
     the page break and merged back spans both pages; every appended row spans `page`."""
     assert table.row_spans is not None, "only a table part is extended"
     rows, cont_rows = _table_rows(table.markdown), _table_rows(continuation)
-    if len(cont_rows) >= 2 and _is_separator(cont_rows[1]):
+    if len(cont_rows) >= 2 and is_separator_row(cont_rows[1]):
         cont_rows = cont_rows[2:]
     spans = table.row_spans
     last = rows[-1] if rows else None
@@ -1032,7 +1121,7 @@ def _extend_table(
         merges_into_previous_row
         and cont_rows
         and last is not None
-        and not _is_separator(last)
+        and not is_separator_row(last)
         and len(last) == len(cont_rows[0])
     ):
         rows[-1] = [" ".join(t for t in pair if t) for pair in zip(last, cont_rows[0], strict=True)]
@@ -1062,6 +1151,8 @@ def _block_parts(block: PageBlock, page: int) -> list[Part]:
             for kind, text in split_table_block(block.markdown)
         ]
     text = block.markdown.strip()
+    if block.kind == "callout" and text.startswith(ANNOTATION_PREFIX):
+        return [Part("annotation", text, page, page)]
     return [Part(block.kind, text, page, page)] if text else []
 
 
@@ -1079,9 +1170,11 @@ def page_parts(page: int, extraction: PageExtraction) -> list[Part]:
 
 def assemble_sections(
     pages: Sequence[tuple[int, PageExtraction]],
+    supplements: Mapping[int, Sequence[Part]] | None = None,
 ) -> list[SectionDraft]:
     """Stitch transcribed pages into heading-delimited sections of at most MAX_SECTION_CHARS
-    (`split_oversized_section`)."""
+    (`split_oversized_section`). The `supplements` of a page (native parts: chart tables and
+    annotations) follow its blocks and visuals in the section open at its end."""
     sections: list[SectionDraft] = []
     stack: dict[int, str] = {}
 
@@ -1105,7 +1198,10 @@ def assemble_sections(
             if not parts:
                 continue
             section = active(page_number)
-            previous = next((p for p in reversed(section.parts) if p.kind != "visual"), None)
+            previous = next(
+                (p for p in reversed(section.parts) if p.kind not in _ASIDE_KINDS and not p.native),
+                None,
+            )
             first = parts[0]
             if (
                 index == 0
@@ -1127,6 +1223,8 @@ def assemble_sections(
                 section.add(part)
         for visual in extraction.visuals:
             active(page_number).add(_visual_part(page_number, visual.label, visual.transcript))
+        for part in (supplements or {}).get(page_number, ()):
+            active(page_number).add(part)
     return [piece for section in sections for piece in split_oversized_section(section)]
 
 
@@ -1259,7 +1357,7 @@ def _wrap_row(line: str, room: int) -> list[str]:
     as text: a one-character cell would cut an escaped pipe (`\\|`) from its backslash."""
     if len(line) <= room:
         return [line]
-    cells = _cells(line)
+    cells = split_table_cells(line)
     overhead = len(_render_rows([[""] * len(cells)]))
     width = (room - overhead) // len(cells)
     if width < 2:
@@ -1313,6 +1411,7 @@ def _table_slices(table: Part, first: int, rest: int) -> list[Part]:
                 start,
                 end,
                 [(start, end)] * len(header) + row_spans,
+                continued=bool(slices),
             )
         )
         current.clear()
@@ -1384,16 +1483,21 @@ def _fence_slices(text: str, first: int, rest: int) -> list[str]:
     return repaired
 
 
-def _visual_slices(visual: str, page: int, first: int, rest: int) -> list[str]:
-    """A visual transcript cut at line breaks into pieces of at most `first` characters, then
-    `rest`, each opening with the transcript's `> **[Visual ...]**` line and quoting every
-    line, so each piece is read as a visual transcript. A title longer than a quarter of a
-    piece becomes the first quoted line, and each piece opens with `> **[Visual - Page N]**`
-    instead."""
-    title, *lines = visual.splitlines()
+def _aside_slices(part: Part, first: int, rest: int) -> list[str]:
+    """A visual transcript or annotation cut at line breaks into pieces of at most `first`
+    characters, then `rest`, each opening with the aside's `> **[Visual ...]**` or
+    `> **[Annotation ...]**` line and quoting every line, so each piece is read as that
+    aside. A title longer than a quarter of a piece becomes the first quoted line, and each
+    piece opens with `> **[Visual - Page N]**` or `> **[Annotation]**` instead."""
+    title, *lines = part.markdown.splitlines()
     limit = min(first, rest)
     if len(title) > limit // 4:
-        title, lines = f"> **[Visual \u2014 Page {page}]**", [title, *lines]
+        short = (
+            f"> **[Visual \u2014 Page {part.page_start}]**"
+            if part.kind == "visual"
+            else f"{ANNOTATION_PREFIX}]**"
+        )
+        title, lines = short, [title, *lines]
     room = limit - len(title) - 1
     quoted = [
         f"> {piece}"
@@ -1423,8 +1527,8 @@ def _slices(part: Part, first: int, rest: int) -> list[Part]:
     if part.kind == "table":
         return _table_slices(part, first, rest)
     texts = (
-        _visual_slices(part.markdown, part.page_start, first, rest)
-        if part.kind == "visual"
+        _aside_slices(part, first, rest)
+        if part.kind in _ASIDE_KINDS
         else _fence_slices(part.markdown, first, rest)
     )
     return [Part(part.kind, text, part.page_start, part.page_end) for text in texts]
@@ -1432,14 +1536,15 @@ def _slices(part: Part, first: int, rest: int) -> list[Part]:
 
 def _bounded_parts(parts: Sequence[Part], first: int) -> list[Part]:
     """`parts` with each one larger than MAX_SECTION_CHARS sliced (`_slices`), the first slice
-    of the first part holding at most `first` where it can. A visual transcript that follows
-    a sliced table, as the visuals of a table's pages do once the table runs across them, is
-    sliced the same way and moves up to follow the slice that holds its page."""
+    of the first part holding at most `first` where it can. An aside (a visual transcript or
+    an annotation) that follows a sliced table, as the asides of a table's pages do once the
+    table runs across them, is sliced the same way and moves up to follow the slice that
+    holds its page."""
     bounded: list[Part] = []
     pending: list[Part] = []
     room = first
     for part in parts:
-        if part.kind == "visual" and pending:
+        if part.kind in _ASIDE_KINDS and pending:
             # The slice before the first that ends on or after the visual's page.
             target = next(
                 (
@@ -1449,7 +1554,7 @@ def _bounded_parts(parts: Sequence[Part], first: int) -> list[Part]:
                 ),
                 len(pending) - 1,
             )
-            at = _after_visuals(pending, target)
+            at = _after_asides(pending, target)
             pending[at:at] = _slices(part, MAX_SECTION_CHARS, MAX_SECTION_CHARS)
             continue
         bounded += pending
@@ -1463,10 +1568,10 @@ def _bounded_parts(parts: Sequence[Part], first: int) -> list[Part]:
     return bounded + pending
 
 
-def _after_visuals(parts: list[Part], index: int) -> int:
-    """The position after `parts[index]` and the visual parts that directly follow it."""
+def _after_asides(parts: list[Part], index: int) -> int:
+    """The position after `parts[index]` and the asides that directly follow it."""
     index += 1
-    while index < len(parts) and parts[index].kind == "visual":
+    while index < len(parts) and parts[index].kind in _ASIDE_KINDS:
         index += 1
     return index
 
@@ -1527,9 +1632,9 @@ def section_pieces(draft: SectionDraft, prose_kind: ChunkKind) -> tuple[ChunkPie
                 else _table_slices(part, TABLE_PIECE_CHARS, TABLE_PIECE_CHARS)
             )
             pieces += [("table", t.markdown, t.page_start, t.page_end) for t in tables]
-        elif part.kind == "visual":
+        elif part.kind == "visual" or part.kind == "annotation":
             flush()
-            pieces.append(("visual", part.markdown, *span))
+            pieces.append((part.kind, part.markdown, *span))
         elif part.kind != "heading":
             for text in _split_prose(part.markdown):
                 packed = "\n\n".join([*(t for t, _, _ in prose), text])
@@ -1582,33 +1687,62 @@ def _visual_summary(extraction: PageExtraction) -> str:
 def observation_batches(sections: Sequence[ReadSection]) -> list[tuple[BatchSection, ...]]:
     """Sections packed in order into batches of at most `OBSERVE_BATCH_CHARS` characters.
 
-    A section larger than the budget is split by `wrap_text` into pieces within it; every
-    piece keeps the section's document-local ordinal, so a quote found in a piece is located
-    in its section. Each piece is labelled with its heading path cut by `heading_context`.
+    A table of more than OBSERVED_TABLE_HEAD_ROWS + OBSERVED_TABLE_TAIL_ROWS body rows is
+    shown abridged to its header, first and last rows (`abridge_tables`), across every
+    consecutive section of one heading path it was split over (`ReadSection.continues_table`);
+    a section of nothing but rows
+    left out is not shown. A section still larger than the budget is split by `wrap_text` into
+    pieces within it; every piece keeps the section's document-local ordinal and whole text, so
+    a quote found in a piece is located in its section. Each piece is labelled with its
+    heading path cut by `heading_context`.
     """
     batches: list[list[BatchSection]] = []
     size = 0
-    for section in sections:
-        label = heading_context(section.heading_path)
-        # An empty section is one empty piece, shown as before.
-        for piece in wrap_text(section.markdown, OBSERVE_BATCH_CHARS) or [section.markdown]:
-            item = BatchSection(section.ordinal, label, section.page_start, section.page_end, piece)
-            if batches and size + len(piece) <= OBSERVE_BATCH_CHARS:
-                batches[-1].append(item)
-                size += len(piece)
-            else:
-                batches.append([item])
-                size = len(piece)
+    for _, run in groupby(sections, key=lambda section: section.heading_path):
+        group = list(run)
+        shown_texts = abridge_tables(
+            [section.markdown for section in group],
+            [section.continues_table for section in group],
+            OBSERVED_TABLE_HEAD_ROWS,
+            OBSERVED_TABLE_TAIL_ROWS,
+        )
+        for section, shown in zip(group, shown_texts, strict=True):
+            if section.markdown.strip() and not shown:
+                continue
+            label = heading_context(section.heading_path)
+            # An empty section is one empty piece, shown as before.
+            for piece in wrap_text(shown, OBSERVE_BATCH_CHARS) or [shown]:
+                item = BatchSection(
+                    section.ordinal,
+                    label,
+                    section.page_start,
+                    section.page_end,
+                    piece,
+                    section.markdown,
+                )
+                if batches and size + len(piece) <= OBSERVE_BATCH_CHARS:
+                    batches[-1].append(item)
+                    size += len(piece)
+                else:
+                    batches.append([item])
+                    size = len(piece)
     return [tuple(batch) for batch in batches]
 
 
-def locate_quote(quote: str, sections: Sequence[BatchSection]) -> int | None:
-    """Ordinal of the first section whose text contains `quote`, compared by `fold_for_quote`."""
+def locate_quote(
+    quote: str, sections: Sequence[BatchSection], *, outside_asides: bool = False
+) -> int | None:
+    """Ordinal of the first section whose stored text (`BatchSection.source`) contains
+    `quote`, compared by `fold_for_quote`; with `outside_asides`, only text outside its visual
+    transcripts and annotations counts. The whole section is searched, so an aside cut over
+    two pieces stays an aside and the line an abridged table shows for its left-out rows is
+    never quoted text."""
     needle = fold_for_quote(quote)
     if not needle:
         return None
     for section in sections:
-        if needle in fold_for_quote(section.markdown):
+        text = without_asides(section.source) if outside_asides else section.source
+        if needle in fold_for_quote(text):
             return section.ordinal
     return None
 
@@ -1618,31 +1752,41 @@ class LocatedBatch:
     """One batch's observations with every quote located; `discarded` counts dropped ones."""
 
     draft: ObservationDraft
+    attributes: tuple[LocatedAttribute, ...]
     terms: tuple[TermObservation, ...]
-    craft: tuple[CraftObservation, ...]
     discarded: int
 
 
 def locate_batch(
     draft: ObservationDraft, sections: Sequence[BatchSection], *, rerun_of_unlocated: bool
 ) -> Checked[LocatedBatch]:
-    """Locate every quote of a batch in that batch's sections.
+    """Locate every quote of a batch in that batch's sections: a term's anywhere in a section,
+    an attribute's only outside its asides, since a comment, tracked change, speaker note or
+    figure description does not state what the document says about itself.
 
     Unlocated quotes are rejections. Keeping the located observations and discarding the rest
     is an accepted reduction, except when the batch quoted something and nothing could be
     located: that is a broken reading. With `rerun_of_unlocated` (the earlier answer quoted
     and located nothing), a rerun without any observation is that same broken reading.
     """
-    if rerun_of_unlocated and not (draft.terms or draft.craft):
+    if rerun_of_unlocated and not (draft.terms or draft.attributes):
         return Checked.reject(
             [
                 "the earlier answer quoted the sections but none of its quotes could be located,"
                 " and this answer has no observations"
             ]
         )
+    attributes: list[LocatedAttribute] = []
     terms: list[TermObservation] = []
-    craft: list[CraftObservation] = []
     unlocated: list[str] = []
+    for attribute in draft.attributes:
+        ordinal = locate_quote(attribute.quote, sections, outside_asides=True)
+        if ordinal is None:
+            unlocated.append(attribute.quote)
+            continue
+        attributes.append(
+            LocatedAttribute(name=attribute.name, value=attribute.value, section_ordinal=ordinal)
+        )
     for term in draft.terms:
         ordinal = locate_quote(term.quote, sections)
         if ordinal is None:
@@ -1658,24 +1802,11 @@ def locate_batch(
                 section_ordinal=ordinal,
             )
         )
-    for item in draft.craft:
-        ordinal = locate_quote(item.quote, sections)
-        if ordinal is None:
-            unlocated.append(item.quote)
-            continue
-        craft.append(
-            CraftObservation(
-                aspect=item.aspect,
-                statement=item.statement,
-                quote=item.quote,
-                section_ordinal=ordinal,
-            )
-        )
-    located = LocatedBatch(draft, tuple(terms), tuple(craft), len(unlocated))
+    located = LocatedBatch(draft, tuple(attributes), tuple(terms), len(unlocated))
     if not unlocated:
         return Checked.accept(located)
     rejections = tuple(f"quote not found verbatim in the sections: {q!r}" for q in unlocated)
-    if terms or craft:
+    if terms or attributes:
         return Checked.reduce(rejections, located)
     return Checked.reject(rejections)
 
@@ -1704,9 +1835,9 @@ def observe_document(
         )
 
     located = [observe(batch) for batch in batches]
-    attributes: dict[tuple[str, str], StatedAttribute] = {}
+    attributes: dict[tuple[str, str], LocatedAttribute] = {}
     for batch in located:
-        for attribute in batch.draft.attributes:
+        for attribute in batch.attributes:
             key = (fold_text(attribute.name).strip(), fold_text(attribute.value).strip())
             attributes.setdefault(key, attribute)
     headers = tuple(
@@ -1726,7 +1857,6 @@ def observe_document(
         summary=header.summary,
         attributes=tuple(attributes.values()),
         terms=tuple(t for b in located for t in b.terms),
-        craft=tuple(c for b in located for c in b.craft),
     )
     return card, sum(b.discarded for b in located)
 
@@ -1775,7 +1905,6 @@ def curator_note_card(text: str) -> ObservationCard:
         summary=" ".join(prose[0].split())[:300] if prose else "",
         attributes=(),
         terms=(),
-        craft=(),
     )
 
 
@@ -1811,44 +1940,42 @@ _DCTERMS = "{http://purl.org/dc/terms/}"
 
 
 def _office_core_properties(source: SourceFile, data: bytes) -> ElementTree.Element | None:
-    """The parsed `docProps/core.xml` of a Word or PowerPoint file, or None without one."""
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            try:
-                info = archive.getinfo(_CORE_PROPERTIES)
-            except KeyError:
-                return None
-            if info.file_size > MAX_CORE_PROPERTIES_BYTES:
-                raise ConversionError(
-                    f"{source.rel_path}: {_CORE_PROPERTIES} is {info.file_size} bytes; the"
-                    f" limit is {MAX_CORE_PROPERTIES_BYTES}"
-                )
+    """The parsed `docProps/core.xml` of an Office file, or None without one. The archive is
+    checked as it opens (`native_formats.open_office_archive`), so the entry's declared size
+    is the size it inflates to."""
+    from arkive_rag.native_formats import ARCHIVE_FAILURES, open_office_archive
+
+    with _named(source, open_office_archive, data) as archive:
+        try:
+            info = archive.getinfo(_CORE_PROPERTIES)
+        except KeyError:
+            return None
+        if info.file_size > MAX_CORE_PROPERTIES_BYTES:
+            raise ConversionError(
+                f"{source.rel_path}: {_CORE_PROPERTIES} is {info.file_size} bytes; the"
+                f" limit is {MAX_CORE_PROPERTIES_BYTES}"
+            )
+        try:
             return ElementTree.fromstring(archive.read(info))
-    except (
-        OSError,
-        zipfile.BadZipFile,
-        UnicodeDecodeError,
-        RuntimeError,
-        NotImplementedError,
-        EOFError,
-        zlib.error,
-        ElementTree.ParseError,
-    ) as exc:
-        raise ConversionError(f"{source.rel_path}: cannot read {_CORE_PROPERTIES}: {exc}") from exc
+        except ARCHIVE_FAILURES as exc:
+            raise ConversionError(
+                f"{source.rel_path}: cannot read {_CORE_PROPERTIES}: {exc}"
+            ) from exc
 
 
 def metadata_date(source: SourceFile, data: bytes) -> str | None:
     """The date a file's own metadata carries, `YYYY-MM-DD` or `YYYY-MM`, read from its
     original bytes.
 
-    PDF: the info dictionary's `CreationDate`, else `ModDate`. Word and PowerPoint:
-    `dcterms:modified` in `docProps/core.xml`, else `dcterms:created`. Markdown has none. A
+    PDF: the info dictionary's `CreationDate`, else `ModDate`. Word, PowerPoint and Excel:
+    `dcterms:modified` in `docProps/core.xml`, else `dcterms:created`. Markdown and HTML have
+    none. A
     value that is not a whole, well-formed date string with a real calendar date counts as
     absent. A file whose metadata container cannot be read (a PDF that does not open, an
     Office file that is not a zip archive, a `core.xml` that is not XML or is larger than
     MAX_CORE_PROPERTIES_BYTES) is corrupt and raises ConversionError.
     """
-    if source.format == "md":
+    if source.format in ("md", "html"):
         return None
     if source.format == "pdf":
         with _PDFIUM_LOCK:
@@ -1906,6 +2033,70 @@ def document_date(printed: str | None, embedded: str | None) -> DocumentDate | N
     return None if embedded is None else DocumentDate(iso=embedded, basis="metadata")
 
 
+def pageless_markdown(source: SourceFile, data: bytes) -> str:
+    """The Markdown text of a source of a format without pages: a Markdown file as written,
+    an Excel workbook or an HTML page as `native_formats` reads it."""
+    if source.format == "md":
+        return _decode_markdown(source, data)
+    from arkive_rag import native_formats
+
+    if source.format == "xlsx":
+        return _named(source, native_formats.xlsx_markdown, data)
+    if source.format == "html":
+        return _named(source, native_formats.html_markdown, data)
+    raise AssertionError(f"{source.format} is a paged format")
+
+
+def _page_of(anchor: str, folded_pages: Sequence[str]) -> int:
+    """The number of the first page whose native text holds the start of `anchor`, compared
+    by `fold_for_quote`; the last page when none does or there is no anchor."""
+    needle = fold_for_quote(anchor)[:ANCHOR_MATCH_CHARS]
+    if needle:
+        for number, page in enumerate(folded_pages, start=1):
+            if needle in page:
+                return number
+    return len(folded_pages)
+
+
+def page_supplements(
+    source: SourceFile, data: bytes, page_texts: Sequence[str]
+) -> dict[int, list[Part]]:
+    """What a Word or PowerPoint file's own structure adds to its rendered pages, by page.
+
+    Word: each tracked change and comment as an annotation on the first page whose native
+    text holds its anchor (its paragraph, or the text the comment marks), else the last page.
+    PowerPoint: each shown slide's chart data as tables, then its speaker notes and comments
+    as annotations, on the page of that slide; when the rendered pages are not one per shown
+    slide, everything goes on the last page under labels that name the slide. PDF has none.
+    """
+    if source.format == "pdf" or not page_texts:
+        return {}
+    from arkive_rag import native_formats
+
+    supplements: dict[int, list[Part]] = {}
+    if source.format == "docx":
+        folded = [fold_for_quote(text) for text in page_texts]
+        for aside in _named(source, native_formats.docx_asides, data):
+            page = _page_of(aside.anchor, folded)
+            supplements.setdefault(page, []).append(
+                Part("annotation", aside.markdown, page, page, native=True)
+            )
+        return supplements
+    slides = _named(source, native_formats.pptx_supplements, data)
+    one_per_slide = len(slides) == len(page_texts)
+    for slide in slides:
+        page = slide.number if one_per_slide else len(page_texts)
+        parts: list[Part] = []
+        for chart in slide.charts:
+            table = _table_part(render_table(chart.headers, chart.rows), page)
+            table.native = True
+            parts += [Part("paragraph", chart.caption, page, page, native=True), table]
+        parts += [Part("annotation", a.markdown, page, page, native=True) for a in slide.asides]
+        if parts:
+            supplements.setdefault(page, []).extend(parts)
+    return supplements
+
+
 def read_document(
     source: SourceFile,
     data: bytes,
@@ -1922,14 +2113,16 @@ def read_document(
     sha256 = hashlib.sha256(data).hexdigest()
     pages: tuple[RenderedPage, ...] = ()
     text, embedded = "", None
-    if source.format == "md":
-        text = _decode_markdown(source, data)
+    if source.format not in PAGED_FORMATS:
+        text = pageless_markdown(source, data)
+        embedded = metadata_date(source, data)
         drafts = assemble_sections([(1, parse_markdown_blocks(text))])
     else:
         rendered = render_source(source, data, sha256, render_cache)
         embedded = rendered.metadata_date
         transcribed = _transcribe_pages(gateway, source, rendered.pages)
-        drafts = assemble_sections(transcribed)
+        supplements = page_supplements(source, data, [native for native, _ in rendered.pages])
+        drafts = assemble_sections(transcribed, supplements)
         pages = tuple(
             RenderedPage(
                 page_number=number,
@@ -1950,6 +2143,7 @@ def read_document(
             page_start=draft.page_start,
             page_end=draft.page_end,
             markdown=draft.markdown,
+            continues_table=draft.continues_table,
             pieces=section_pieces(draft, prose_kind),
         )
         for ordinal, draft in enumerate(drafts, start=1)
@@ -2103,7 +2297,7 @@ def compile_corpus(
         # holding the build up at the end; results are gathered in path order.
         schedule = sorted(
             range(len(sources)),
-            key=lambda i: (sources[i].format == "md", -sources[i].size_bytes, i),
+            key=lambda i: (sources[i].format not in PAGED_FORMATS, -sources[i].size_bytes, i),
         )
         futures: dict[int, Future[tuple[str | None, DocumentReading] | None]] = {
             i: pool.submit(read, sources[i]) for i in schedule

@@ -27,7 +27,8 @@ their text and the factual provenance of that text.
 | `llm.py` | The `StructuredRequest` protocol, the provider-neutral `Tool`, the `LanguageGateway` protocol, `OpenAIGateway` (every provider call: structured Responses calls, Decisions, embeddings, the evaluation harness's agent conversations, the retry policy), `BuildCache`, `UsageMeter` with the spend limit, and `.env` loading. |
 | `compiler.py` | Reading (discovery, rendering, the transcription fidelity gate, section stitching, chunk pieces, observation cards with quote location) and binding (IDs, breadcrumbs, embeddings). `compile_corpus` composes reading, induction and binding into a `CompiledCorpus`. Its request types (`PageTranscription`, `ObserveSections`, `ConsolidateCard`) own their prompts, output schemas and reasoning efforts. |
 | `induction.py` | Induction: corpus organisation in bounded batches, type canonicalisation, facet binding, version families, feedback lessons, the glossary and the topic guide; the validate-and-retry helper `generate_checked`; support checks. Its request types (`OrganiseCorpus`, `CanonicaliseTypes`, `ExtractFeedbackLessons`, `WriteGlossary`, `WriteGuide`) own their prompts, schemas and efforts. |
-| `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what a visual transcript is and its removal (`without_visual_transcripts`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a corpus recur (`recurring_units`, over plain `TextDocument` records). Induction, the drafting packet and the evaluation harness all measure text with it. |
+| `native_formats.py` | What a file's own structure holds, read from its bytes: Excel workbooks (`xlsx_markdown`) and HTML pages (`html_markdown`) as Markdown through Docling's spreadsheet and HTML backends, the Office archive limits (`open_office_archive`), the accepted-revision copy of a Word file (`accepted_revision_copy`), Word comments and tracked changes (`docx_asides`), and PowerPoint speaker notes, comments and chart data (`pptx_supplements`). It is the only module that imports Docling or openpyxl; `compiler` imports it inside the functions that read those formats. |
+| `passages.py` | Text passages, with no I/O: what a unit of section Markdown is (`standing_units`), what an aside (a visual transcript or an annotation) is and its removal (`without_asides`), the one GFM table parser and renderer (`split_table_cells`, `tables`, `render_table`, `abridge_tables`), word 4-gram `shingles` and `containment` with their thresholds, and which units of a corpus recur (`recurring_units`, over plain `TextDocument` records). Induction, the drafting packet and the evaluation harness all measure text with it. |
 | `snapshot.py` | The SQLite schema, the atomic writer, and `TopicSnapshot`, the read-only query surface (facet filters, hybrid search, grep, sections, pages, glossary lookup, document pages and the drafting packet). |
 | `server.py` | `TopicCatalog` (open snapshots keyed by topic), the ten MCP tools and the server instructions. |
 | `cli.py` | The `arkive-rag` command. It is the only package module that reads `.env` and constructs `OpenAIGateway`; the evaluation harness in `evals/` does the same for its own runs. |
@@ -36,19 +37,30 @@ Dependencies point one way: `cli` → `server` → `snapshot`, and `cli` →
 `compiler` → `induction` → `llm`, with `induction` → `passages` and `snapshot` →
 `passages`; every module uses `models`, and `passages` imports nothing else of
 the package. `snapshot` and `server` import neither `compiler`, `induction` nor
-`llm`, and make no model call apart from the query embedder the CLI passes in. The compiler and induction receive a `LanguageGateway`, so
+`llm`, and make no model call apart from the query embedder the CLI passes in. Serving a snapshot
+therefore never loads Docling, openpyxl, pandas or torch, and reading a workbook or HTML page
+loads no torch either: the Docling distribution is `docling-slim` with only its spreadsheet and
+HTML extras. The compiler and induction receive a `LanguageGateway`, so
 tests drive them with a deterministic fake and no network. Only `llm.py`
 imports the OpenAI SDK and the OpenAI Agents SDK (`openai-agents`).
 
 ## Corpus layout
 
 Every non-hidden file under the corpus directory must be `.pdf`, `.docx`,
-`.pptx` or `.md`. Any other file stops the build with `UnsupportedFormatError`
-before the first model call. Paths starting with `.` are skipped. A symlink
-anywhere in the corpus stops the build with `UnsafePathError`, and each source
-is read once without following symlinks; Word and PowerPoint files are
-converted from a private copy of those bytes. The snapshot and the build cache
-must be different files outside the corpus directory.
+`.pptx`, `.md`, `.xlsx`, `.html` or `.htm`. Any other file, a legacy `.xls`
+workbook included, stops the build with `UnsupportedFormatError` before the
+first model call. Paths starting with `.` are skipped. A symlink anywhere in
+the corpus stops the build with `UnsafePathError`, and each source is read once
+without following symlinks. Every later step reads those bytes: LibreOffice
+converts a private copy of a Word or PowerPoint file, and Docling and openpyxl
+read a workbook or HTML page from an in-memory stream, never from a path. The
+snapshot and the build cache must be different files outside the corpus
+directory.
+
+PDF, Word and PowerPoint files are paged formats (`PAGED_FORMATS`): they are
+rendered and transcribed page by page. Markdown, Excel and HTML files have no
+pages: a reading of one has no rendered pages (`page_count` 0), and each of its
+sections spans page 1.
 
 - Folders carry no fixed meaning. Induction decides whether the folder
   structure encodes a facet (projects, campaigns, authors) and binds that
@@ -82,7 +94,7 @@ must be different files outside the corpus directory.
 
 `compile_corpus` runs three passes in order. Reading runs per document in a
 thread pool (`--max-concurrency`, default 4): PDF, Word and PowerPoint files
-start first, largest first, then Markdown, and readings are gathered in path
+start first, largest first, then the formats without pages, and readings are gathered in path
 order. The first failed read cancels the reads not yet started. Induction is corpus-wide and one executor of the same size bounds all
 its provider calls in flight; binding needs both.
 
@@ -96,7 +108,22 @@ moved. Each PDF, Word and PowerPoint file follows one path:
 
 1. **Render.** Word and PowerPoint files are converted to PDF by LibreOffice
    (`soffice --headless`) with a private temporary profile, a minimal
-   environment and a 120 s timeout. Each PDF page is rendered by pypdfium2 at
+   environment and a 120 s timeout. Before anything inside an Office archive
+   is parsed or reaches LibreOffice, Docling or openpyxl,
+   `open_office_archive` refuses an archive that is not a readable zip file,
+   declares more than 5,000 entries (`MAX_OFFICE_ARCHIVE_ENTRIES`), holds a
+   member that is encrypted or neither stored nor deflated, or a member whose
+   inflated bytes differ from the size and CRC its entry declares, or inflates
+   to more than 100,000,000 bytes (`MAX_OFFICE_ARCHIVE_BYTES`). It measures
+   this by inflating every member in 64 KiB steps, so a directory that
+   understates a member's size is caught. A Word file is converted with its tracked
+   changes accepted (`accepted_revision_copy`: deleted and moved-away runs and
+   deleted table rows removed, inserted and moved-in runs kept, in the body,
+   headers, footers, footnotes and endnotes, with every namespace prefix
+   kept), because LibreOffice otherwise draws a deletion and its replacement
+   into one PDF text run (`2176019` replaced by `1998` reads `21760191998`).
+   The original bytes stay the document's SHA-256 and metadata source; the
+   render cache revision is `arkive-page-render/4`. Each PDF page is rendered by pypdfium2 at
    scale 2.0 (`PDF_RENDER_SCALE`) to WebP (quality 85, `WEBP_QUALITY`), and its
    full Unicode native text layer is extracted. A page whose longest side would
    pass 4,096 px (`MAX_RENDER_SIDE_PX`) at that scale, such as an A0 sheet,
@@ -121,18 +148,24 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    propagation stops when a page's tail is unchanged.
 3. **Check fidelity.** Running headers, footers and page numbers are removed
    before anchors are collected, and only from a page's edge lines (its first
-   two and last two non-blank lines): a top line repeated as a top line, or a
+   four and last four non-blank lines, `EDGE_LINES`, so a running header of up
+   to four lines is furniture): a top line repeated as a top line, or a
    bottom line as a bottom line, exactly on three or more pages, or repeated
    apart from a leading or trailing number that advances with the page; on a
-   two-page document, such a line repeated at the same edge of both pages when
+   two-page document, such a line among the first two or last two non-blank
+   lines (`TWO_PAGE_EDGE_LINES`) repeated at the same edge of both pages when
    both pages have at least five non-blank lines, the line is at most 120
    characters and holds no part of a data filename (a fragment of one wrapped
    over lines included), and any such number is the page number itself; a labelled page number (`Page 3`, `3 of 12`) on an edge line; and a
    bare number on a page's first or last line. A body line that repeats an
    edge line stays. The anchors are GIS/data
    filenames (`.tif`, `.tiff`, `.shp`, `.nc`, `.gpkg`, `.csv`), signed
-   formatted numbers such as `-330.9` or `59,494`, and integers of three or
-   more digits. A filename that a narrow table cell wraps over up to six lines
+   formatted numbers such as `-330.9` or `59,494`, integers of three or
+   more digits, percentages such as `60%`, and one- or two-digit integers
+   followed by a unit of measure such as `10 mm` or `5 kg/m3` (written without
+   the space and with the unit in lower case, so `10 MM` matches `10mm`; a bare
+   list marker or line number has no unit and is no anchor). A value and its
+   unit or percent sign transcribed in two table cells still match. A filename that a narrow table cell wraps over up to six lines
    of native text also accepts its rejoined form; each occurrence is its own
    anchor, so two wrapped names that end in the same fragment each need their
    own transcription, and a number inside a wrapped name (`dry_` / `2026` /
@@ -147,7 +180,7 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    transcribed once more at high effort and the missing values are named in
    the request. After that retry, a missing filename or recall below 0.85
    raises `TranscriptionFidelityError` naming the file, page and missing
-   values.
+   values, and the build stops.
 4. **Stitch sections.** `assemble_sections` keeps a heading stack (levels 1-4;
    a heading with level 0 counts as level 2) and starts a section at every
    heading; text before the first heading is `Overview`. A table block keeps
@@ -158,7 +191,19 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    rows, and when `merges_into_previous_row` is set, its first row is merged
    cell by cell into the row cut by the page break; each table row keeps the
    pages it came from. Visual transcripts become quoted
-   `[Visual — Page N: label]` blocks in the section. A section over 32,000
+   `[Visual — Page N: label]` blocks in the section. A Word or PowerPoint
+   file's own structure adds native parts to its pages (`page_supplements`),
+   after the page's blocks and visual transcripts: each Word tracked insertion
+   and deletion (with author, date and text) and each comment (with the text
+   it marks) becomes a quoted `[Annotation — ...]` block on the first page
+   whose native text holds its paragraph or marked text, else on the last
+   page; each shown PowerPoint slide's native chart series become a Markdown
+   table under a `Chart: <title>` line, then its speaker notes and comments
+   become annotations, on that slide's page (hidden slides are skipped, as
+   LibreOffice skips them; when the pages are not one per shown slide, they go
+   on the last page under labels that name the slide). A transcribed block
+   that continues from the previous page never joins a native part, a visual
+   transcript or an annotation. A section over 32,000
    characters (`MAX_SECTION_CHARS`), such as a 20-page continued table or an
    unheaded transcript, becomes consecutive sections of that heading path
    within the limit, cut between blocks. The first section holds the heading
@@ -169,14 +214,15 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    separator rows repeated, each slice spanning only its own rows' pages, and a
    row too long for a slice wrapped cell by cell into rows of the same columns
    (a header that would leave a row less than a quarter of a slice is cut like
-   rows instead); a visual transcript at line breaks, every slice under its
-   `[Visual ...]` title (a title longer than a quarter of a slice is quoted once
-   under `[Visual — Page N]`); other text at line breaks or spaces, a fenced
+   rows instead); a visual transcript or annotation at line breaks, every
+   slice under its `[Visual ...]` or `[Annotation ...]` title (a title longer
+   than a quarter of a slice is quoted once under `[Visual — Page N]` or
+   `[Annotation]`); other text at line breaks or spaces, a fenced
    code block closed at the end of one slice and reopened at the start of the
    next with its delimiter and an info word of at most 32 characters. A line
    that starts with an inline code span (`` ```cli``` runs it ``) is text, not
-   a fence. The visual transcripts of a continued table's pages are sliced the
-   same way and follow the slice that holds their page.
+   a fence. The visual transcripts and annotations of a continued table's
+   pages are sliced the same way and follow the slice that holds their page.
 5. **Chunk pieces.** `section_pieces` packs paragraphs and callouts into prose
    pieces of up to 1,800 characters, splitting an oversized paragraph at
    sentence ends. A table up to 2,400 characters is one `table` piece; a larger
@@ -184,34 +230,44 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    characters, repeating the header and separator rows, each piece spanning
    the pages of its own rows; a header too wide to leave a row a quarter of
    the target is cut like rows instead of repeated. Each visual transcript is
-   its own
-   `visual` piece. No piece exceeds 6,000 characters: a final split wraps
+   its own `visual` piece, and each annotation its own `annotation` piece. No piece exceeds 6,000 characters: a final split wraps
    oversized content at line breaks or spaces and does not repeat a table
    header on later fragments. A piece has its own page span and no ID or breadcrumb yet.
 6. **Observe.** The document's sections are packed in order into batches of
    at most 24,000 characters (a larger section is split at line breaks or
    spaces into pieces within that size, each keeping the section's ordinal), and
+   a table of more than 25 body rows is shown as its header, its first 20 and
+   last 5 rows (`OBSERVED_TABLE_HEAD_ROWS`, `OBSERVED_TABLE_TAIL_ROWS`) with a
+   `[... N rows omitted for observation ...]` line between them, so a sheet of
+   thousands of rows takes one observation request; the section and its chunk
+   pieces keep every row. A table the section split cut between rows over
+   sections of one heading path is abridged as one table, even with a page's
+   visual between its pieces, while two tables that only share a header stay
+   two; a section of nothing but left-out rows is not shown. Then
    `gpt-6.1-sol` at low effort reads each batch (`observe`). It returns the
    title, date, deliverable type (free text, such as "technical memorandum"
    or "campaign brief"), summary, the attributes the document states about
-   itself (client, author, audience, channel and similar), the terms it uses
-   (with kind, aliases and whether the quote defines the term), and craft
-   observations (structure, convention, caveat, disclaimer, reviewer
-   feedback, tone; no induction step reads craft observations now, and they
-   stay in the observation schema so that cached observations stay valid).
-   Every term and craft observation carries a verbatim
-   quote, never a section number. Code locates each quote in the batch's
-   sections with `fold_for_quote` (NFKC, case, Unicode dashes, whitespace,
+   itself (named `reference`, `status`, `client`, `site`, `author` and
+   `instruments` when it states them, and other short names such as audience
+   or channel), and the terms it uses (with kind, aliases and whether the
+   quote defines the term). Every attribute and term carries a verbatim
+   quote, never a section number. Code locates each quote in the whole stored
+   text of the batch's sections (never in the line of left-out rows) with `fold_for_quote` (NFKC, case, Unicode dashes, whitespace,
    `*` and `_` emphasis, backticks, table pipes, block-quote markers and
    line-break hyphenation ignored; a `*` with spaces on both sides and an
    underscore inside a word stay text) and records the first containing
-   section's ordinal. Unlocated quotes get one rerun that names them. After
+   section's ordinal; an attribute's quote counts only outside the section's
+   asides (`without_asides`), because a comment, tracked change, speaker note
+   or figure description does not state what the document says about itself.
+   A located attribute (`LocatedAttribute`) keeps its name, value and section
+   ordinal. Unlocated quotes get one rerun that names them. After
    the rerun, observations whose quote is still unlocated are discarded and
    counted in the build report; a batch that quoted something and had no
    quote located raises `RejectedOutputError`, also when its rerun returns
-   no observations at all. A placeholder date answer such as `none` or
+   no observations at all; a batch whose located observations are all
+   attributes is a complete reading. A placeholder date answer such as `none` or
    `not stated` counts as no printed date. A document with several batches
-   has its terms, craft and attributes unioned in code, and one
+   has its terms and attributes unioned in code, and one
    `consolidate_card` request (low effort) writes its single title, date,
    deliverable type and summary from the batch headers. The date it keeps is
    always one a batch reported as printed, as that batch wrote it: the
@@ -232,8 +288,9 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    single reading, such as `05/04/2026` or a range, gives no calendar date and
    never falls back to the file's metadata. Only a document that prints no
    date takes the date in its original bytes, with basis `metadata`: a PDF's
-   `CreationDate`, else `ModDate`; a Word or PowerPoint file's
-   `dcterms:modified`, else `dcterms:created`, in `docProps/core.xml`. Each
+   `CreationDate`, else `ModDate`; a Word, PowerPoint or Excel file's
+   `dcterms:modified`, else `dcterms:created`, in `docProps/core.xml`; an HTML
+   page has none. Each
    value must be a whole PDF date string or W3CDTF value (`YYYY-MM` precision
    included) whose hour, minute, second and offset are in range, with an
    offset only after an hour; trailing text, a range or an impossible time
@@ -243,10 +300,35 @@ moved. Each PDF, Word and PowerPoint file follows one path:
    document's `doc_date` is the metadata date's ISO form, and induction
    prompts show it as `<date> (file metadata)`.
 
-Markdown files skip steps 1-3: `parse_markdown_blocks` splits them
-deterministically, keeping a fenced code block as one literal paragraph, and
-they have no page images for `view_page`. A document with no text raises
-`ConversionError`.
+Files without pages skip steps 1-3. `pageless_markdown` gives their Markdown,
+and `parse_markdown_blocks` splits it deterministically, keeping a fenced code
+block as one literal paragraph; they have no page images for `view_page`.
+
+- A Markdown file is its own UTF-8 text.
+- An Excel workbook (`.xlsx`, `xlsx_markdown`) is read by Docling's spreadsheet
+  backend, constructed directly on the bytes with single cells read as text,
+  charts not parsed and no LibreOffice conversion of embedded images. A
+  workbook with more than 250,000 populated cells (`MAX_WORKBOOK_CELLS`,
+  counted while streaming each sheet) is refused with `ConversionError`, never
+  cut. Each worksheet becomes a level-1 heading in workbook order, then each
+  data region a `Range A2:D5` line and a GFM table. A title row merged across
+  the table stays a paragraph above it, and a merged header of several rows is
+  flattened into one row (`Group — Column (Unit)`). A formula cell the file
+  saved without a computed value shows its formula (`=B4+C4`), read from the
+  streamed sheet XML (a shared formula translated to its cell with openpyxl's
+  formula translator), also when it lies outside every table; a string
+  formula with an empty cached value is blank. Cell notes and Excel 365
+  threaded comments (with replies, authors and dates) are read from the
+  archive and follow the sheet's tables as `[Annotation — Sheet <name>: ...]`
+  blocks.
+- An HTML page (`.html`, `.htm`, `html_markdown`) is read by Docling's HTML
+  backend with every image fetch, remote or local, and page rendering off, and
+  with furniture inference off, so text before the first heading stays body
+  text. Headings, paragraphs, lists, code blocks and tables (each with its
+  caption) follow in document order; images, and their alt text, are left out.
+
+A paragraph that would read as a heading, quote, table or fence is escaped.
+A document with no text raises `ConversionError`.
 
 ### Induction
 
@@ -438,20 +520,21 @@ note verbatim. No step caps how many deliverable types a corpus has.
    a list item. A table whose first line opens with `|` runs through the
    following lines that hold `|` and are not list items; a table without outer
    pipes runs through every following line that holds `|`. A block quote that
-   is not a visual transcript is a paragraph. Headings, visual transcripts
-   (`> **[Visual` blocks), fenced blocks and table body rows are not units. A
+   is not an aside is a paragraph. Headings, asides (visual transcripts,
+   `> **[Visual` blocks, and annotations, `> **[Annotation` blocks), fenced
+   blocks and table body rows are not units. A
    prose unit is folded without its leading list marker (`fold_unit`), so
    items numbered `1.` and `2.` in two documents compare alike. A unit is
    eligible with at least 8 words (`STANDING_MIN_WORDS`, counted after
    `fold_unit`), or as a table header row of at least two columns
    (`STANDING_MIN_TABLE_COLUMNS`). A section *holds* a unit when it holds at
    least 0.8 (`STANDING_RECURRENCE_CONTAINMENT`) of its word 4-grams after
-   folding, counting the 4-grams of the section's whole text without visual
-   transcripts together with those of its own units (folding the whole text
+   folding, counting the 4-grams of the section's whole text without asides
+   together with those of its own units (folding the whole text
    joins a line-end hyphen with the next unit's first word, so neither form
    alone holds every 4-gram the other does), or, for a table header, when it
-   has a table header of the same folded row. A visual transcript describes a
-   figure, so it never makes a section hold prose. Where documents sit plays no part. Units that say the same
+   has a table header of the same folded row. An aside describes a figure or
+   comments on the text, so it never makes a section hold prose. Where documents sit plays no part. Units that say the same
    thing (the same folded text, or containment of at least 0.8 both ways) are
    linked, and a cluster is everything linked directly or through other units,
    so a chain of light edits across several documents is one cluster even when
@@ -637,7 +720,7 @@ file-system failures raise `SnapshotIntegrityError`. The text tables are
 written first and the page images last, so sections and chunks lie together
 in the file rather than between page BLOBs.
 
-Tables (schema version `6.0`):
+Tables (schema version `7.0`):
 
 | Table | Contents |
 | --- | --- |
@@ -663,9 +746,10 @@ so it is the content address of the corpus a snapshot was built from
 
 `TopicSnapshot.open` uses a read-only SQLite URI with the path
 percent-encoded, so names containing `%`, `?` or `#` open the right file. It
-refuses any schema version other than `6.0`, naming the file's version and the
-one it reads; an older snapshot (`5.0`, whose recurring units and version
-families follow earlier rules, or `3.0` and `4.0`) is rebuilt from its corpus. Every
+refuses any schema version other than `7.0`, naming the file's version and the
+one it reads; an older snapshot (`6.0`, which holds no workbook, page or
+annotation content, `5.0`, whose recurring units and version families follow
+earlier rules, or `3.0` and `4.0`) is rebuilt from its corpus. Every
 `corpus_meta` key and every table is required, and `open` runs `PRAGMA
 foreign_key_check`, so a dangling facet assignment or alias is refused. Each
 facet value must have its canonical alias row. A snapshot is a build output
@@ -1194,8 +1278,8 @@ The two measures compare wording, not meaning. They reuse the build's text
 functions from `arkive_rag.passages`: `standing_units`, word 4-gram
 `shingles` of `fold_for_quote` text, `containment`, `STANDING_MIN_WORDS` and
 `STANDING_RECURRENCE_CONTAINMENT`, and the list-marker pattern `LIST_MARKER`.
-A visual transcript is a block quote whose first line opens with
-`> **[Visual`, the same rule `standing_units` applies, so a line with that
+An aside is a block quote whose first line opens with `> **[Visual` or
+`> **[Annotation`, the same rule `standing_units` applies, so a line with that
 prefix inside an ordinary block quote or a fenced block starts nothing. The
 sections of curator notes in the holdout snapshot are not holdout text.
 
@@ -1522,5 +1606,7 @@ uv build --out-dir "$SCRATCH/dist"
 ```
 
 The test suite makes no network calls. It needs LibreOffice (`soffice`) for the
-Word and PowerPoint conversion test; that test is skipped when `soffice` is
-absent.
+Word and PowerPoint conversion test and the test that a Word file's accepted
+tracked change renders as its accepted value alone; those tests are skipped
+when `soffice` is absent. Excel, HTML and the Word and PowerPoint comment,
+note and chart readers are tested without LibreOffice.

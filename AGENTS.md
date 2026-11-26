@@ -8,7 +8,7 @@ Open the nearest file below when your work enters its directory:
 
 | Directory | Read | Owns |
 | --- | --- | --- |
-| `src/arkive_rag/` | [`src/arkive_rag/AGENTS.md`](src/arkive_rag/AGENTS.md) | Package module boundaries, schema `6.0` hard-cut rules, path-hash IDs, fixed OpenAI models, prompt/MCP byte ceilings, and `prepare_draft` packing invariants. |
+| `src/arkive_rag/` | [`src/arkive_rag/AGENTS.md`](src/arkive_rag/AGENTS.md) | Package module boundaries, schema `7.0` hard-cut rules, path-hash IDs, fixed OpenAI models, prompt/MCP byte ceilings, and `prepare_draft` packing invariants. |
 | `evals/` | [`evals/AGENTS.md`](evals/AGENTS.md) | `arkive-eval-pack/3` harness, preflight/leak guards, frozen oracle control rules, example corpora/packs, and Docker `opencode_check`. |
 | `tests/` | [`tests/AGENTS.md`](tests/AGENTS.md) | Offline-only test invariant, `.env` isolation, owning test-file map, and targeted pytest invocations. |
 | `docs/` | [`docs/AGENTS.md`](docs/AGENTS.md) | Human documentation suite, strict public-corpus-only PII rule, and visual assets (`docs/assets/`). |

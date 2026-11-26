@@ -692,7 +692,6 @@ def test_cli_build_that_reaches_the_spend_limit_exits_with_its_usage_and_no_snap
         summary="Seagrass.",
         attributes=[],
         terms=[],
-        craft=[],
     )
     api.script("/responses", structured_body(card, tokens=usage(100_000, 10_000)))
     monkeypatch.setattr(cli, "OpenAIGateway", api.gateway)

@@ -15,6 +15,7 @@ from typing import Any
 
 import pypdfium2 as pdfium
 import pytest
+from openpyxl import Workbook
 from PIL import Image
 
 from arkive_rag import compiler
@@ -28,6 +29,7 @@ from arkive_rag.compiler import (
     FilenameAnchor,
     ObserveSections,
     PageTranscription,
+    Part,
     SectionDraft,
     SourceFile,
     assemble_sections,
@@ -40,6 +42,7 @@ from arkive_rag.compiler import (
     encode_page_image,
     fidelity_anchors,
     find_furniture,
+    locate_batch,
     locate_quote,
     metadata_date,
     missing_anchors,
@@ -47,6 +50,7 @@ from arkive_rag.compiler import (
     observe_document,
     parse_markdown_blocks,
     printed_date_or_none,
+    read_document,
     read_source,
     render_pdf,
     render_source,
@@ -66,7 +70,6 @@ from arkive_rag.models import (
     ChunkPiece,
     ConversionError,
     CorpusDocument,
-    CraftDraft,
     DocumentDate,
     DocumentReading,
     DocumentRole,
@@ -83,6 +86,7 @@ from arkive_rag.models import (
     PageExtraction,
     ReadSection,
     RejectedOutputError,
+    StatedAttribute,
     TermDraft,
     TranscriptionFidelityError,
     UnsafePathError,
@@ -91,7 +95,7 @@ from arkive_rag.models import (
     document_id,
     parse_printed_date,
 )
-from arkive_rag.passages import standing_units, without_visual_transcripts
+from arkive_rag.passages import split_table_cells, standing_units, without_asides
 from arkive_rag.snapshot import TopicSnapshot, write_snapshot
 from tests.support import (
     FakeGateway,
@@ -166,10 +170,10 @@ def test_discovery_lists_supported_files_in_sorted_order_and_skips_hidden(tmp_pa
 def test_discovery_rejects_unsupported_files_before_any_model_call(tmp_path: Path) -> None:
     (tmp_path / "p1").mkdir()
     (tmp_path / "p1" / "memo.md").write_text("# Memo\n\nText")
-    (tmp_path / "p1" / "model.xlsx").write_bytes(b"x")
+    (tmp_path / "p1" / "model.xls").write_bytes(b"x")
     gateway = FakeGateway()
 
-    with pytest.raises(UnsupportedFormatError, match=r"p1/model\.xlsx"):
+    with pytest.raises(UnsupportedFormatError, match=r"p1/model\.xls: supported formats are .pdf"):
         compile_corpus(tmp_path, gateway, topic="t", title="T")
     assert gateway.calls == []
 
@@ -315,6 +319,26 @@ def test_headless_continuation_skips_visuals_and_appends_rows() -> None:
         "| Year | Rain |\n| --- | --- |\n| 2016 | 210 |\n| 2017 | 402 |\n\n"
         "> **[Visual \u2014 Page 1: Figure 2]**\n> Nine Year Median = 330.9 mm\n\nEnd"
     )
+
+
+def test_a_continued_table_skips_native_chart_tables_and_annotations_to_join_its_own() -> None:
+    table = "| Year | Rain |\n| --- | --- |\n| 2016 | 210 |"
+    chart = Part("table", "| Category | North |\n| --- | --- |\n| Q1 | 120 |", 1, 1, [(1, 1)] * 3)
+    chart.native = True
+    note = Part("annotation", "> **[Annotation \u2014 Speaker notes, slide 1]**\n> Say it", 1, 1)
+    sections = assemble_sections(
+        [
+            (1, page(block("table", table))),
+            (2, page(block("table", "| 2017 | 402 |", continues=True))),
+        ],
+        {1: [chart, note]},
+    )
+
+    assert sections[0].markdown.split("\n\n") == [
+        "| Year | Rain |\n| --- | --- |\n| 2016 | 210 |\n| 2017 | 402 |",
+        chart.markdown,
+        note.markdown,
+    ]
 
 
 def test_continued_paragraph_joins_previous_paragraph() -> None:
@@ -633,6 +657,7 @@ def reading_of(
                 page_end=d.page_end,
                 markdown=d.markdown,
                 pieces=section_pieces(d, "prose"),
+                continues_table=d.continues_table,
             )
             for i, d in enumerate(drafts, start=1)
         ),
@@ -644,7 +669,6 @@ def reading_of(
             summary="Rainfall.",
             attributes=(),
             terms=(),
-            craft=(),
         ),
         date=date,
         discarded_quotes=0,
@@ -706,30 +730,24 @@ def test_binding_numbers_chunks_and_builds_breadcrumbs_from_bound_facets() -> No
 
 # Observation cards.
 
+
+def shown(ordinal: int, heading: str, markdown: str) -> BatchSection:
+    """A section a batch shows whole, on page `ordinal`."""
+    return BatchSection(ordinal, heading, ordinal, ordinal, markdown, markdown)
+
+
 LOCATION_SECTIONS = (
-    BatchSection(
-        1,
-        "Areas",
-        1,
-        1,
-        "| Layer | File |\n| --- | --- |\n| Dry season | harbour_dry_depth_thresh.tif |",
+    shown(
+        1, "Areas", "| Layer | File |\n| --- | --- |\n| Dry season | harbour_dry_depth_thresh.tif |"
     ),
-    BatchSection(
+    shown(
         2,
         "Rainfall",
-        2,
-        2,
         "> **[Visual \u2014 Page 2: Rainfall chart]**\n> Nine Year Median = 330.9 mm\n"
         "> for 2016\u20132017",
     ),
-    BatchSection(3, "Methods", 3, 3, "The multi-\nbeam survey used `LAT` as the *vertical* datum."),
-    BatchSection(
-        4,
-        "Grid",
-        4,
-        4,
-        "The multi\u2010\nswath run used _LAT_ on a 2 * 3 m grid, file dry_run.tif.",
-    ),
+    shown(3, "Methods", "The multi-\nbeam survey used `LAT` as the *vertical* datum."),
+    shown(4, "Grid", "The multi\u2010\nswath run used _LAT_ on a 2 * 3 m grid, file dry_run.tif."),
 )
 
 
@@ -758,18 +776,17 @@ def test_quotes_are_located_through_markup_case_dashes_and_hyphenation(
     assert locate_quote(quote, LOCATION_SECTIONS) == ordinal
 
 
-def draft(*quotes: str, craft: Sequence[str] = ()) -> ObservationDraft:
+def draft(*quotes: str, attributes: Sequence[str] = ()) -> ObservationDraft:
     return ObservationDraft(
         title="Datum memo",
         doc_date=None,
         deliverable_type="memorandum",
         summary="Datum.",
-        attributes=[],
+        attributes=[StatedAttribute(name="datum", value=q, quote=q) for q in attributes],
         terms=[
             TermDraft(term=q.split()[0], kind="acronym", aliases=[], quote=q, defines=True)
             for q in quotes
         ],
-        craft=[CraftDraft(aspect="convention", statement=q, quote=q) for q in craft],
     )
 
 
@@ -790,7 +807,7 @@ def test_unlocated_quotes_get_one_rerun_that_names_them(tmp_path: Path) -> None:
 
 
 def test_quotes_still_unlocated_after_the_rerun_are_discarded_and_counted(tmp_path: Path) -> None:
-    kept_then_lost = draft(LOCATED, UNLOCATED, craft=["Always state the datum loudly"])
+    kept_then_lost = draft(LOCATED, UNLOCATED, attributes=["Always state the datum loudly"])
     gateway = FakeGateway(observe_script=[kept_then_lost, kept_then_lost])
 
     corpus = compile_corpus(write_files(tmp_path, DATUM_CORPUS), gateway, topic="t", title="T")
@@ -849,6 +866,261 @@ def test_an_oversized_section_is_observed_in_pieces_that_keep_its_ordinal() -> N
     pieces = [s for batch in batches for s in batch if s.ordinal == 2]
     assert len(pieces) >= 3 and " ".join(p.markdown for p in pieces) == long_text
     assert locate_quote("closing note", batches[-1]) == 2
+
+
+def test_a_long_table_is_observed_abridged_while_its_section_keeps_every_row() -> None:
+    rows = "\n".join(f"| R{n} | {n * 7} |" for n in range(1, 5001))
+    markdown = f"# Log\n\nReadings follow.\n\n| Row | Value |\n| --- | --- |\n{rows}\n\nEnd."
+    section = ReadSection(
+        ordinal=1,
+        heading_path="Log",
+        level=1,
+        page_start=1,
+        page_end=1,
+        markdown=markdown,
+        pieces=(),
+    )
+
+    ((shown,),) = observation_batches([section])
+
+    lines = shown.markdown.splitlines()
+    assert lines[4:7] == ["| Row | Value |", "| --- | --- |", "| R1 | 7 |"]
+    assert "| R20 | 140 |" in lines and "| R21 | 147 |" not in lines
+    assert "[... 4975 rows omitted for observation ...]" in lines
+    assert lines[-7:] == [
+        "| R4996 | 34972 |",
+        "| R4997 | 34979 |",
+        "| R4998 | 34986 |",
+        "| R4999 | 34993 |",
+        "| R5000 | 35000 |",
+        "",
+        "End.",
+    ]
+    assert "| R2500 | 17500 |" not in shown.markdown
+
+
+def test_a_sheet_split_over_sections_is_observed_as_one_abridged_table() -> None:
+    book = Workbook()
+    sheet = book.active
+    assert sheet is not None
+    sheet.title = "Log"
+    sheet.append(["Reading", "Depth (m)", "Notes"])
+    for n in range(1, 5001):
+        sheet.append([f"R{n}", n * 7, "logged at the quay"])
+    buffer = io.BytesIO()
+    book.save(buffer)
+    gateway = FakeGateway()
+
+    reading = read_document(
+        SourceFile("log.xlsx", Path("log.xlsx"), "xlsx", 0), buffer.getvalue(), gateway
+    )
+
+    assert len(reading.sections) > 3
+    stored = [
+        line
+        for s in reading.sections
+        for line in s.markdown.splitlines()
+        if re.match(r"\| R\d", line)
+    ]
+    assert stored == [f"| R{n} | {n * 7} | logged at the quay |" for n in range(1, 5001)]
+    (request,) = gateway.of_type(ObserveSections)
+    shown = "\n".join(s.markdown for s in request.sections)
+    rows = [line for line in shown.splitlines() if re.match(r"\| R\d", line)]
+    assert rows == [
+        f"| R{n} | {n * 7} | logged at the quay |" for n in (*range(1, 21), *range(4996, 5001))
+    ]
+    assert shown.count("[... 4975 rows omitted for observation ...]") == 1
+    # The quote location never reads the line of left-out rows.
+    assert locate_quote("4975 rows omitted for observation", request.sections) is None
+
+
+def test_a_table_cut_around_a_page_visual_is_observed_as_one_abridged_table() -> None:
+    def rows(numbers: range) -> str:
+        return "\n".join(f"| R{n} | {n * 7} | logged at the quay |" for n in numbers)
+
+    header = "| Reading | Depth | Notes |\n| --- | --- | --- |\n"
+    visual = VisualTranscript(label="Quay plan", transcript="Gauge positions along the quay.")
+    drafts = assemble_sections(
+        [
+            (
+                1,
+                page(
+                    block("heading", "# Log", level=1),
+                    block("table", header + rows(range(1, 1001))),
+                ),
+            ),
+            (
+                2,
+                page(
+                    block("table", header + rows(range(1001, 2001)), continues=True),
+                    visuals=(visual,),
+                ),
+            ),
+            (3, page(block("table", header + rows(range(2001, 3001)), continues=True))),
+        ]
+    )
+    reading = reading_of(drafts, "Log")
+
+    # The page 2 visual stands between two slices of the table.
+    assert [(d.continues_table, [p.kind for p in d.parts]) for d in drafts] == [
+        (False, ["heading", "table"]),
+        (True, ["table"]),
+        (False, ["visual"]),
+        (True, ["table"]),
+        (True, ["table"]),
+    ]
+    shown = "\n".join(s.markdown for batch in observation_batches(reading.sections) for s in batch)
+    kept = [line for line in shown.splitlines() if re.match(r"\| R\d", line)]
+    assert kept == [
+        f"| R{n} | {n * 7} | logged at the quay |" for n in (*range(1, 21), *range(2996, 3001))
+    ]
+    assert shown.count("[... 2975 rows omitted for observation ...]") == 1
+    assert "Gauge positions along the quay." in shown
+
+
+def test_two_tables_that_share_a_header_in_consecutive_sections_stay_two_tables() -> None:
+    def table(first: int) -> str:
+        body = "\n".join(f"| R{n} | {n} |" for n in range(first, first + 20))
+        return f"| Reading | Value |\n| --- | --- |\n{body}"
+
+    sections = [
+        ReadSection(
+            ordinal=ordinal,
+            heading_path="Log",
+            level=1,
+            page_start=1,
+            page_end=1,
+            markdown=markdown,
+            pieces=(),
+        )
+        for ordinal, markdown in ((1, f"Morning.\n\n{table(1)}"), (2, table(21)))
+    ]
+
+    shown = [s.markdown for batch in observation_batches(sections) for s in batch]
+
+    assert shown == [section.markdown for section in sections]
+
+
+def test_an_aside_cut_over_observation_pieces_stays_an_aside() -> None:
+    notes = "\n".join(f"> Status: draft only, item {n}" for n in range(OBSERVE_BATCH_CHARS // 20))
+    markdown = f"Status: final issue.\n\n> **[Annotation \u2014 Comment by R]**\n{notes}"
+    section = ReadSection(
+        ordinal=1,
+        heading_path="Notes",
+        level=1,
+        page_start=1,
+        page_end=1,
+        markdown=markdown,
+        pieces=(),
+    )
+
+    pieces = [s for batch in observation_batches([section]) for s in batch]
+
+    last = f"Status: draft only, item {OBSERVE_BATCH_CHARS // 20 - 1}"
+    assert len(pieces) >= 2 and last in pieces[-1].markdown
+    assert not pieces[-1].markdown.startswith("> **[Annotation")
+    assert locate_quote(last, pieces[-1:]) == 1
+    assert locate_quote(last, pieces[-1:], outside_asides=True) is None
+    assert locate_quote("Status: final issue.", pieces[-1:], outside_asides=True) == 1
+
+
+def attribute_draft(*quotes: str) -> ObservationDraft:
+    return ObservationDraft(
+        title="Memo",
+        doc_date=None,
+        deliverable_type="memorandum",
+        summary="Memo.",
+        attributes=[StatedAttribute(name="status", value="final", quote=q) for q in quotes],
+        terms=[],
+    )
+
+
+def test_attribute_quotes_are_located_outside_asides_and_carry_their_section() -> None:
+    sections = (
+        shown(1, "Cover", "Reference: HS-2041"),
+        shown(
+            2,
+            "Notes",
+            "Status: Final issue.\n\n> **[Annotation \u2014 Comment by R]**\n> Status: Draft only",
+        ),
+    )
+
+    located = locate_batch(
+        attribute_draft("Status: Final issue."), sections, rerun_of_unlocated=False
+    )
+    in_aside = locate_batch(
+        attribute_draft("Status: Final issue.", "Status: Draft only"),
+        sections,
+        rerun_of_unlocated=False,
+    )
+    only_aside = locate_batch(
+        attribute_draft("Status: Draft only"), sections, rerun_of_unlocated=False
+    )
+    rerun = locate_batch(attribute_draft("Status: Final issue."), sections, rerun_of_unlocated=True)
+
+    # A batch that states attributes and no terms is a complete reading.
+    assert located.rejections == () and located.result is not None
+    assert [(a.name, a.value, a.section_ordinal) for a in located.result.attributes] == [
+        ("status", "final", 2)
+    ]
+    assert in_aside.result is not None and in_aside.result.discarded == 1
+    assert in_aside.rejections == (
+        "quote not found verbatim in the sections: 'Status: Draft only'",
+    )
+    assert only_aside.result is None
+    # After an answer that located nothing, a rerun stating located attributes is accepted.
+    assert rerun.rejections == () and rerun.result is not None
+    assert locate_quote("Status: Draft only", sections) == 2
+
+
+def test_percentages_and_short_values_with_units_are_fidelity_anchors() -> None:
+    native = "1. Cover 60% of the bed\n2 Sensitivity 9.7 pm/°C at 10 mm and 12 % slope\n3 items"
+
+    _, numbers = fidelity_anchors(native)
+    dropped = PageExtraction.model_validate(
+        {
+            "blocks": [
+                {
+                    "kind": "table",
+                    "heading_level": 0,
+                    "continues_from_previous_page": False,
+                    "merges_into_previous_row": False,
+                    "markdown": "| Cover | 60 | % |\n| --- | --- | --- |\n| Pitch | 10 | MM |",
+                }
+            ],
+            "visuals": [],
+        }
+    )
+
+    assert numbers == {"60%", "9.7", "10mm", "12%"}
+    assert missing_anchors(1, dropped, (), numbers) == ["12%", "9.7"]
+
+
+def test_unit_anchors_match_whole_units_whatever_their_spacing_or_micro_sign() -> None:
+    def units(text: str) -> set[str]:
+        return fidelity_anchors(text)[1]
+
+    assert units("10 \u00b5m") == units("10 \u03bcm") == {"10\u03bcm"}
+    assert units("55 dB (A)") == units("55 dB(A)") == {"55db(a)"}
+    assert units("20 \u00b0 C") == units("20 \u00b0C") == {"20\u00b0c"}
+    assert units("-5 \u00b0C at 3 m/s") == {"-5\u00b0c", "3m/s"}
+    # A compound unit is one anchor: `5 kg` and `5 kg/m2` never stand for `5 kg/m3`.
+    assert units("5 kg/m3") == {"5kg/m3"}
+    assert units("5 kg") == {"5kg"} and units("5 kg/m2") == {"5kg/m2"}
+    # A superscript power is the inline one, in a numerator or a denominator.
+    assert units("10 m\u00b2") == units("10 m2") == {"10m2"}
+    assert units("5 kg/m\u00b3") == units("5 kg / m3") == {"5kg/m3"}
+    assert units("7 pm/\u00b0C") == {"7pm/\u00b0c"} and units("10 m/s") == {"10m/s"}
+    # A code that only starts like a unit is no unit anchor, never a cut one.
+    assert units("10 M25 or 5 V12 or 12 T100 or 5 kg/m25") == set()
+    # A slash may be spaced, but only a unit follows it: prose after one is no denominator.
+    assert units("10 m / s") == units("10 m/s") == {"10m/s"}
+    assert units("12 km/h and 3 mm / yr") == {"12km/h", "3mm/yr"}
+    assert units("5 m / all buildings") == {"5m"}
+    # A run of slashes before no denominator is matched in linear time.
+    started = time.monotonic()
+    assert units("10 m/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a!" + " 10 m/" * 20_000) == set()
+    assert time.monotonic() - started < 1
 
 
 def test_a_runaway_heading_is_cut_only_where_it_labels_section_text() -> None:
@@ -1195,7 +1467,7 @@ def test_metadata_dates_come_from_the_original_file_and_never_replace_a_printed_
     assert metadata_date(word, created_only) == "2024-03-04"
     assert metadata_date(word, write_docx(tmp_path / "f.docx", ["Body"]).read_bytes()) is None
     assert metadata_date(source_file("m.md", "md"), b"# Memo") is None
-    with pytest.raises(ConversionError, match=r"d\.docx: cannot read docProps/core\.xml"):
+    with pytest.raises(ConversionError, match=r"d\.docx: cannot read the Office archive"):
         metadata_date(word, b"not a zip archive")
 
     metadata = DocumentDate(iso="2025-06-30", basis="metadata")
@@ -1443,7 +1715,7 @@ def test_an_oversized_visual_is_split_into_transcripts_each_under_its_title() ->
     for text in visuals:
         assert text.startswith("> **[Visual \u2014 Page 3: Map]**\n> legend entry")
         assert all(line.startswith(">") for line in text.splitlines())
-        assert without_visual_transcripts(text) == "" and standing_units(text) == []
+        assert without_asides(text) == "" and standing_units(text) == []
     entries = [line for text in visuals for line in text.splitlines()[1:]]
     assert entries == [f"> legend entry {i}" for i in range(4000)]
 
@@ -1552,6 +1824,28 @@ def test_a_heading_with_little_or_no_room_beside_it_keeps_every_piece_bounded() 
         assert " ".join(paragraphs) == body
 
 
+def test_an_annotation_on_a_split_table_page_follows_the_slice_of_that_page() -> None:
+    header = "| Station | Notes |\n| --- | --- |"
+    pages: list[tuple[int, PageExtraction]] = []
+    for number in range(1, 9):
+        rows = "\n".join(f"| S{number}-{i:02d} | {'x' * 70} |" for i in range(80))
+        table = block("table", f"{header}\n{rows}" if number == 1 else rows, continues=number > 1)
+        pages.append((number, page(table)))
+    note = Part(
+        "annotation", "> **[Annotation \u2014 Comment by R]**\n> Check S1", 1, 1, native=True
+    )
+
+    drafts = assemble_sections(pages, {1: [note]})
+
+    assert len(drafts) >= 2 and all(len(d.markdown) <= MAX_SECTION_CHARS for d in drafts)
+    parts = [p for d in drafts for p in d.parts]
+    at = [p.kind for p in parts].index("annotation")
+    # It follows the slice holding page 1, before the slices of later pages.
+    assert parts[at - 1].kind == "table" and parts[at - 1].page_start == 1
+    assert all(p.kind == "table" and p.page_start > 1 for p in parts[at + 1 :])
+    assert all(d.page_start <= d.page_end for d in drafts)
+
+
 def test_an_oversized_visual_after_a_split_table_is_split_too() -> None:
     header = "| Station | Notes |\n| --- | --- |"
     rows = "\n".join(f"| S{i:04d} | {'x' * 60} |" for i in range(1200))
@@ -1610,7 +1904,7 @@ def test_a_wrapped_cell_keeps_every_escaped_pipe_and_its_row_inside_the_slice() 
 
     tables = [p.markdown for d in drafts for p in d.parts if p.kind == "table"]
     assert len(tables) >= 2 and all(len(d.markdown) <= MAX_SECTION_CHARS for d in drafts)
-    rows = [compiler._cells(row) for text in tables for row in text.splitlines()[2:]]
+    rows = [split_table_cells(row) for text in tables for row in text.splitlines()[2:]]
     # No piece starts with a pipe its backslash was cut from, so every row keeps two columns.
     assert all(len(cells) == 2 for cells in rows)
     assert ["".join(cells[i] for cells in rows) for i in (0, 1)] == [cell, cell]
@@ -1655,7 +1949,7 @@ def test_a_cell_too_narrow_for_an_escaped_pipe_is_cut_as_text() -> None:
     # Rows with one-character cells would cut `\|` from its backslash into a third column.
     pieces = compiler._wrap_row(line, len("|  |  |") + 3)
 
-    assert all(len(compiler._cells(piece)) <= 2 for piece in pieces)
+    assert all(len(split_table_cells(piece)) <= 2 for piece in pieces)
     assert any("a\\|b" in piece for piece in pieces)
 
 
@@ -1666,7 +1960,7 @@ def test_wrapping_a_long_cell_into_narrow_columns_keeps_every_character() -> Non
     rows = compiler._wrap_row(line, MAX_SECTION_CHARS)
 
     assert len(rows) > 1000 and all(len(row) <= MAX_SECTION_CHARS for row in rows)
-    assert " ".join(compiler._cells(row)[0] for row in rows).split() == cell.split()
+    assert " ".join(split_table_cells(row)[0] for row in rows).split() == cell.split()
 
 
 # Furniture and filename anchors.
@@ -1701,15 +1995,37 @@ def test_two_page_furniture_needs_body_pages_matching_edges_and_true_page_number
     assert strip_furniture(wrapped[1], find_furniture(wrapped), 1).startswith("north_\n2024_")
 
 
+def test_a_short_page_line_is_at_one_edge_only() -> None:
+    # A line at the top of two short slides and at the bottom of a third is not furniture.
+    assert find_furniture(["Harbour\nOne", "Harbour\nTwo", "Three\nHarbour"]) == frozenset()
+    assert find_furniture(["Harbour\nOne", "Harbour\nTwo", "Harbour\nThree"]) == {"top\x00harbour"}
+    # A page holding nothing but its number still loses it.
+    assert strip_furniture("7", frozenset(), 6) == ""
+
+
 def test_furniture_is_stripped_from_page_edges_only() -> None:
     pages = [
-        f"CONFIDENTIAL\nSection {n}\nBody {n}\nCONFIDENTIAL\nMore {n}\nEnd {n}\nCONFIDENTIAL"
+        f"CONFIDENTIAL\nSection {n}\nBody {n}\nA {n}\nB {n}\nCONFIDENTIAL\nC {n}\nD {n}\nMore {n}"
+        f"\nEnd {n}\nCONFIDENTIAL"
         for n in ("alpha", "beta", "gamma")
     ]
 
     stripped = strip_furniture(pages[1], find_furniture(pages), 1)
 
-    assert stripped == "Section beta\nBody beta\nCONFIDENTIAL\nMore beta\nEnd beta"
+    assert stripped == (
+        "Section beta\nBody beta\nA beta\nB beta\nCONFIDENTIAL\nC beta\nD beta\nMore beta\nEnd beta"
+    )
+
+
+def test_a_four_line_running_header_and_footer_are_furniture_not_fidelity_anchors() -> None:
+    header = "Harbour Survey Ltd\nReport HS-2041\nIssue 3 of 2025-04-01\nRevision 7.2"
+    footer = "Registered 08812345\nPrinted 2025\nConfidential\nTel 0161 496 0000"
+    pages = [f"{header}\nBody {n} sounding.\nDepth {n}{n}.5 m\n{footer}" for n in (1, 2, 3)]
+
+    furniture = find_furniture(pages)
+    _, numbers = fidelity_anchors(strip_furniture(pages[1], furniture, 1))
+
+    assert numbers == {"22.5"}
 
 
 def test_two_wrapped_filenames_with_one_tail_are_two_anchors_and_hold_their_numbers() -> None:
@@ -1948,7 +2264,6 @@ def test_placeholders_and_consolidation_never_invent_or_drop_a_printed_date() ->
         summary="S.",
         attributes=[],
         terms=[],
-        craft=[],
     )
     section = ReadSection(
         ordinal=1, heading_path="Memo", level=1, page_start=1, page_end=1, markdown="B.", pieces=()

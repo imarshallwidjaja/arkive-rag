@@ -12,7 +12,7 @@
 
 `TopicSnapshot.open` opens each snapshot through a percent-encoded read-only SQLite URI (`?mode=ro`) and verifies that:
 
-- `SCHEMA_VERSION == "6.0"` and every required table is present;
+- `SCHEMA_VERSION == "7.0"` and every required table is present;
 - no foreign key dangles and every facet value has its canonical alias;
 - `corpus_fingerprint`, every glossary citation, the document roles, version families, feedback lessons, and recurring clusters pass validation;
 - the normalised `(N, 1536)` `float32` chunk embedding matrix loads into memory.

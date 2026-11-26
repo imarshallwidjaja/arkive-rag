@@ -39,7 +39,6 @@ from arkive_rag.induction import (
 from arkive_rag.llm import OpenAIGateway, StructuredRequest
 from arkive_rag.models import (
     CanonicalTypeDraft,
-    CraftDraft,
     DocumentRoleDraft,
     FacetDraft,
     FacetValueDraft,
@@ -63,10 +62,11 @@ from arkive_rag.snapshot import write_snapshot
 TEST_BASE_URL = "https://api.openai.test/v1"
 SCRIPTED_EMBEDDING_DIMENSIONS = 8
 # Synthetic documents state what the fake gateway observes in plain lines: `Key: value`
-# attributes, `Convention:` / `Reviewer:` craft lines (a `Reviewer:` line is also a feedback
-# lesson), and `**Term** (alias) means ...` terms.
+# attributes quoting their whole line (`Convention:`, `Reviewer:` and `Caveat:` lines are
+# writing rules, not attributes; a `Reviewer:` line is also a feedback lesson), and
+# `**Term** (alias) means ...` terms.
 _KEY_LINE = re.compile(r"([A-Z][A-Za-z]{1,19}): (\S.*)")
-_CRAFT_KEYS = {"Convention": "convention", "Reviewer": "reviewer_feedback", "Caveat": "caveat"}
+_RULE_KEYS = {"Convention", "Reviewer", "Caveat"}
 _BOLD_TERM = re.compile(r"\*\*([^*]+)\*\*(?: \(([^)]+)\))?")
 _QUOTED = re.compile(r'"([^"]+)"')
 _FOLDER_FACET = re.compile(r"^Folders: (\w+)$", re.MULTILINE)
@@ -247,16 +247,15 @@ class FakeGateway:
     def observe(self, request: ObserveSections) -> ObservationDraft:
         attributes: list[StatedAttribute] = []
         terms: list[TermDraft] = []
-        craft: list[CraftDraft] = []
         prose: list[str] = []
         for section in request.sections:
             for line in section.markdown.splitlines():
                 key = _KEY_LINE.fullmatch(line.strip())
-                if key and key[1] in _CRAFT_KEYS:
-                    aspect = cast(Any, _CRAFT_KEYS[key[1]])
-                    craft.append(CraftDraft(aspect=aspect, statement=key[2], quote=key[2]))
-                elif key:
-                    attributes.append(StatedAttribute(name=key[1].lower(), value=key[2]))
+                if key:
+                    if key[1] not in _RULE_KEYS:
+                        attributes.append(
+                            StatedAttribute(name=key[1].lower(), value=key[2], quote=line.strip())
+                        )
                 elif line.strip() and not line.startswith(("#", "|", ">")):
                     prose.append(line.strip().replace("**", ""))
                 for match in _BOLD_TERM.finditer(line):
@@ -279,7 +278,6 @@ class FakeGateway:
             summary=prose[0] if prose else f"About {title}.",
             attributes=attributes,
             terms=terms,
-            craft=craft,
         )
 
     def organise(self, request: OrganiseCorpus) -> OrganisationDraft:
@@ -465,7 +463,6 @@ def _default_structured(schema_name: str, body: dict[str, Any]) -> BaseModel:
             summary="Bathymetry memo.",
             attributes=[],
             terms=[],
-            craft=[],
         )
     text = body["input"][0]["content"][0]["text"]
     if schema_name == "OrganisationDraft":

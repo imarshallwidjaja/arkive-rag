@@ -51,11 +51,11 @@ from arkive_rag.models import (
     GlossaryEntryDraft,
     GlossarySense,
     GuideDraft,
+    LocatedAttribute,
     NotFoundError,
     OrganisationDraft,
     ReadSection,
     RejectedOutputError,
-    StatedAttribute,
     TermObservation,
     TypeCanonicalisationDraft,
     UnitCluster,
@@ -507,7 +507,7 @@ class DocumentDigest:
     title: str
     summary: str
     # What the document states about itself, such as client or author.
-    attributes: tuple[StatedAttribute, ...]
+    attributes: tuple[LocatedAttribute, ...]
 
     def line(self) -> str:
         stated = "; ".join(f"{a.name}: {a.value}" for a in self.attributes)
@@ -1139,7 +1139,7 @@ def order_predicate(a: str, b: str) -> str:
 
 
 def _sampled_grams(doc: CorpusDocument) -> frozenset[int]:
-    text = "\n".join(_passages.without_visual_transcripts(s.markdown) for s in doc.reading.sections)
+    text = "\n".join(_passages.without_asides(s.markdown) for s in doc.reading.sections)
     # A checksum, not `hash`: the sample decides which pairs reach a prompt and a cache key.
     checksums = (zlib.crc32(" ".join(g).encode()) for g in _passages.shingles(fold_for_quote(text)))
     return frozenset(c for c in checksums if c % VERSION_SHINGLE_SAMPLE == 0)

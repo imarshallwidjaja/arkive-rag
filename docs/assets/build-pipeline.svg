@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 1280 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="build-pipeline-title build-pipeline-desc" id="build-pipeline-root">
         <title id="build-pipeline-title">Arkive Build and Parsing Pipeline</title>
-        <desc id="build-pipeline-desc">Three-pass build architecture covering per-document reading and render caching, bounded corpus induction under a 90,000-character prompt ceiling, and breadcrumb embedding into an atomic schema 6.0 SQLite snapshot.</desc>
+        <desc id="build-pipeline-desc">Three-pass build architecture covering per-document reading and render caching, bounded corpus induction under a 90,000-character prompt ceiling, and breadcrumb embedding into an atomic schema 7.0 SQLite snapshot.</desc>
         <defs>
       <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
       #build-pipeline-root { --color-paper:       #F4F1EA;
@@ -158,7 +158,7 @@
         <rect x="920" y="208" width="316" height="104" rx="6" fill="#F4F1EA"/>
         <rect x="920" y="208" width="316" height="104" rx="6" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.5"/>
         <rect x="928" y="216" width="60" height="12" rx="2" fill="none" stroke="#b03f1b" stroke-opacity="0.45" stroke-width="0.8"/>
-        <text x="958" y="225" fill="#B03F1B" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">SCHEMA 6.0</text>
+        <text x="958" y="225" fill="#B03F1B" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">SCHEMA 7.0</text>
         <text x="1078" y="256" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Portable Read-Only Snapshot</text>
         <text x="1078" y="274" fill="#B03F1B" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">*.arkive.db (mode 0600 · integrity checked)</text>
         <text x="1078" y="292" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">documents · sections · pages · chunks · clusters · lessons</text>

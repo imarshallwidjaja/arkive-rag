@@ -57,12 +57,12 @@ from arkive_rag.models import (
     FeedbackLessonsDraft,
     GlossaryDraft,
     GlossaryEntryDraft,
+    LocatedAttribute,
     ObservationCard,
     OrganisationDraft,
     ReadSection,
     RejectedOutputError,
     SenseDraft,
-    StatedAttribute,
     TermObservation,
     TypeCanonicalisationDraft,
     document_id,
@@ -104,7 +104,7 @@ def reading(
     summary: str = "Memo.",
     date: str | None = None,
     sha256: str | None = None,
-    attributes: Sequence[StatedAttribute] = (),
+    attributes: Sequence[LocatedAttribute] = (),
     headings: Sequence[str] | None = None,
 ) -> DocumentReading:
     """A reading whose source hash, unless given, is that of its text and title: readings that
@@ -134,7 +134,6 @@ def reading(
             summary=summary,
             attributes=tuple(attributes),
             terms=tuple(terms),
-            craft=(),
         ),
         date=None if date is None else DocumentDate(iso=date, basis="printed"),
         discarded_quotes=0,
@@ -453,7 +452,9 @@ def scale_corpus(documents: int = 260, sections: int = 30) -> CorpusView:
                     title=f"{dtype.title()} for client {n % 17} on site {n} " + "about " * 30,
                     deliverable_type=dtype,
                     summary="A summary sentence that runs on and on. " * 12,
-                    attributes=[StatedAttribute(name="client", value=f"Client {n % 17}")],
+                    attributes=[
+                        LocatedAttribute(name="client", value=f"Client {n % 17}", section_ordinal=1)
+                    ],
                     headings=headings,
                 ),
             )
@@ -1169,7 +1170,7 @@ def test_every_induction_request_stays_within_the_prompt_bound_on_its_rerun() ->
             "type " * 40,
             "title " * 40,
             "summary " * 60,
-            (StatedAttribute(name="client", value="client " * 30),),
+            (LocatedAttribute(name="client", value="client " * 30, section_ordinal=1),),
         )
         for n in range(400)
     ]
@@ -1255,7 +1256,8 @@ def test_every_induction_request_stays_within_the_prompt_bound_on_its_rerun() ->
                 [f"Part {k}." for k in range(2_000)],
                 title="title " * 2_000,
                 summary="summary " * 10_000,
-                attributes=[StatedAttribute(name="client", value="c " * 500)] * 300,
+                attributes=[LocatedAttribute(name="client", value="c " * 500, section_ordinal=1)]
+                * 300,
             ),
         )
     ).citable
