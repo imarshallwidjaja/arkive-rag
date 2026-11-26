@@ -1,23 +1,45 @@
 # Architecture
 
-> Authoritative engineering reference. For plain-language guides, technical appendices, and diagrams, start at the [Documentation hub](README.md).
-
-![Arkive RAG system overview](assets/system-overview.svg)
-
-[Open interactive HTML diagram](assets/system-overview.html)
-
 Arkive RAG turns a folder of reference documents into one SQLite file, the
-*snapshot*, and serves one or more snapshots to AI agents over MCP. Building a
-snapshot calls OpenAI models. Reading one needs no network, except that the
-`search` tool embeds each query with the OpenAI embedding model.
+*snapshot*, and serves one or more snapshots to AI agents over MCP. Agents use
+it to answer questions with citations and to draft new deliverables from prior
+exemplars. Building a snapshot calls OpenAI models. Reading one needs no
+network, except that the `search` tool, and `prepare_draft` when a key is set,
+embed their query text with the OpenAI embedding model.
+
+![Arkive RAG system overview: documents are built once into a snapshot that a local server offers to AI assistants](assets/system-overview.svg)
+
+[Open the interactive diagram](assets/system-overview.html)
 
 The build does not assume how a collection is organised. It reads every
-document, induces from the whole corpus the facets an agent can filter by,
-each document's canonical deliverable type and feedback role, version families,
-reviewer lessons, recurring text units and a cited glossary, and stores them in
-the snapshot next to the sections, pages and chunks. An agent drafting a new
-deliverable asks the server for a drafting packet: ranked prior exemplars with
-their text and the factual provenance of that text.
+document, then works out from the whole corpus (the step this page calls
+*induction*) the facets an agent can filter by, each document's canonical
+deliverable type and feedback role, version families, reviewer lessons,
+recurring text units and a cited glossary. It stores them in the snapshot next
+to the sections, pages and chunks. An agent drafting a new deliverable asks
+the server for a drafting packet: ranked prior exemplars with their text and
+the provenance of that text.
+
+This page is the authoritative specification for people who change Arkive. It
+states what each part of the code does, the exact limits and checks, and the
+commands that verify a change. When this page and the code disagree, the code
+wins. For plain-language guides and reference appendices, start at the
+[documentation hub](README.md).
+
+The sections below follow the data:
+
+| Section | Covers |
+| --- | --- |
+| [Modules](#modules) | What each module owns and which way dependencies point. |
+| [Corpus layout](#corpus-layout) | Accepted files, curator notes, document IDs and ordering. |
+| [Build pipeline](#build-pipeline) | [Reading](#reading) each file, corpus-wide [induction](#induction), and [binding](#binding) IDs and embeddings. |
+| [Provider calls](#provider-calls) | Model IDs, retries, the build cache and the spend limit. |
+| [Snapshot file](#snapshot-file) | Every table, the corpus fingerprint and the checks run when a snapshot opens. |
+| [Private corpus and eval versioning](#private-corpus-and-eval-versioning) | Where private documents, packs and snapshots are kept. |
+| [Retrieval](#retrieval) and [Drafting packet](#drafting-packet) | Filters, version scope, ranking, read tools and packet assembly. |
+| [MCP server](#mcp-server) | Tool signatures, error messages, transport safety and server instructions. |
+| [Evaluation](#evaluation), [Example corpora](#example-corpora) and [OpenCode check](#opencode-check) | The eval pack format, the three evaluation layers, the public collections and the live client check. |
+| [Verification](#verification) | The repository's check commands. |
 
 ## Modules
 
@@ -1744,7 +1766,12 @@ page returned it. The chart value is also in
 the page's visual summary, which `view_page` returns as text, so a correct
 answer alone does not prove that the model read the image.
 
-The README states what a pass proves. `tests/test_opencode_check.py` covers the
+A passing scenario shows that OpenCode, with the named model, connected to
+`arkive-rag serve`, completed the required Arkive tool calls with the expected
+arguments on the expected topics, received every Arkive result uncut, called
+no other tool, and wrote an answer that meets the scenario's phrase and
+passage checks. It does not show that the model read a page image (above), and
+its token and cost totals are lower bounds. `tests/test_opencode_check.py` covers the
 scenario file, event parsing, every kind of check failure, the container
 command, the runner's input refusals, output links, key redaction and container
 removal (including an interrupt) offline, with a fake Docker and no key.

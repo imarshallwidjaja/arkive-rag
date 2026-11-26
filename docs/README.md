@@ -1,47 +1,47 @@
 # Arkive RAG documentation
 
-Arkive RAG turns a curated folder of `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html`/`.htm`, and `.md` reference documents into one portable, read-only knowledge file (`*.arkive.db`). AI assistants read that file over MCP to answer questions with citations and to draft new work from past examples.
+Arkive RAG turns a folder of PDF (`.pdf`), Word (`.docx`), PowerPoint (`.pptx`), Excel (`.xlsx`), HTML (`.html`, `.htm`) and Markdown (`.md`) reference documents into one portable, read-only knowledge file. AI assistants connect to that file through a local server to answer questions with citations and to draft new work from past examples.
 
-![Arkive RAG system overview](assets/system-overview.svg)
+![Arkive RAG system overview: documents are built once into a knowledge file that a local server offers to AI assistants](assets/system-overview.svg)
 
 [Open the interactive diagram](assets/system-overview.html)
 
-## Guides (start here)
+## Guides
 
-Short plain-language reads for product, technical, and team leads.
+Start here if you are deciding whether to use Arkive, running it for a team, or reading its results.
 
-| Guide | Covers |
+| Guide | Read it to learn |
 | --- | --- |
-| [What Arkive does and how a team uses it](overview.md) | The problem with raw folders, how a team curates a collection, the two everyday workflows, and a worked example. |
-| [How folders become searchable knowledge](how-it-works.md) | What the build does to each document and how the server gives assistants bounded, read-only access. |
-| [Data boundaries, security, and cost](security-privacy-and-cost.md) | What is sent to OpenAI and when, file and network safeguards, spending limits, and measured costs. |
-| [Evidence, benchmarks, and known limits](results-and-limits.md) | How Arkive was tested, the main results, and where it does not help. |
+| [Arkive overview and team workflows](overview.md) | Why a raw folder is hard for an assistant to use, how a team prepares a collection, the two everyday workflows, and a worked example. |
+| [Building and serving a snapshot](how-it-works.md) | What the build does to each document, and what the server lets an assistant do. |
+| [Data boundaries, security, and cost](security-privacy-and-cost.md) | What is sent to OpenAI and when, the file and network safeguards, spending limits, and measured costs. |
+| [Test results and known limits](results-and-limits.md) | How Arkive was tested, what the tests found, and where Arkive does not help. |
 
-## Technical appendices and reference
+## Reference
 
-Engineering detail, full benchmark tables, and the contributor specification.
+These pages give exact limits, settings, full result tables and the maintainer specification.
 
 | Document | Covers |
 | --- | --- |
-| [Appendix A: Parsing, induction, and build pipeline](appendices/build-and-parsing.md) | How each file format is read, the three build passes, limits, caching, snapshot contents, build model calls, and a worked example. |
-| [Appendix B: MCP tools, drafting packet, and cost scaling](appendices/mcp-tools-and-drafting.md) | All eleven tools and their bounds, hybrid search, `prepare_draft` packing, model prices, and scaling. |
-| [Appendix C: Evaluation harness and full benchmark tables](appendices/evaluation-benchmarks.md) | The evaluation layers, the four collections, the schema `7.0` uplift benchmarks beside the schema `6.0` baseline, and the commands to run it. |
-| [Architecture and verification reference](architecture.md) | Modules, schema invariants, validation, error handling, and repository verification gates. |
+| [Appendix A: Build reference](appendices/build-and-parsing.md) | How each file format is read, how the collection is organised, size limits, caching, what the knowledge file stores, model calls during a build, and a worked example. |
+| [Appendix B: Server tools and drafting reference](appendices/mcp-tools-and-drafting.md) | Every assistant tool and its limits, how search ranks results, how the drafting packet is assembled, model prices, and how cost grows. |
+| [Appendix C: Evaluation method and full results](appendices/evaluation-benchmarks.md) | The test collections, the four kinds of test, every result for the current and previous versions, and the commands to rerun the tests tracked in this repository. Some results come from collections and runs kept outside Git, which the appendix names. |
+| [Architecture and verification reference](architecture.md) | The authoritative specification for maintainers: code modules, stored data and its checks, error handling, and the repository's verification commands. |
 
-## Visual assets
+## Diagrams
 
-Diagrams in `assets/` ship as an `.svg` for embedding and a self-contained interactive `.html` page:
+Each diagram has an interactive page and an SVG copy for embedding:
 
 - [System overview](assets/system-overview.html) ([SVG](assets/system-overview.svg))
 - [Team workflow](assets/team-workflow.html) ([SVG](assets/team-workflow.svg))
 - [Data and trust boundaries](assets/data-and-trust-boundaries.html) ([SVG](assets/data-and-trust-boundaries.svg))
-- [Benchmark highlights](assets/benchmark-highlights.html) ([SVG](assets/benchmark-highlights.svg))
-- [Build and parsing pipeline](assets/build-pipeline.html) ([SVG](assets/build-pipeline.svg))
-- [MCP serving and drafting packet](assets/mcp-serving-and-drafting.html) ([SVG](assets/mcp-serving-and-drafting.svg))
+- [Previous-version benchmark highlights](assets/benchmark-highlights.html) ([SVG](assets/benchmark-highlights.svg))
+- [Build pipeline](assets/build-pipeline.html) ([SVG](assets/build-pipeline.svg))
+- [Server tools and drafting packet](assets/mcp-serving-and-drafting.html) ([SVG](assets/mcp-serving-and-drafting.svg))
 - [Evaluation harness](assets/evaluation-harness.html) ([SVG](assets/evaluation-harness.svg))
 
-Three illustrations show the concepts: [the folder-to-snapshot model](assets/arkive-concept-hero.png), [the two workflows](assets/mcp-workflows-concept.png), and [the data boundary](assets/privacy-vault-concept.png).
+Three illustrations show the main ideas: [a folder becoming one knowledge file](assets/arkive-concept-hero.png), [the two workflows](assets/mcp-workflows-concept.png), and [the data boundary](assets/privacy-vault-concept.png).
 
-## Privacy boundary
+## Example data
 
-Every example, document ID, excerpt, and result table in these docs comes from fictional documents: the four collections tracked in `evals/example_corpora/`, and three synthetic stress collections that [Appendix C](appendices/evaluation-benchmarks.md#schema-70-uplift-benchmarks) describes and that are kept outside Git. No client documents, personal data, or private benchmark results appear in this repository.
+Every example, document ID, excerpt and result table in these pages comes from fictional documents. Four collections are tracked in `evals/example_corpora/`. Three synthetic stress collections, described in [Appendix C](appendices/evaluation-benchmarks.md#test-collections), are kept outside Git. The repository holds no client documents, personal data or private benchmark results.

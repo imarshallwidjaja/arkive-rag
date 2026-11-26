@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 960 536" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="evaluation-harness-title evaluation-harness-desc" id="evaluation-harness-root">
         <title id="evaluation-harness-title">Arkive Evaluation Harness</title>
-        <desc id="evaluation-harness-desc">Evaluation architecture showing how an eval pack, snapshot, and raw corpus pass through preflight validation into retrieval ablation, grounded Q&amp;A, five-arm holdout drafting, and containerized OpenCode acceptance checks before writing atomic private reports.</desc>
+        <desc id="evaluation-harness-desc">Evaluation architecture showing how an eval pack, snapshot, and raw corpus pass through preflight validation into a search ranking comparison, grounded Q&amp;A, drafting tests that rewrite a held-out document with five approaches, and containerized OpenCode acceptance checks before writing atomic private reports.</desc>
         <defs>
       <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
       #evaluation-harness-root { --color-paper:       #F4F1EA;
@@ -99,8 +99,8 @@
         <rect x="296" y="64" width="368" height="64" rx="6" fill="#F4F1EA" stroke="#1D232A" stroke-width="1"/>
         <rect x="304" y="72" width="24" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
         <text x="316" y="81" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">L1</text>
-        <text x="480" y="96" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 1 · Retrieval Ablation</text>
-        <text x="480" y="114" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">bm25 · dense · hybrid_rrf · served_search · Completion@k</text>
+        <text x="480" y="96" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 1 · Search Ranking Comparison</text>
+        <text x="480" y="114" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">keyword · meaning · combined · served search · Completion@k</text>
 
         <!-- 5. Layer 2 -->
         <rect x="296" y="152" width="368" height="64" rx="6" fill="#F4F1EA"/>
@@ -108,16 +108,16 @@
         <rect x="304" y="160" width="24" height="12" rx="2" fill="none" stroke="#1d232a" stroke-opacity="0.35" stroke-width="0.8"/>
         <text x="316" y="169" fill="#47525E" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">L2</text>
         <text x="480" y="184" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 2 · Grounded Q&amp;A</text>
-        <text x="480" y="202" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">raw_files vs arkive_mcp · anchored claim-level judge</text>
+        <text x="480" y="202" fill="#47525E" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">raw files vs Arkive · anchored claim-level judge</text>
 
         <!-- 6. Layer 3 (FOCAL ACCENT) -->
         <rect x="296" y="240" width="368" height="80" rx="6" fill="#F4F1EA"/>
         <rect x="296" y="240" width="368" height="80" rx="6" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.5"/>
         <rect x="304" y="248" width="24" height="12" rx="2" fill="none" stroke="#b03f1b" stroke-opacity="0.45" stroke-width="0.8"/>
         <text x="316" y="257" fill="#B03F1B" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">L3</text>
-        <text x="480" y="276" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 3 · 5-Arm Holdout Drafting</text>
-        <text x="480" y="294" fill="#B03F1B" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">zero · chunk · raw · mcp · oracle (5 rounds each)</text>
-        <text x="480" y="308" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">house recall · contamination · rubric · blind judge</text>
+        <text x="480" y="276" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Layer 3 · Rewriting a Held-Out Document</text>
+        <text x="480" y="294" fill="#B03F1B" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">no tools · chunk search · raw files · Arkive · pasted · 5 rounds</text>
+        <text x="480" y="308" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">house wording · other-document wording · rubric · blind judge</text>
 
         <!-- 7. OpenCode Container Check -->
         <rect x="296" y="344" width="368" height="68" rx="6" fill="#F4F1EA"/>
@@ -141,7 +141,7 @@
         <text x="24" y="492" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">LEGEND</text>
 
         <rect x="108" y="482" width="14" height="12" rx="3" fill="#b03f1b" fill-opacity="0.08" stroke="#B03F1B" stroke-width="1.2"/>
-        <text x="130" y="492" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Focal drafting benchmark</text>
+        <text x="130" y="492" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Drafting test (focal)</text>
 
         <rect x="316" y="482" width="14" height="12" rx="3" fill="#1b5e63" fill-opacity="0.06" stroke="#1B5E63" stroke-width="1"/>
         <text x="338" y="492" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Containerised client check</text>

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Arkive RAG Schema 6.0 Baseline Benchmark Highlights</title>
+  <title>Previous Version (Schema 6.0) Benchmark Highlights</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -55,18 +55,18 @@
 </head>
 <body>
   <div class="frame">
-    <h1>Schema 6.0 baseline: fewer tokens on a 126-file archive, and no borrowed policy in drafts</h1>
+    <h1>Previous version (schema 6.0): fewer tokens on a 126-file archive, and no borrowed policy in drafts</h1>
 
     <div class="diagram-container">
       <svg viewBox="0 0 960 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="benchmark-highlights-title benchmark-highlights-desc">
-        <title id="benchmark-highlights-title">Arkive RAG Schema 6.0 Baseline Benchmark Highlights</title>
-        <desc id="benchmark-highlights-desc">Historical schema 6.0 baseline, superseded by the schema 7.0 results in the documentation. On the public 126-file structural monitoring archive, Arkive MCP used 77,215 input tokens for grounded Q&amp;A against 134,043 for raw file tools, and 179,051 for a 52-page report holdout against 287,143 for raw files and 540,990 for full-context examples; on the acoustic noise report holdout it scored a median 10 of 10 for discipline against 4 of 10 for full-context examples, which copied an unrelated six-year policy.</desc>
+        <title id="benchmark-highlights-title">Previous Version (Schema 6.0) Benchmark Highlights</title>
+        <desc id="benchmark-highlights-desc">Results from the previous version (schema 6.0), kept as the baseline for the current results in the documentation. On the public 126-file structural monitoring archive, Arkive used 77,215 input tokens for grounded Q&amp;A against 134,043 for raw file tools, and 179,051 for a 52-page report holdout against 287,143 for raw files and 540,990 for pasted examples; on the acoustic noise report holdout it scored a median 10 of 10 for discipline against 4 of 10 for pasted examples, which copied an unrelated six-year policy.</desc>
 
         <rect width="100%" height="100%" fill="#F4F1EA"/>
 
         <!-- ===== SECTION A: input tokens, one shared scale (x = 200 + tokens / 1000) ===== -->
         <text x="24" y="36" fill="#4F5B66" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">A · INPUT TOKENS ON THE 126-FILE ARCHIVE · LOWER IS BETTER</text>
-        <text x="936" y="36" fill="#B03F1B" font-size="8" font-weight="600" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end" letter-spacing="0.14em">SCHEMA 6.0 BASELINE</text>
+        <text x="936" y="36" fill="#B03F1B" font-size="8" font-weight="600" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end" letter-spacing="0.14em">PREVIOUS VERSION · SCHEMA 6.0</text>
 
         <!-- zero line and axis -->
         <line x1="200" y1="52" x2="200" y2="256" stroke="rgba(29,35,42,0.25)" stroke-width="1"/>
@@ -90,7 +90,7 @@
         <text x="184" y="94" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="end">Grounded Q&amp;A</text>
         <text x="184" y="108" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">8 questions</text>
 
-        <text x="200" y="68" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600" fill="#B03F1B">Arkive MCP</tspan>  77,215 · -42% · 8/8 phrase coverage · 2/2 draft-conflict cases</text>
+        <text x="200" y="68" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600" fill="#B03F1B">Arkive</tspan>  77,215 · -42% · 8/8 phrase coverage · 2/2 draft-conflict cases</text>
         <rect x="200" y="74" width="77.215" height="14" fill="rgba(176,63,27,0.12)" stroke="#B03F1B" stroke-width="1"/>
 
         <text x="200" y="104" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600">Raw file tools</tspan>  134,043 · 6/8 phrase coverage · 0/2 draft-conflict cases</text>
@@ -100,13 +100,13 @@
         <text x="184" y="194" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="end">Long-report drafting</text>
         <text x="184" y="208" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">52-page holdout · 5 rounds</text>
 
-        <text x="200" y="156" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600" fill="#B03F1B">Arkive MCP</tspan>  179,051 · -38% vs raw · -67% vs full · 0/5 judge wins · 0.66 house recall</text>
+        <text x="200" y="156" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600" fill="#B03F1B">Arkive</tspan>  179,051 · -38% vs raw · -67% vs pasted · 0/5 judge wins · 0.66 house recall</text>
         <rect x="200" y="162" width="179.051" height="14" fill="rgba(176,63,27,0.12)" stroke="#B03F1B" stroke-width="1"/>
 
         <text x="200" y="192" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600">Raw file tools</tspan>  287,143 · 0/5 judge wins · 0.38 house recall</text>
         <rect x="200" y="198" width="287.143" height="14" fill="rgba(71,82,94,0.15)" stroke="#47525E" stroke-width="1"/>
 
-        <text x="200" y="228" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600">Full-context examples</tspan>  540,990 · 5/5 judge wins · 0.98 house recall</text>
+        <text x="200" y="228" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600">Pasted examples</tspan>  540,990 · 5/5 judge wins · 0.98 house recall</text>
         <rect x="200" y="234" width="540.99" height="14" fill="rgba(71,82,94,0.15)" stroke="#47525E" stroke-width="1"/>
 
         <!-- Section divider -->
@@ -133,10 +133,10 @@
         <text x="184" y="394" fill="#1D232A" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="end">Noise report draft</text>
         <text x="184" y="408" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">acoustic holdout · 5 rounds</text>
 
-        <text x="200" y="372" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600" fill="#1B5E63">Arkive MCP</tspan>  10 / 10 · 5/5 blind-judge wins · 0.7% copied text</text>
+        <text x="200" y="372" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600" fill="#1B5E63">Arkive</tspan>  10 / 10 · 5/5 blind-judge wins · 0.7% copied text</text>
         <rect x="200" y="378" width="600" height="14" fill="rgba(27,94,99,0.12)" stroke="#1B5E63" stroke-width="1"/>
 
-        <text x="200" y="408" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600">Full-context examples</tspan>  4 / 10 · 0/5 wins · 7.6% copied text · copied an unrelated six-year policy</text>
+        <text x="200" y="408" fill="#1D232A" font-size="9" font-family="'Geist Mono', ui-monospace, monospace"><tspan font-family="'Geist', system-ui, sans-serif" font-weight="600">Pasted examples</tspan>  4 / 10 · 0/5 wins · 7.6% copied text · copied an unrelated six-year policy</text>
         <rect x="200" y="414" width="240" height="14" fill="rgba(71,82,94,0.15)" stroke="#47525E" stroke-width="1"/>
 
         <!-- LEGEND STRIP (bottom) -->
@@ -145,12 +145,12 @@
 
         <rect x="96" y="510" width="14" height="12" fill="rgba(176,63,27,0.12)" stroke="#B03F1B" stroke-width="1"/>
         <rect x="114" y="510" width="14" height="12" fill="rgba(27,94,99,0.12)" stroke="#1B5E63" stroke-width="1"/>
-        <text x="136" y="520" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Arkive MCP (tokens / discipline)</text>
+        <text x="136" y="520" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Arkive (tokens / discipline)</text>
 
         <rect x="340" y="510" width="14" height="12" fill="rgba(71,82,94,0.15)" stroke="#47525E" stroke-width="1"/>
         <text x="362" y="520" fill="#1D232A" font-size="9" font-family="'Geist', system-ui, sans-serif">Comparison approach</text>
 
-        <text x="936" y="520" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">Public example corpora · docs/appendices/evaluation-benchmarks.md</text>
+        <text x="936" y="520" fill="#47525E" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">Fictional example collections · full data in Appendix C</text>
       </svg>
     </div>
   </div>

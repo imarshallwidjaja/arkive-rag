@@ -1,116 +1,152 @@
-# Appendix A: Parsing, induction, and build pipeline
+# Appendix A: Build reference
 
-> Technical appendix. For the plain-language summary, read [How folders become searchable knowledge](../how-it-works.md). The authoritative specification is in [Reading](../architecture.md#reading), [Induction](../architecture.md#induction), and [Snapshot file](../architecture.md#snapshot-file).
+This appendix gives the exact steps, limits and caching rules of `arkive-rag build`. [Building and serving a snapshot](../how-it-works.md) is the plain-language summary. Maintainers will find the authoritative specification, with the code that implements each step, in the architecture reference under [Reading](../architecture.md#reading), [Induction](../architecture.md#induction) and [Snapshot file](../architecture.md#snapshot-file).
 
-`arkive-rag build` turns a folder of `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html`, and `.md` documents into one read-only SQLite snapshot (`*.arkive.db`, schema `7.0`). The compiler assumes no folder hierarchy, domain vocabulary, or heading convention: a flat folder of Word and PDF files goes through the same three passes as a 126-file multi-client archive.
+The build turns a folder of PDF (`.pdf`), Word (`.docx`), PowerPoint (`.pptx`), Excel (`.xlsx`), HTML (`.html`, `.htm`) and Markdown (`.md`) files into one read-only SQLite file, the snapshot (`*.arkive.db`). It assumes no folder hierarchy, vocabulary or heading convention: a flat folder of Word and PDF files goes through the same steps as a 126-file archive spread over many clients. The build runs in three passes:
 
-`compile_corpus` in `src/arkive_rag/compiler.py` runs the passes in order: per-document reading, corpus induction, and binding with embeddings.
+1. **Reading** each document on its own.
+2. **Organising** the whole collection: filters, document types, versions, lessons, glossary and guide. The architecture reference calls this pass induction.
+3. **Storing** the result: final IDs, search vectors and the snapshot file.
 
-![Arkive three-pass build and parsing pipeline](../assets/build-pipeline.svg)
+![The three build passes: reading each file, organising the collection, and storing the snapshot](../assets/build-pipeline.svg)
 
 [Open the interactive diagram](../assets/build-pipeline.html)
 
-## Pass 1: per-document reading (`compiler.py`)
+## Reading each document
 
-`read_document` processes each source file independently in a thread pool and produces a `DocumentReading` that depends only on the file's bytes and format. The relative path is carried only for diagnostics.
+Reading runs on several files at once (four by default, set with `--max-concurrency`). The result for a file depends only on its bytes and format, so cached results stay valid when other files are added, moved or removed.
 
-### Discovery, path-hash IDs, and document dates
+### Allowed files, document IDs and dates
 
-`discover_corpus` walks the corpus in sorted POSIX relative-path order, rejects symlinks and unsupported file extensions before any model call, and hashes each file's bytes with SHA-256.
+The build walks the folder in sorted path order and hashes each file's bytes. Before any model call, it stops on a symbolic link or on any file whose extension is not in the list above, including legacy `.doc`, `.ppt` and `.xls` files. Files and folders whose names start with `.` are skipped.
 
-- **Stable document IDs.** `document_id(rel_path)` hashes the NFC-normalised POSIX path to `doc_<10hex>`. For example, `q102-oskary-quarry/q102-technical-memorandum.pdf` in `coastal-survey-projects` becomes `doc_cc01ac49e1`. Adding or moving another file never renumbers existing documents. SQLite queries keep the sorted-path order through an `ordinal` column.
-- **Document dates.** Arkive stores a validated `DocumentDate` (`iso` and `basis`). A printed date comes from the document's observed text (`basis: "printed"`). When a file has no printed date, the compiler reads embedded PDF metadata (`/CreationDate`, `/ModDate`) or Office `docProps/core.xml` properties (`basis: "metadata"`). In the flat `acoustic-consultancy-files` collection, which has no printed dates and no folders, `corvane-depot-night-noise-report.pdf` (`doc_d81e70766d`) receives `iso="2025-06-30", basis="metadata"`.
-- **Curator notes.** Every `AGENTS.md` file in the corpus is marked `is_curator_note = True` and read directly, without a model call. Curator notes steer induction and appear in `get_topic_guide` and `prepare_draft`. The induced guide, glossary, and feedback lessons never cite them.
+- **Document IDs.** Each document's ID is derived from its path inside the folder, as `doc_` and ten hexadecimal digits. For example, `q102-oskary-quarry/q102-technical-memorandum.pdf` in `coastal-survey-projects` becomes `doc_cc01ac49e1`. Adding or moving another file never changes an existing document's ID. Sections and chunks get IDs built on the document ID, such as `doc_cc01ac49e1_sec_001`.
+- **Document dates.** A date printed in the document wins. When a document prints no date, Arkive uses the creation or modification date stored in the PDF or Office file, and records that the date came from file metadata. In the flat `acoustic-consultancy-files` collection, which has no printed dates and no folders, `corvane-depot-night-noise-report.pdf` gets the metadata date 2025-06-30.
+- **`AGENTS.md` notes.** Every `AGENTS.md` file in the folder is a curator note. It is read directly without a model call, guides how the collection is organised, and is returned with the collection guide and in drafting packets. The generated guide, glossary and reviewer lessons never cite a note.
 
-### Office conversion, rendering, and the render cache
+### Word, PowerPoint and PDF files
 
-`convert_office_to_pdf` converts `.docx` and `.pptx` files to PDF in an isolated headless LibreOffice (`soffice`) temporary directory. Checkboxes, floating text boxes, embedded charts, and slide layouts then follow the same page pipeline as native PDFs.
+Word and PowerPoint files are converted to PDF in an isolated, headless LibreOffice. Checkboxes, floating text boxes, embedded charts and slide layouts then go through the same page steps as native PDFs.
 
-Before any part of an Office archive (`.docx`, `.pptx`, `.xlsx`) reaches LibreOffice, Docling, or openpyxl, `open_office_archive` in `native_formats.py` inflates every member in 64 KiB steps and refuses an archive that is not a readable zip file, declares more than 5,000 entries (`MAX_OFFICE_ARCHIVE_ENTRIES`), holds an encrypted member or one whose inflated size or CRC differs from its directory entry, or inflates to more than 100,000,000 bytes (`MAX_OFFICE_ARCHIVE_BYTES`).
+Before LibreOffice or any parser sees a Word, PowerPoint or Excel file, Arkive unpacks the file's archive in 64 KiB steps and refuses it when:
 
-A Word file is converted from an accepted-revision copy (`accepted_revision_copy`): deleted and moved-away runs are removed and inserted runs kept, because LibreOffice otherwise draws a deletion and its replacement into one PDF text run. The original bytes stay the document's SHA-256 and metadata source. `page_supplements` in `compiler.py` then adds what the file's own XML holds as quoted `[Annotation — ...]` blocks on the page that holds the marked text: each Word tracked insertion and deletion (with author and date) and each comment, and each shown PowerPoint slide's speaker notes and comments. A PowerPoint slide's native chart series become a Markdown table under a `Chart: <title>` line. Hidden slides are skipped, as LibreOffice skips them. Annotations are their own `annotation` chunks, and an observed document attribute never counts a quote found only inside an annotation or visual transcript.
+- it is not a readable zip archive;
+- it declares more than 5,000 entries;
+- an entry is encrypted, or its unpacked size or checksum differs from what the archive declares;
+- it would unpack to more than 100,000,000 bytes.
+
+A Word file is converted from a copy with its tracked changes accepted: deleted text is removed and inserted text kept. Without this step, LibreOffice draws a deletion and its replacement as one run of text. The original file still supplies the document's hash and metadata date.
+
+Arkive then adds content from the file's own structure to the page that holds the marked text, as quoted `[Annotation — ...]` blocks:
+
+- each Word tracked insertion and deletion, with author and date, and each Word comment;
+- each shown PowerPoint slide's speaker notes and comments.
+
+A PowerPoint slide's native chart becomes a table under a `Chart: <title>` line. Hidden slides are skipped, as LibreOffice skips them. Annotations are stored as their own search chunks. A fact the document states about itself never counts when its quote appears only in an annotation or a chart description.
+
+Each PDF page is rendered at twice its size as a WebP image, with its longest side capped at 4,096 pixels, and its text layer is extracted. With `--cache`, rendered pages and metadata dates are stored by the hash of the source file, so rebuilding an unchanged folder renders no pages and opens neither LibreOffice nor the PDF renderer.
 
 ### Excel workbooks and HTML pages
 
-`.xlsx`, `.html`, and `.htm` files have no pages. `xlsx_markdown` and `html_markdown` read them from an in-memory stream through Docling's spreadsheet and HTML backends. The dependency is `docling-slim` with only its `format-xlsx` and `format-html` extras, so no PyTorch is installed and serving never loads Docling.
+Excel and HTML files have no pages. Arkive reads them from memory with Docling's spreadsheet and HTML readers. The build installs only those two Docling readers, so no machine-learning framework such as PyTorch is installed, and serving never loads Docling.
 
-- **Workbooks.** Each worksheet becomes a level-1 heading, and each data region a `Range A2:D5` line and a GFM table. A merged multi-row header is flattened into one row (`Group — Column (Unit)`). A formula saved without a computed value shows its formula (`=B4+C4`). Cell notes and Excel 365 threaded comments with their replies follow the sheet's tables as annotations. A workbook with more than 250,000 populated cells (`MAX_WORKBOOK_CELLS`, counted while streaming each sheet) is refused with `ConversionError` instead of being cut. A legacy `.xls` file stops the build as an unsupported format.
-- **HTML pages.** Every image fetch, remote or local, is off, as are page rendering and furniture inference, so text before the first heading stays body text. Headings, paragraphs, lists, code blocks, and tables follow in document order. Images and their alt text are left out.
+- **Workbooks.** Each worksheet becomes a top-level heading, and each block of data a `Range A2:D5` line followed by a table. A header merged over several rows is flattened into one row (`Group — Column (Unit)`). A formula saved without a computed value shows the formula itself (`=B4+C4`). Cell notes and threaded comments, with their replies, follow the sheet's tables as annotations. A workbook with more than 250,000 populated cells is refused, so it is never silently cut short.
+- **HTML pages.** Arkive fetches no image, remote or local, and does not render the page. Text before the first heading stays body text. Headings, paragraphs, lists, code blocks and tables follow in document order. Images and their alt text are left out.
 
-Their Markdown is split into sections by `parse_markdown_blocks` like a `.md` file, and each section spans page 1. They have no page images for `view_page`.
+Their text is split into sections the same way as a Markdown file, and each section counts as page 1. They have no page images to view.
 
-`render_pdf` uses `pypdfium2` to extract each page's Unicode native text layer and render a 2x WebP image (`webp_bytes`, longest side clamped to `MAX_RENDER_SIDE_PX = 4096`). With `--cache`, `BuildCache` stores rendered pages and metadata dates in SQLite (`page_render_cache` and `page_render_meta`) keyed by source SHA-256, and checks the cache before invoking LibreOffice or `pypdfium2`. Rebuilding an unchanged corpus renders zero pages.
+### Page transcription and checks
 
-### Vision transcription, fidelity checks, and section stitching
+For each rendered page, `gpt-6.1-sol` at low reasoning effort receives the page image, the page's text layer, and the last 1,200 characters transcribed from the previous page. It returns headings, paragraphs, tables and lists, plus separate descriptions of charts, maps and diagrams. The request asks the model to transcribe values that exist only inside a chart image into that description.
 
-For each rendered page, `transcribe_with_fidelity` sends `gpt-6.1-sol` (low reasoning effort) three inputs: the 2x WebP page image, the native text layer, and the last 1,200 characters (`PREV_CONTEXT_CHARS`) of the preceding page's transcribed blocks, excluding visual transcripts. The model returns structured blocks (headings, paragraphs, tables, lists) and separate `VisualTranscript` blocks for charts, maps, and diagrams. A value that exists only inside a chart image enters a `VisualTranscript`.
+Two checks guard each page:
 
-Two mechanical checks guard transcription:
+1. **Numbers and filenames survive.** Arkive collects numbers, measurements and data filenames from the page's text layer and checks that the transcript keeps them. When the transcript misses any filename, or misses more than a small share of the numbers, Arkive transcribes the page once more at high effort and names the missing values in the request. [Reading](../architecture.md#reading) gives the exact thresholds. If the retry still misses a filename or too many numbers, the build stops with an error that names the file, page and missing values. When a retry changes the end of a page's transcript, the next page is transcribed again, and this stops at the first page whose ending is unchanged.
+2. **Sections and tables join across pages.** Arkive builds sections from the headings, each with its heading path and page range. A paragraph or table that continues across a page break is joined to its first part. A table row cut in the middle of a cell is rejoined cell by cell, and each row remembers the pages it came from.
 
-1. **Numeric and filename fidelity.** The compiler extracts anchor tokens (numbers, measurements, filenames) from the native text layer and checks that they survive transcription. When a page drops anchors or shows ligature corruption, Arkive retries it once at high reasoning effort. When the retry changes the page's trailing 1,200-character tail, page `N + 1` is transcribed again. Propagation stops as soon as a tail is unchanged.
-2. **Cross-page section and table stitching.** `assemble_sections` builds Markdown sections with hierarchical `heading_path` strings and `page_start..page_end` spans. A paragraph or table that continues across a page break (`continues_from_previous_page=True`) is joined onto the previous part. A table row split mid-cell (`merges_into_previous_row=True`) has its cells joined column by column, and each row keeps the pages it came from.
+A section longer than 32,000 characters is split into consecutive sections with the same heading path, cut between paragraphs, tables and other blocks. A single block too large for one section is sliced: a table on row boundaries with its header rows repeated, a chart description or annotation at line breaks with its title repeated on each slice, and a code block closed at the end of one slice and reopened at the start of the next. Each section is then cut into search chunks of up to 6,000 characters, of five kinds: prose, table, chart description, annotation and curator note. The section itself stays whole for reading.
 
-Sections longer than `MAX_SECTION_CHARS = 32_000` split at paragraph or table boundaries, never inside fenced code blocks or visual transcripts. `section_pieces` then splits each section into `prose`, `table`, `visual`, `annotation`, or `guidance` chunk pieces of at most `MAX_CHUNK_CHARS = 6_000`. The section itself stays whole for reading.
+### Document records
 
-### Per-document observation cards
+`gpt-6.1-sol` at low effort reads each document's sections, in batches for a long document, and records:
 
-`ObserveSections` asks `gpt-6.1-sol` (low effort; batched over long documents with one consolidation request) for an observation card per citable document: title, printed date, proposed deliverable type, summary, the attributes the document states about itself, and the terms it uses. Every quoted term or attribute is matched back to a section through `fold_for_quote`. Unlocated quotes get one rerun that names them, then are discarded and counted in `build_report.discarded_unlocated_quotes`. Each located attribute (such as `reference`, `client`, `site`, `status`, `author`, or `instruments`) is stored in `document_attributes` with the section that states it; a quote found only inside an annotation or visual transcript does not count.
+- its title, printed date, proposed document type and summary;
+- the facts it states about itself, such as its reference, client, site, status, author and instruments;
+- the terms it uses.
 
-## Pass 2: bounded corpus induction (`induction.py`)
+Every fact and term must come with a quote. Arkive looks for each quote in the document's sections, ignoring differences in case, dashes, whitespace and Markdown formatting. A quote it cannot find gets one retry that names it. If it is still missing, the item is dropped and counted in the build report. Each fact whose quote is found is stored with the section that holds the quote. A quote found only in an annotation or chart description does not count.
 
-`induce` runs once for the whole corpus over the observation cards, folder paths, and curator notes, with documents in sorted path order. Every Pass 2 prompt has a hard ceiling of `MAX_PROMPT_CHARS = 90_000` (about 30k tokens), so a large archive never overflows the context window.
+## Organising the collection
 
-1. **Facets and uncapped deliverable types (`OrganiseCorpus`, `CanonicaliseFacets`, `CanonicaliseTypes`).** Document digests go to the model in batches of at most 44,000 characters (`MAX_ORGANISE_BATCH_CHARS`). The model proposes 0 to 6 corpus-specific facets (`MAX_FACETS`), each either `path`-bound (from folders) or `content`-bound (from document text), and gives each document a deliverable type. A review is marked feedback for the types it reviews and keeps its own type. One facet canonicalisation request receives every distinct facet the batches proposed and merges synonymous facets and values into at most 6 facets. One type canonicalisation request maps every proposed type label to a canonical type, with no cap on the number of types.
-2. **Facet binding (`bind_facets`).** Path-bound facets take values from folder segments. `gpt-6-luna` on the Decisions API judges content-bound values for each citable document against its card and outline. Unused values and facets with fewer than two populated values are pruned and logged in `build_report`.
-3. **Version families (`PartitionVersions`).** Python proposes scored pairs of documents with high word 4-gram overlap, or overlapping title and filename words within one type, ignoring boilerplate held by more than 12 documents (`VERSION_COMMON_POSTING`). Pairs join documents into components of at most 16 (`MAX_VERSION_COMPONENT_DOCS`); weaker pairs that would exceed it are dropped and counted in `build_report.dropped_version_edges`. For each component, one `gpt-6.1-sol` request partitions the documents into families and names a latest member only when one clearly supersedes the others; a file metadata date never proves supersession. The latest member is `latest` and the others `superseded`. When the order is ambiguous, every distinct member is `unordered`.
-4. **Verified feedback lessons (`ExtractFeedbackLessons`).** For each feedback document, `gpt-6.1-sol` extracts transferable reviewer lessons with verbatim quotes. Python locates each quote in a section, and `gpt-6-luna` confirms the lessons of each section in one request. Unconfirmed lessons are dropped and recorded in `build_report.dropped_feedback_lessons`.
-5. **Cited glossary (`WriteGlossary`).** Term observations and occurrences produce cited senses. `gpt-6-luna` checks each proposed definition against its cited evidence. An unsupported definition is demoted to `null` and counted in `build_report.unsupported_definitions`. A `null` definition means no definition was established from that sense's cited evidence. It does not prove the corpus never defines the term, and `unsupported_definitions` counts only demoted definitions, not every `null` sense.
-6. **Recurring text units (`recurring_units` in `passages.py`).** Pure Python extracts normalised paragraphs, list items, and table header rows from every citable document, indexes their word 4-grams, and clusters units that recur in more than one document into `unit_clusters` and `cluster_sections`, keeping each holder's matched sample text. No model call is made.
-7. **Bounded topic guide (`WriteGuide`).** `gpt-6.1-sol` writes a 4,000 to 8,000 character overview (hard ceiling 16,000 characters and 24,000 JSON bytes) from a bounded catalog of documents, facets, types, glossary terms, and curator notes. Python verifies that every `[doc_id:section_id]` citation resolves to a citable section of the document it names.
+This pass runs once over the whole collection, using the model's record of each document, the folder paths and the `AGENTS.md` notes. Every prompt in this pass stays within 90,000 characters (about 30,000 tokens), so a large archive never overflows the model's context window.
 
-## Pass 3: binding, embeddings, and atomic snapshot
+1. **Filters and document types.** Document digests go to the model in batches of up to 44,000 characters. The model proposes up to 6 filters suited to the collection and gives each document a type. A filter either follows the folder structure, such as one folder per project, or comes from what the documents say. A review is marked as feedback on the types it reviews and keeps its own type. One more request merges filters and values that mean the same thing across batches, keeping at most 6 filters. Another maps every proposed type label to one canonical type. The number of types is not capped.
+2. **Assigning filter values.** Values of a folder-based filter come from folder names. For a text-based filter, `gpt-6-luna` decides each document's value from its record and outline. Values no document uses, and filters with fewer than two used values, are removed and listed in the build report.
+3. **Version groups.** Arkive pairs documents that share many identical four-word sequences, or whose titles and filenames overlap within one type. Text shared by more than 12 documents is ignored, because it is boilerplate. Pairs join documents into groups of at most 16. A weaker pair that would make a group larger is dropped and counted in the build report. For each group, one `gpt-6.1-sol` request splits the documents into sets of versions of one deliverable. It names a latest version only when one clearly replaces the others, and a file's saved date never proves that. The latest version is marked `latest` and the others `superseded`. When the order is unclear, every version is marked `unordered`.
+4. **Reviewer lessons.** For each feedback document, `gpt-6.1-sol` extracts lessons for future work, each with a quote. Arkive finds each quote in a section, and `gpt-6-luna` confirms the section's lessons in one request. Unconfirmed lessons are dropped and counted in the build report.
+5. **Glossary.** The terms each document uses become glossary entries with cited meanings. `gpt-6-luna` checks each proposed definition against its cited evidence, and an unsupported definition is left empty. An empty definition means only that the cited evidence did not establish one. The collection may still define the term elsewhere.
+6. **Standard wording.** Without a model call, Arkive compares the paragraphs, list items and table header rows of every document, and groups those that appear in more than one document. It keeps a sample of the matching text from each document that holds it.
+7. **Collection guide.** `gpt-6.1-sol` writes a 4,000 to 8,000 character overview of the collection from its documents, filters, types, glossary and notes. The hard limit is 16,000 characters. Arkive checks that every citation in the guide points to a real section of the document it names.
 
-`bind_document` in `compiler.py` gives sections and chunks their final IDs (`<doc_id>_sec_001`, `<doc_id>_chk_0001`) and prepends a breadcrumb to every chunk with its bound facets, document title, page span, and heading path. `text-embedding-3-large` (1,536 dimensions) embeds `breadcrumb + "\n" + content` in batches, and each vector is L2-normalised to `float32`.
+## Storing the snapshot
 
-`write_snapshot` in `snapshot.py` fills a temporary sibling SQLite file (mode `0600`) in one transaction, builds the FTS5 index `chunks_fts` (NFKC-normalised content weighted 10, breadcrumbs weighted 2), runs foreign-key and integrity checks, and atomically renames the file into place. Replacing an existing snapshot keeps that file's mode. A snapshot of an older schema is rebuilt from its corpus.
+Each section and chunk gets its final ID. Each chunk also gets a breadcrumb line that names its filter values, document title, pages and heading path. `text-embedding-3-large` computes a 1,536-dimension vector for each chunk from its breadcrumb and text, and each vector is normalised to unit length.
+
+Arkive writes the snapshot to a temporary file next to the output, readable only by its owner. It builds the keyword search index, which weights chunk text above breadcrumbs, and runs SQLite's integrity checks. It then renames the temporary file over the output in one step, so a failed build leaves any earlier snapshot untouched. Replacing an existing snapshot keeps that file's permissions. A snapshot in an earlier format (the current format is schema `7.0`) cannot be opened, so rebuild it from its folder.
 
 ### Snapshot contents
 
-The snapshot holds the corpus metadata and topic guide, the verbatim curator notes, one row per source document with its facets, type, date, and version family, its verified attributes (`document_attributes`), every Markdown table of its sections stored row by row with an FTS5 index (`document_tables`, `table_rows`, `table_rows_fts`), the glossary and reviewer lessons, the recurring text clusters, every stitched section and rendered page, and the chunks with their embeddings and FTS5 index. [Snapshot file](../architecture.md#snapshot-file) in the architecture reference gives every table and column.
+A snapshot holds:
+
+- the collection's metadata and guide, and the `AGENTS.md` notes word for word;
+- one record per source file, with its filter values, type, date and version group;
+- the facts each document states about itself, each linked to its section;
+- every table in every section, stored row by row with a keyword index;
+- the glossary, the reviewer lessons and the groups of standard wording;
+- every section, every rendered page, and every chunk with its vector and keyword index.
+
+[Snapshot file](../architecture.md#snapshot-file) in the architecture reference lists every table and column.
 
 ### Model calls during a build
 
-| Operation | Model | When it runs |
+| Step | Model | Calls |
 | --- | --- | --- |
-| Page transcription | `gpt-6.1-sol`, low effort (high on fidelity retry) | Once per rendered page. |
-| Observation | `gpt-6.1-sol`, low effort | Once per batch of a citable document's sections, plus one consolidation for a multi-batch document. |
-| Organisation, facet and type canonicalisation, version partition, glossary, guide | `gpt-6.1-sol`, medium effort | Organisation once per batch of digests; each canonicalisation and the guide once per topic; the version partition once per component of candidate versions; the glossary once per batch of terms. |
-| Feedback lessons | `gpt-6.1-sol`, low effort | Once per batch of a feedback document's sections. |
-| Facet binding, support checks | `gpt-6-luna` on the Decisions API | Once per citable document for content-bound facets, once per glossary definition, and once per section holding feedback lessons. |
-| Chunk embeddings | `text-embedding-3-large` | Batched once per topic. |
+| Page transcription | `gpt-6.1-sol`, low effort (high on a retry) | One per rendered page. |
+| Recording each document | `gpt-6.1-sol`, low effort | One per batch of a document's sections, plus one to merge the batches of a long document. |
+| Filters, type merging, version groups, glossary, guide | `gpt-6.1-sol`, medium effort | Filters once per batch of digests; filter merging, type merging and the guide once per collection; one per version group; the glossary once per batch of terms. |
+| Reviewer lessons | `gpt-6.1-sol`, low effort | One per batch of a feedback document's sections. |
+| Text-based filter values and support checks | `gpt-6-luna`, through OpenAI's Decisions API | One per document for text-based filters, one per glossary definition, and one per section that holds reviewer lessons. |
+| Chunk vectors | `text-embedding-3-large` | In batches over the whole collection. |
 
-With `--cache`, provider responses are stored under a hash of their inputs. An unchanged rebuild makes no provider calls. Adding a file reads only that file and requests induction over the changed corpus, where identical requests still hit the cache.
+With `--cache`, every model response is stored under a hash of its inputs. Rebuilding an unchanged folder makes no paid calls. Adding a file reads only that file. The organising pass is requested again because the collection changed, but any request whose inputs are identical is still answered from the cache.
 
-`build` prints the provider calls, tokens, and estimated cost, then the build report: observations and lessons dropped for an unlocated quote, definitions and lessons the support checks did not confirm, refused decision questions, pruned facet values and facets, and curator notes a prompt could not show in full.
+`build` prints the paid calls, tokens and estimated cost, then the build report. The report counts what the checks removed or could not confirm:
 
-## Worked example from a public corpus
+- facts and terms dropped because their quote was not found (`discarded_unlocated_quotes`);
+- definitions and lessons the support checks did not confirm (`unsupported_definitions`, `dropped_feedback_lessons`);
+- yes/no questions the model refused (`judge_refusals`);
+- removed filter values and filters (`pruned_facet_values`, `pruned_facets`);
+- `AGENTS.md` notes too long for a prompt to show in full (`truncated_curator_notes`);
+- version pairs dropped to keep groups small (`dropped_version_edges`).
 
-The file `archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline-report.docx` in the 126-file fictional `structural-monitoring-consultancy` collection shows what the three passes produce. The figures come from the metered schema `7.0` cold build of the collection.
+## Worked example
 
-1. **Discovery and identity.** `document_id` hashes the path to `doc_4957546a24`. LibreOffice converts the Word file to PDF, and `pypdfium2` renders all 52 pages.
-2. **Transcription and assembly.** Transcription and stitching produce 86 sections (`doc_4957546a24_sec_001` to `doc_4957546a24_sec_086`), keeping the document-control tables and multi-page instrument schedules.
-3. **Induction.** Across the collection, induction creates 28 canonical deliverable types, 30 verified reviewer lessons, and a 10,395-character cited topic guide. For `doc_4957546a24` it assigns:
-   - `deliverable_type`: `Installation and baseline report`
-   - `doc_date`: `14 October 2024`
-   - `version_status`: `sole`
-   - bound facets: `issue_status: issued`, `job_cohort: archive`, `project: M2409 Askern Viaduct`, `sensing_technology: fibre_bragg_grating`
-   - 17 verified attributes, including `reference: MI-IR-2409`, `status: Issue 1, final`, and `instruments: Prisma FI-4 interrogator, serial PF4-1876`
-   - 61 stored tables in `document_tables`
+The file `archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline-report.docx`, in the 126-file fictional `structural-monitoring-consultancy` collection, shows what the three passes produce. The figures come from the metered first build of the collection on the current version.
 
-   Facet names come from induction and can differ between independent builds of the same collection (see [Appendix C](evaluation-benchmarks.md#version-families-and-facet-coverage)).
+1. **Identity and rendering.** The document's ID is `doc_4957546a24`. LibreOffice converts the Word file to PDF, and all 52 pages are rendered.
+2. **Transcription and sections.** Transcription and joining produce 86 sections, `doc_4957546a24_sec_001` to `doc_4957546a24_sec_086`, keeping the document-control tables and the instrument schedules that run over several pages.
+3. **Organisation.** Across the collection, the build creates 28 document types, 30 confirmed reviewer lessons and a 10,395-character cited guide. For this document it records:
+   - type: `Installation and baseline report`
+   - date: `14 October 2024`
+   - version status: `sole` (the document has no other versions)
+   - filter values: `issue_status: issued`, `job_cohort: archive`, `project: M2409 Askern Viaduct`, `sensing_technology: fibre_bragg_grating`
+   - 17 confirmed facts, including `reference: MI-IR-2409`, `status: Issue 1, final` and `instruments: Prisma FI-4 interrogator, serial PF4-1876`
+   - 61 stored tables
 
-   In the same folder, the calibration sheet `prisma-fi-4-calibration-pf4-1876.md` (`doc_a971f575a6`) is byte-identical to a copy in the `m2505-halverton-greyscar-spillway` folder (`doc_fed78f012b`). Induction groups them as one family and marks `doc_a971f575a6` `superseded` by `doc_fed78f012b`.
-4. **Stored chunk breadcrumb.** Chunk `doc_4957546a24_chk_0001` (`kind="table"`, page 1) is indexed and embedded as:
+   Filter names come from the organising pass, so another build of the same collection can name them differently. [Appendix C](evaluation-benchmarks.md#version-groups-and-filter-coverage) compares three builds.
+
+   In the same folder, the calibration sheet `prisma-fi-4-calibration-pf4-1876.md` (`doc_a971f575a6`) is byte-for-byte identical to a copy in the `m2505-halverton-greyscar-spillway` folder (`doc_fed78f012b`). The build groups them as versions of one document and marks `doc_a971f575a6` as superseded by `doc_fed78f012b`.
+4. **A stored chunk.** The first chunk of the report, a table on page 1, is indexed and embedded as:
 
 ```text
 [job_cohort: archive | sensing_technology: fibre_bragg_grating | issue_status: issued | project: M2409 Askern Viaduct | Doc: Askern Viaduct: fibre Bragg grating installation and baseline report (pp. 1-1) | Section: Askern Viaduct: fibre Bragg grating installation and baseline report]
@@ -123,6 +159,6 @@ The file `archive/m2409-northbray-askern-viaduct/m2409-installation-and-baseline
 ...
 ```
 
-5. **Linked reviewer lesson.** From the unlabelled QA register `active/m2505-halverton-greyscar-spillway/qa-disposition-register.docx` (`doc_4329fae0a3`), Pass 2 extracts and verifies seven lessons that target `Installation and baseline report`, including: *"Apply strain-free reference grating temperature compensation before reporting wavelength shifts as strain, and state this step in the method."*
+5. **A linked reviewer lesson.** From the unlabelled QA register `active/m2505-halverton-greyscar-spillway/qa-disposition-register.docx`, the build extracts and confirms seven lessons for `Installation and baseline report`, including: *"Apply strain-free reference grating temperature compensation before reporting wavelength shifts as strain, and state this step in the method."*
 
-Rebuilding the same collection with `--cache` and no changes made 0 provider calls ($0.0000). On the earlier schema `6.0` build, inserting a 127th file, `a00-new-intake/a00-scoping-note.md`, at the start of the directory tree left all 126 existing `doc_id` values unchanged.
+Rebuilding the same collection with `--cache` and no changes made 0 paid calls ($0.0000). On the previous version, adding a 127th file, `a00-new-intake/a00-scoping-note.md`, at the start of the folder tree left all 126 existing document IDs unchanged.

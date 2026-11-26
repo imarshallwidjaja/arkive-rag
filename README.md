@@ -2,36 +2,37 @@
 
 ![A folder of team documents compiled into one portable knowledge file that AI assistants query](docs/assets/arkive-concept-hero.png)
 
-Arkive RAG turns a curated folder of team reference documents (`.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html`/`.htm`, `.md`) into one portable, read-only knowledge file (`*.arkive.db`). AI assistants query that file to answer questions with citations and to draft new deliverables that follow the team's past work.
+Arkive RAG turns a folder of a team's reference documents into one portable, read-only knowledge file, called a snapshot. AI assistants use that file to answer questions with citations and to draft new deliverables that follow the team's past work. It reads PDF (`.pdf`), Word (`.docx`), PowerPoint (`.pptx`), Excel (`.xlsx`), HTML (`.html`, `.htm`) and Markdown (`.md`) files.
 
-A team uses one snapshot for two jobs:
+A team uses one knowledge file for two jobs:
 
-- **Grounded Q&A with citations.** The assistant finds exact numbers, filenames, table rows, and chart values, and cites the document, section, and page they came from. Answers use the current version of each document by default, and the assistant can ask for earlier drafts when a question is about history.
-- **Grounded drafting from past work.** The assistant receives the closest past examples of the same kind of deliverable, the reviewer lessons that apply to it, and a marker on each passage showing whether it is standard company wording or a clause from one project.
+- **Answering questions with citations.** The assistant finds exact numbers, filenames, table rows and chart values, and cites the document and section they came from, with page numbers when the document has pages. It answers from the current version of each document unless the question is about earlier drafts.
+- **Drafting from past work.** The assistant receives relevant past examples and reviewer lessons. The drafting packet flags sections with recurring wording and includes a few samples. This helps the assistant judge which wording may be a team standard.
 
 ## At a glance
 
-- **No data preparation.** Put the documents in any folder layout. Tagging, renaming, and reformatting are not needed. Optional plain-English `AGENTS.md` notes tell Arkive how the collection fits together.
-- **Local, read-only serving.** The server reads the knowledge file on your machine and makes no generative AI calls. Ten of its eleven tools work fully offline, and only `search` needs an OpenAI key, to embed the query. `prepare_draft` ranks past work by keywords when no key is set. When a key is set, it also sends the project inputs to OpenAI for embedding.
-- **Capped build spend.** `--max-cost` stops new paid model calls once the estimated spend reaches your limit.
-- **Private data stays out of Git.** Keep client documents and `*.arkive.db` files in a private store. The repository's `.gitignore` excludes snapshots and private evaluation packs.
+- **No data preparation.** Any folder layout works, and nobody has to tag, rename or reformat files in the supported formats. Convert legacy `.doc`, `.ppt` and `.xls` files first, because the build stops when it finds any other file type. Hidden files and folders are skipped. You can add plain-English notes in files named `AGENTS.md` to tell Arkive how the collection fits together.
+- **AI calls happen while building.** Building the knowledge file sends document content to OpenAI. Serving it reads the file on your machine and makes no generative AI calls.
+- **Serving works mostly offline.** Without an OpenAI key, every tool except meaning-based search works, and drafting ranks past work by keywords alone. With a key, the server sends each search query, and the start of the project notes given for a draft, to OpenAI to compute embeddings.
+- **Build spend has a cap.** The `--max-cost` option stops new paid calls once the estimated spend reaches your limit.
+- **Private data stays out of Git.** Keep client documents and snapshots in a private store outside this repository. `.gitignore` includes rules for snapshots and local evaluation packs. It does not automatically exclude client documents.
 
 ## Quickstart
 
-You need Python `3.14`, [uv](https://docs.astral.sh/uv/), LibreOffice (`soffice`, to render `.docx` and `.pptx` files), and an `OPENAI_API_KEY`. Excel and HTML files need no extra install. Arkive loads the key from `.env` in the working directory when it is not set.
+You need Python 3.14, [uv](https://docs.astral.sh/uv/), LibreOffice (the `soffice` command, used to render Word and PowerPoint files) and an `OPENAI_API_KEY`. Excel and HTML files need no extra software. If the key is not set in your environment, Arkive reads it from a `.env` file in the working directory.
 
-The commands below build the tracked fictional collection `evals/example_corpora/coastal-survey-projects` (nine files from three survey projects). Keep build outputs outside the corpus folder.
+The commands below build `evals/example_corpora/coastal-survey-projects`, a fictional collection of nine files from three survey projects. Write build outputs outside the folder you build.
 
 ```sh
 uv sync --locked
 
-# Compile the folder into one snapshot file (stops new paid calls at about USD 2)
+# Build the knowledge file (stops new paid calls at about USD 2)
 uv run --locked arkive-rag build evals/example_corpora/coastal-survey-projects \
   -o /tmp/arkive-examples/coastal-survey-projects.arkive.db \
   --cache /tmp/arkive-examples/coastal-survey-projects.cache.db \
   --max-cost 2
 
-# Show the filters, document types, version families, and reviewer lessons Arkive found
+# Show the filters, document types, version groups and reviewer lessons Arkive found
 uv run --locked arkive-rag inspect /tmp/arkive-examples/coastal-survey-projects.arkive.db
 
 # Exact text lookup (offline)
@@ -42,26 +43,26 @@ uv run --locked arkive-rag grep /tmp/arkive-examples/coastal-survey-projects.ark
 uv run --locked arkive-rag search /tmp/arkive-examples/coastal-survey-projects.arkive.db \
   "minimum depth in the dredged channel"
 
-# Serve the snapshot to an MCP-capable AI assistant (stdio by default)
+# Serve the knowledge file to an MCP-capable AI assistant (stdio by default)
 uv run --locked arkive-rag serve /tmp/arkive-examples/coastal-survey-projects.arkive.db
 ```
 
-`search` and `grep` also take `--filter FACET=VALUE`, `--type` for a deliverable type, and `--versions all` to include superseded drafts. Arkive infers the facet names and types from each collection, so read them from the `inspect` output first.
+`search` and `grep` also accept `--filter FACET=VALUE`, `--type` for a document type, and `--versions all` to include superseded drafts. Arkive works out the filter names and document types for each collection, so read them from the `inspect` output first.
 
 ## Documentation
 
-**Guides** explain the product in plain language:
+Guides:
 
-- [What Arkive does and how a team uses it](docs/overview.md)
-- [How folders become searchable knowledge](docs/how-it-works.md)
+- [Arkive overview and team workflows](docs/overview.md)
+- [Building and serving a snapshot](docs/how-it-works.md)
 - [Data boundaries, security, and cost](docs/security-privacy-and-cost.md)
-- [Evidence, benchmarks, and known limits](docs/results-and-limits.md)
+- [Test results and known limits](docs/results-and-limits.md)
 
-**Technical appendices and reference** hold the engineering detail:
+Reference:
 
-- [Appendix A: Parsing, induction, and build pipeline](docs/appendices/build-and-parsing.md)
-- [Appendix B: MCP tools, drafting packet, and cost scaling](docs/appendices/mcp-tools-and-drafting.md)
-- [Appendix C: Evaluation harness and full benchmark tables](docs/appendices/evaluation-benchmarks.md)
+- [Appendix A: Build reference](docs/appendices/build-and-parsing.md)
+- [Appendix B: Server tools and drafting reference](docs/appendices/mcp-tools-and-drafting.md)
+- [Appendix C: Evaluation method and full results](docs/appendices/evaluation-benchmarks.md)
 - [Architecture and verification reference](docs/architecture.md)
 
-The [documentation hub](docs/README.md) lists every diagram. Contributor instructions for agents start at [`AGENTS.md`](AGENTS.md).
+The [documentation hub](docs/README.md) lists every diagram. Contributors start at [`AGENTS.md`](AGENTS.md).
